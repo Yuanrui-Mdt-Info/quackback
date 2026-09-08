@@ -144,6 +144,9 @@ const consumeWidgetHandoffFn = createServerFn({ method: 'POST' })
         method: 'POST',
         headers: {
           'content-type': 'application/json',
+          // BA requires a trusted Origin on Cookie-bearing POSTs. This is an
+          // internal request: derive it from config, never caller headers.
+          origin: new URL(config.baseUrl).origin,
           // Forward the caller's cookie header so BA can resolve any
           // existing session context if needed.
           ...(getRequestHeaders().get('cookie')
