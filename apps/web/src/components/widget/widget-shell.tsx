@@ -73,7 +73,6 @@ interface WidgetShellProps {
 }
 
 export function WidgetShell({
-  orgSlug,
   activeTab,
   onTabChange,
   onBack,
@@ -240,22 +239,23 @@ export function WidgetShell({
 
         <div className="border-t border-border/20 py-2 flex items-center justify-center">
           <a
-            href={`https://quackback.io?utm_campaign=${encodeURIComponent(orgSlug || 'unknown')}&utm_content=widget&utm_medium=referral&utm_source=powered-by`}
+            href="https://www.faray.org"
             target="_blank"
+            rel="noopener noreferrer"
             className="group inline-flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-all"
           >
             <img
-              src="/logo.png"
+              src="/faray-logo.webp"
               alt=""
-              width={11}
-              height={11}
-              className="opacity-60 group-hover:opacity-100 transition-opacity"
+              width={16}
+              height={16}
+              className="shrink-0 object-contain"
             />
             <span>
               <FormattedMessage
                 id="widget.shell.poweredBy"
                 defaultMessage="Powered by {brand}"
-                values={{ brand: <span className="font-medium">Quackback</span> }}
+                values={{ brand: <span className="font-medium">Faray</span> }}
               />
             </span>
           </a>

@@ -176,10 +176,21 @@ export function WidgetPreview({
               </div>
             )}
             <div className={cn('text-center', showTabBar ? 'pb-0.5' : 'py-1')}>
-              <span className="inline-flex items-center gap-0.5 text-[8px] text-muted-foreground/60">
-                <img src="/logo.png" alt="" width={10} height={10} className="opacity-60" />
-                Powered by Quackback
-              </span>
+              <a
+                href="https://www.faray.org"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-0.5 text-[8px] text-muted-foreground/60"
+              >
+                <img
+                  src="/faray-logo.webp"
+                  alt=""
+                  width={14}
+                  height={14}
+                  className="shrink-0 object-contain"
+                />
+                Powered by Faray
+              </a>
             </div>
           </div>
         </div>
