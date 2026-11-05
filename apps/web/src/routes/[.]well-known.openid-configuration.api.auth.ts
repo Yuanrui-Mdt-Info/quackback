@@ -16,6 +16,10 @@ export const Route = createFileRoute('/.well-known/openid-configuration/api/auth
   server: {
     handlers: {
       GET: async ({ request }) => {
+        const { mcpOAuthUnavailableResponse } =
+          await import('@/lib/server/auth/mcp-oauth-availability')
+        const unavailable = mcpOAuthUnavailableResponse()
+        if (unavailable) return unavailable
         const { getAuth } = await import('@/lib/server/auth/index')
         const { oauthProviderOpenIdConfigMetadata } = await import('@better-auth/oauth-provider')
         const auth = await getAuth()

@@ -19,6 +19,7 @@ function quoteAuthParam(value: string): string {
 }
 
 export function unauthenticatedMcpChallenge(): string {
+  if (config.mcpOAuthEnabled === false) return 'Bearer realm="mcp"'
   const scopes = MCP_FIRST_CONNECT_SCOPES.join(' ')
   return `Bearer scope="${quoteAuthParam(scopes)}", resource_metadata="${quoteAuthParam(mcpResourceMetadataUrl())}"`
 }
@@ -28,8 +29,10 @@ export function insufficientScopeChallenge(scope: string): Response {
   const header =
     `Bearer error="insufficient_scope", ` +
     `error_description="${quoteAuthParam(description)}", ` +
-    `scope="${quoteAuthParam(scope)}", ` +
-    `resource_metadata="${quoteAuthParam(mcpResourceMetadataUrl())}"`
+    `scope="${quoteAuthParam(scope)}"` +
+    (config.mcpOAuthEnabled === false
+      ? ''
+      : `, resource_metadata="${quoteAuthParam(mcpResourceMetadataUrl())}"`)
   return new Response(
     JSON.stringify({ error: 'insufficient_scope', error_description: description }),
     {
