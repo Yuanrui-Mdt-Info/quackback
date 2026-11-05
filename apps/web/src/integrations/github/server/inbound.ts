@@ -13,6 +13,7 @@ import type {
 } from '@/lib/server/integrations/inbound-types'
 
 export const githubInboundHandler: InboundWebhookHandler = {
+  statusMode: 'automatic',
   async verifySignature(request: Request, body: string, secret: string): Promise<true | Response> {
     const signature = request.headers.get('X-Hub-Signature-256')
     if (!signature) {
@@ -34,7 +35,8 @@ export const githubInboundHandler: InboundWebhookHandler = {
   async parseStatusChange(body: string): Promise<InboundWebhookResult | null> {
     let payload: {
       action?: string
-      issue?: { number?: number }
+      issue?: { number?: number; updated_at?: string }
+      repository?: { full_name?: string }
     }
     try {
       payload = JSON.parse(body) as typeof payload
@@ -53,6 +55,8 @@ export const githubInboundHandler: InboundWebhookHandler = {
     const externalStatus = payload.action === 'closed' ? 'Closed' : 'Open'
 
     return {
+      destinationId: payload.repository?.full_name,
+      occurredAt: payload.issue.updated_at,
       externalId: String(payload.issue.number),
       externalStatus,
       eventType: `issues.${payload.action}`,

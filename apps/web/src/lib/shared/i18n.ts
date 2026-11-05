@@ -10,6 +10,8 @@ export const SUPPORTED_LOCALES = [
   'pt-br',
   'zh-cn',
   'zh-tw',
+  'nl',
+  'pl',
 ] as const
 
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number]
@@ -148,11 +150,76 @@ export function loadMessages(locale: SupportedLocale): Promise<Record<string, st
 }
 
 /**
- * Key prefixes the widget surface renders (widget views plus the shared
- * Ask-AI / ui / common strings they embed). Everything else in the catalog is
- * portal/admin copy the iframe never shows.
+ * Key prefixes only the file viewer renders. The viewer is a lazy chunk that
+ * opens on a click, so no page seeds these strings into its document; the
+ * viewer loads them as it opens (see `ViewerMessages`).
  */
-const WIDGET_MESSAGE_PREFIXES = ['widget.', 'helpAskAi.', 'ui.', 'common.']
+export const VIEWER_MESSAGE_PREFIXES = [
+  'files.viewer.',
+  'files.find.',
+  'files.archive.',
+  'files.sheet.',
+  'files.pdf.',
+] as const
+
+export function isViewerMessage(key: string): boolean {
+  return VIEWER_MESSAGE_PREFIXES.some((prefix) => key.startsWith(prefix))
+}
+
+/**
+ * Key prefix for the standalone /unsubscribe page. That page seeds only these
+ * (see {@link loadUnsubscribeMessages}), and no other surface renders them, so
+ * the portal slice leaves them out by prefix and the admin catalog drops them
+ * with {@link withoutPageScopedMessages}.
+ */
+export const UNSUBSCRIBE_MESSAGE_PREFIX = 'unsubscribe.'
+
+export function isUnsubscribeMessage(key: string): boolean {
+  return key.startsWith(UNSUBSCRIBE_MESSAGE_PREFIX)
+}
+
+/** Strings no shared page seeds: each belongs to one lazy chunk or one page. */
+function isPageScopedMessage(key: string): boolean {
+  return isViewerMessage(key) || isUnsubscribeMessage(key)
+}
+
+/** A catalog without the viewer's or the unsubscribe page's strings, for seeding a page. */
+export function withoutPageScopedMessages(all: Record<string, string>): Record<string, string> {
+  const subset: Record<string, string> = {}
+  for (const [key, value] of Object.entries(all)) {
+    if (!isPageScopedMessage(key)) subset[key] = value
+  }
+  return subset
+}
+
+/** The /unsubscribe page's strings in a locale, which is all that page renders. */
+export async function loadUnsubscribeMessages(
+  locale: SupportedLocale
+): Promise<Record<string, string>> {
+  const all = await loadMessages(locale)
+  const subset: Record<string, string> = {}
+  for (const [key, value] of Object.entries(all)) {
+    if (isUnsubscribeMessage(key)) subset[key] = value
+  }
+  return subset
+}
+
+/** The file viewer's strings in a locale. */
+export async function loadViewerMessages(locale: SupportedLocale): Promise<Record<string, string>> {
+  const all = await loadMessages(locale)
+  const subset: Record<string, string> = {}
+  for (const [key, value] of Object.entries(all)) {
+    if (isViewerMessage(key)) subset[key] = value
+  }
+  return subset
+}
+
+/**
+ * Key prefixes the widget surface renders (widget views plus the shared
+ * Ask-AI / ui / common / files strings they embed). Everything else in the
+ * catalog is portal/admin copy the iframe never shows.
+ */
+const WIDGET_MESSAGE_PREFIXES = ['widget.', 'helpAskAi.', 'ui.', 'common.', 'files.']
 
 /**
  * The widget's slice of the message catalog. Loaded in the widget layout
@@ -166,6 +233,7 @@ export async function loadWidgetMessages(locale: SupportedLocale): Promise<Recor
   const all = await loadMessages(locale)
   const subset: Record<string, string> = {}
   for (const [key, value] of Object.entries(all)) {
+    if (isViewerMessage(key)) continue
     if (WIDGET_MESSAGE_PREFIXES.some((prefix) => key.startsWith(prefix))) subset[key] = value
   }
   return subset
@@ -217,14 +285,23 @@ export async function loadOnboardingMessages(
  *   assistant strings) reused on the portal support & ticket pages;
  * - `helpAskAi.` — the help-center Ask-AI search surface under `_portal/hc`;
  * - `ui.` — shared UI primitives (e.g. combobox) embedded in portal forms;
- * - `common.` — cross-surface strings (e.g. common.cancel) used on auth pages.
+ * - `common.` — cross-surface strings (e.g. common.cancel) used on auth pages;
+ * - `files.` — the shared file viewer/card/composer-tray components (gallery
+ *   viewer, attachment cards) reused on the portal support & ticket pages.
  *
  * Everything else in the catalog is admin/inbox copy the portal never renders.
  * A unit test (portal-message-coverage.test.ts) statically re-derives the ids
  * referenced by the portal source and fails CI if any fall outside this list,
  * so a future key can't silently render its English fallback in production.
  */
-const PORTAL_MESSAGE_PREFIXES = ['portal.', 'widget.', 'helpAskAi.', 'ui.', 'common.'] as const
+const PORTAL_MESSAGE_PREFIXES = [
+  'portal.',
+  'widget.',
+  'helpAskAi.',
+  'ui.',
+  'common.',
+  'files.',
+] as const
 
 /** The prefix allowlist as a plain string[], for tests and iteration. */
 export const PORTAL_MESSAGE_PREFIX_LIST: readonly string[] = PORTAL_MESSAGE_PREFIXES
@@ -241,6 +318,7 @@ export async function loadPortalMessages(locale: SupportedLocale): Promise<Recor
   const all = await loadMessages(locale)
   const subset: Record<string, string> = {}
   for (const [key, value] of Object.entries(all)) {
+    if (isViewerMessage(key)) continue
     if (PORTAL_MESSAGE_PREFIXES.some((prefix) => key.startsWith(prefix))) subset[key] = value
   }
   return subset

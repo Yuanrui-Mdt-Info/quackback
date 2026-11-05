@@ -27,6 +27,7 @@ import {
   conversationMessageMentions,
   conversationMessageReactions,
   conversationMessageFlags,
+  user,
   userSegments,
   segments,
   assistantInvolvements,
@@ -72,9 +73,10 @@ import {
 import { PRIORITY_RANK } from '@/lib/shared/conversation/priority-meta'
 import { conversationRelevanceSql } from './conversation-relevance'
 import type { SQL } from 'drizzle-orm'
-import { loadAuthors, fallbackAuthor } from '../principals/principal-display'
+import { loadAuthors, loadAuthorAudiences, fallbackAuthor } from '../principals/principal-display'
 import { toMessageDTO } from '@/lib/server/messages/message-core'
 import { aggregateReactions } from '@/lib/shared'
+import { supportContactName } from '@/lib/shared/support-contact-name'
 import { truncate } from '@/lib/shared/utils/string'
 import type { Channel } from '@/lib/shared/channels'
 import { keywordInContext, type TermSegment } from '@/lib/shared/utils/keyword-context'
@@ -101,7 +103,7 @@ const INBOX_PAGE_SIZE = 25
 // loadAuthors/fallbackAuthor now live in the principals domain (principal
 // display is a principal concern). Re-exported here because the inbox, the
 // message stream, and their test mocks reference them from this module.
-export { loadAuthors, fallbackAuthor }
+export { loadAuthors, loadAuthorAudiences, fallbackAuthor }
 
 /** Build an author DTO from a send-call author input (no DB round trip). */
 export function authorFromInput(input: {
@@ -117,25 +119,48 @@ export function authorFromInput(input: {
 }
 
 /**
- * Resolve a send-call author for the returned/broadcast DTO. The avatar comes
+ * Resolve an agent-only note or suggestion author. The avatar comes
  * from the canonical resolver (loadAuthors: user.image → uploaded image_key →
  * principal copy) so a just-sent message shows the same avatar a reload would —
  * the session only carries `user.image`, which is null for uploaded avatars. The
- * live session display name is preferred; we fall back to the input entirely if
- * the principal row can't be found.
+ * account name matches agent thread reads; we fall back to the input if the
+ * principal row can't be found.
  */
 export async function resolveAuthor(input: {
   principalId: PrincipalId
   displayName?: string | null
   avatarUrl?: string | null
 }): Promise<ConversationAuthorDTO> {
-  const resolved = (await loadAuthors([input.principalId])).get(input.principalId)
+  const resolved = (await loadAuthors([input.principalId], { preferAccountName: true })).get(
+    input.principalId
+  )
   if (!resolved) return authorFromInput(input)
   return {
     principalId: input.principalId,
-    displayName: input.displayName ?? resolved.displayName,
+    displayName: resolved.displayName,
     avatarUrl: resolved.avatarUrl ?? input.avatarUrl ?? null,
   }
+}
+
+/**
+ * Public name for the visitor channel, account name for the agent inbox.
+ * The caller's display name is not used: a session name can be the account
+ * name, and that must not ride the visitor payload.
+ */
+export async function resolveAuthorAudiences(input: {
+  principalId: PrincipalId
+  displayName?: string | null
+  avatarUrl?: string | null
+}): Promise<{ publicAuthor: ConversationAuthorDTO; supportAuthor: ConversationAuthorDTO }> {
+  const views = await loadAuthorAudiences([input.principalId])
+  const view = views.get(input.principalId)
+  if (!view) {
+    return {
+      publicAuthor: fallbackAuthor(input.principalId),
+      supportAuthor: authorFromInput(input),
+    }
+  }
+  return view
 }
 
 // toMessageDTO now lives in the shared message core (a message is a peer concern
@@ -296,7 +321,8 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
         conversationId: conversationMessages.conversationId,
         content: conversationMessages.content,
         senderType: conversationMessages.senderType,
-        authorName: principal.displayName,
+        authorPublicName: principal.displayName,
+        authorAccountName: user.name,
         visitorPrincipalId: conversations.visitorPrincipalId,
         flaggedAt: conversationMessageFlags.flaggedAt,
       })
@@ -310,6 +336,7 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
       )
       .innerJoin(conversations, eq(conversations.id, conversationMessages.conversationId))
       .leftJoin(principal, eq(principal.id, conversationMessages.principalId))
+      .leftJoin(user, eq(user.id, principal.userId))
       .where(eq(conversationMessageFlags.principalId, viewerPrincipalId))
       .orderBy(desc(conversationMessageFlags.flaggedAt))
       .limit(100),
@@ -319,7 +346,8 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
         ticketId: conversationMessages.ticketId,
         content: conversationMessages.content,
         senderType: conversationMessages.senderType,
-        authorName: principal.displayName,
+        authorPublicName: principal.displayName,
+        authorAccountName: user.name,
         ticketTitle: tickets.title,
         ticketNumber: tickets.number,
         flaggedAt: conversationMessageFlags.flaggedAt,
@@ -334,18 +362,32 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
       )
       .innerJoin(tickets, and(eq(tickets.id, conversationMessages.ticketId), ticketFilter(actor)))
       .leftJoin(principal, eq(principal.id, conversationMessages.principalId))
+      .leftJoin(user, eq(user.id, principal.userId))
       .where(eq(conversationMessageFlags.principalId, viewerPrincipalId))
       .orderBy(desc(conversationMessageFlags.flaggedAt))
       .limit(100),
   ])
 
-  const visitorNames = await loadAuthors(conversationRows.map((r) => r.visitorPrincipalId))
+  const visitorNames = await loadAuthors(
+    conversationRows.map((r) => r.visitorPrincipalId),
+    { preferAccountName: true }
+  )
+  const flaggedAuthor = (row: {
+    authorAccountName: string | null
+    authorPublicName: string | null
+    senderType: string
+  }) =>
+    supportContactName({
+      accountName: row.authorAccountName,
+      publicName: row.authorPublicName,
+      fallback: row.senderType === 'agent' ? 'Agent' : 'Visitor',
+    })
   const fromConversations: FlaggedMessageDTO[] = conversationRows.map((r) => ({
     messageId: r.messageId,
     conversationId: r.conversationId,
     ticketId: null,
     preview: truncate(r.content, 120),
-    authorName: r.authorName ?? (r.senderType === 'agent' ? 'Agent' : 'Visitor'),
+    authorName: flaggedAuthor(r),
     conversationLabel: visitorNames.get(r.visitorPrincipalId)?.displayName ?? 'Visitor',
     flaggedAt: r.flaggedAt.toISOString(),
   }))
@@ -354,7 +396,7 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
     conversationId: null,
     ticketId: r.ticketId,
     preview: truncate(r.content, 120),
-    authorName: r.authorName ?? (r.senderType === 'agent' ? 'Agent' : 'Visitor'),
+    authorName: flaggedAuthor(r),
     conversationLabel: `#${r.ticketNumber} · ${r.ticketTitle}`,
     flaggedAt: r.flaggedAt.toISOString(),
   }))
@@ -564,7 +606,11 @@ export async function conversationToDTO(
   // concurrently; this is on the send hot path for every message. Labels are
   // agent-only, so the visitor-facing path skips the load entirely.
   const [authors, unread, tagMap] = await Promise.all([
-    loadAuthors([conversation.visitorPrincipalId, conversation.assignedAgentPrincipalId]),
+    loadAuthors(
+      [conversation.visitorPrincipalId, conversation.assignedAgentPrincipalId],
+      // Visitors keep the public name. Agents see the account name.
+      side === 'agent' ? { preferAccountName: true } : undefined
+    ),
     unreadCountFor(conversation, side),
     side === 'agent'
       ? loadConversationTagsForConversations([conversation.id])
@@ -901,6 +947,8 @@ export async function listMessages(
     limit?: number
     includeInternal?: boolean
     includeLinkedTicket?: boolean
+    /** Agent surfaces show the account name. Posts and the visitor widget do not. */
+    preferAccountName?: boolean
   }
 ): Promise<MessagePage> {
   const limit = Math.min(opts?.limit ?? MESSAGE_PAGE_SIZE, 100)
@@ -978,7 +1026,14 @@ export async function listMessages(
   const hasMore = merged.length > limit
   const page = hasMore ? merged.slice(0, limit) : merged
   const [authors, assistantPrincipalId] = await Promise.all([
-    loadAuthors(page.map((m) => m.principalId)),
+    loadAuthors(
+      page.map((m) => m.principalId),
+      {
+        // Agent threads (internal notes, or an explicit ask) show the account
+        // name. The visitor widget leaves this off and keeps the public name.
+        preferAccountName: opts?.preferAccountName ?? !!opts?.includeInternal,
+      }
+    ),
     assistantPrincipalIdOnce(),
   ])
   const ordered = [...page].reverse() // oldest-first for rendering
@@ -1048,7 +1103,10 @@ export async function listConversationMessagesForGrounding(
     .orderBy(asc(conversationMessages.createdAt), asc(conversationMessages.id))
 
   const [authors, assistantPrincipalId] = await Promise.all([
-    loadAuthors(rows.map((m) => m.principalId)),
+    loadAuthors(
+      rows.map((m) => m.principalId),
+      { preferAccountName: true }
+    ),
     assistantPrincipalIdOnce(),
   ])
   return rows.map((m) =>
@@ -1756,7 +1814,8 @@ export async function listConversationsForAgent(
 
   // Authors for all visitors + assigned agents in one batch.
   const authors = await loadAuthors(
-    page.flatMap((c) => [c.visitorPrincipalId, c.assignedAgentPrincipalId])
+    page.flatMap((c) => [c.visitorPrincipalId, c.assignedAgentPrincipalId]),
+    { preferAccountName: true }
   )
 
   // Unread (visitor-authored, after the agent's last read) for all rows, batched.

@@ -19,10 +19,12 @@
 import { logger } from '@/lib/server/logger'
 import { getCurrentWorkspace } from '@/lib/server/workspaces/workspace-context'
 import {
+  claimById,
   claimJobs,
   completeJob,
   failJob,
   heartbeatJob,
+  peekRunnableJob,
   pruneTerminalJobs,
   reapExpiredLeases,
   type ClaimedJob,
@@ -38,6 +40,7 @@ import {
   maxAttemptsFor,
   retentionOverrides,
   retryBackoffMs,
+  RetryAfterError,
   type DynamicSchedule,
   type JobDefinition,
   type JobHandler,
@@ -238,7 +241,13 @@ export async function runJob(job: ClaimedJob): Promise<'succeeded' | 'failed' | 
   heartbeat.unref?.()
 
   const startedAt = Date.now()
-  log.info(jobFields(job, { event: 'job.started' }), 'job started')
+  log.info(
+    jobFields(job, {
+      event: 'job.started',
+      queued_ms: Math.max(0, startedAt - job.runAt.getTime()),
+    }),
+    'job started'
+  )
   try {
     const handler = await resolveHandler(def)
     await handler(job)
@@ -250,7 +259,12 @@ export async function runJob(job: ClaimedJob): Promise<'succeeded' | 'failed' | 
     // answer. It only ever makes the outcome final sooner — see failJob.
     const terminal = isTerminalJobError(err)
     const outcome = await failJob(job, message, {
-      backoffMs: retryBackoffMs(def, job.attempts),
+      backoffMs: Math.max(
+        retryBackoffMs(def, job.attempts),
+        err instanceof RetryAfterError && Number.isFinite(err.retryAfterMs)
+          ? Math.max(0, err.retryAfterMs)
+          : 0
+      ),
       terminal,
     })
     const fields = jobFields(job, {
@@ -332,21 +346,52 @@ export interface DrainResult {
  *
  * **Why per-queue caps rather than one pool size.** The reference gave each
  * queue its own `Worker` with its own `concurrency`, and one of those numbers
- * is load-bearing: `workflow-dispatch` is `concurrency: 1` because it is a
- * global FIFO, not because it is slow. A single undifferentiated pool would run
- * two dispatch jobs at once and reorder a reply and a close on one
- * conversation. So the cap is per queue, the claim asks for exactly the free
- * slots each queue has, and the FIFO queue can never have two in flight.
+ * is load-bearing: `workflow-dispatch` is `concurrency: 1` because it
+ * dispatches in enqueue order, not because it is slow. A single
+ * undifferentiated pool would run two dispatch jobs at once and reorder a reply
+ * and a close on one conversation. So the cap is per queue, the claim asks for
+ * exactly the free slots each queue has, and a concurrency-1 queue never has
+ * two in flight in this pool. That order holds within one process while jobs
+ * succeed first time; it is not global. A failed job is retried behind later
+ * ones, two worker processes each run one job at once, and a crashed job runs
+ * again only once its lease lapses.
  */
 export interface JobPool {
   /** Jobs currently running, per queue. */
   readonly inFlight: Map<string, number>
   /** Every running job's promise, so a caller can wait the pool out. */
   readonly active: Set<Promise<void>>
+  /**
+   * Serialises `dispatchPass` and `startJobsById` so they cannot claim at once.
+   * The poller does not reserve before `claimJobs`; without this lock a wake
+   * can start a second job on a concurrency-1 queue while that claim is in flight.
+   */
+  claimChain: Promise<void>
 }
 
 export function createJobPool(): JobPool {
-  return { inFlight: new Map(), active: new Set() }
+  return { inFlight: new Map(), active: new Set(), claimChain: Promise.resolve() }
+}
+
+async function withClaimLock<T>(pool: JobPool, work: () => Promise<T>): Promise<T> {
+  let release!: () => void
+  const next = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const prev = pool.claimChain
+  pool.claimChain = next
+  await prev
+  try {
+    return await work()
+  } finally {
+    release()
+  }
+}
+
+function releaseReservation(pool: JobPool, queue: string): void {
+  const held = pool.inFlight.get(queue) ?? 1
+  if (held <= 1) pool.inFlight.delete(queue)
+  else pool.inFlight.set(queue, held - 1)
 }
 
 export function poolSize(pool: JobPool): number {
@@ -395,34 +440,89 @@ export async function dispatchPass(opts: {
   onSettled?: (queue: string, outcome: 'succeeded' | 'failed' | 'retrying') => void
 }): Promise<DispatchResult> {
   const { pool } = opts
-  const specs = claimSpecsFor(pool, opts.config)
-  if (specs.length === 0) return { claimed: 0, saturated: true }
+  return withClaimLock(pool, async () => {
+    const specs = claimSpecsFor(pool, opts.config)
+    if (specs.length === 0) return { claimed: 0, saturated: true }
 
-  const jobs = await claimJobs({ specs })
-  for (const job of jobs) {
-    pool.inFlight.set(job.queue, (pool.inFlight.get(job.queue) ?? 0) + 1)
-    const promise = opts
-      .run(job)
-      .catch((err): 'failed' => {
-        // runJob already records every handler failure on the row; reaching
-        // here means the queue machinery itself threw, which must still free
-        // the slot rather than wedge the pool at its cap forever.
-        log.error(
-          jobFields(job, { event: 'job.runner_threw', err }),
-          'job runner threw outside runJob'
-        )
-        return 'failed'
+    const jobs = await claimJobs({ specs })
+    for (const job of jobs) startClaimedJob({ pool, job, run: opts.run, onSettled: opts.onSettled })
+    return { claimed: jobs.length, saturated: false }
+  })
+}
+
+/**
+ * Put an already-claimed row on the pool. `counted` means the caller already
+ * reserved the inFlight slot (start-by-id does this before `claimById` so a
+ * failed claim does not leave a running row with no runner).
+ */
+export function startClaimedJob(opts: {
+  pool: JobPool
+  job: ClaimedJob
+  run: (job: ClaimedJob) => Promise<'succeeded' | 'failed' | 'retrying'>
+  onSettled?: (queue: string, outcome: 'succeeded' | 'failed' | 'retrying') => void
+  counted?: boolean
+}): void {
+  const { pool, job } = opts
+  if (!opts.counted) pool.inFlight.set(job.queue, (pool.inFlight.get(job.queue) ?? 0) + 1)
+  const promise = opts
+    .run(job)
+    .catch((err): 'failed' => {
+      log.error(
+        jobFields(job, { event: 'job.runner_threw', err }),
+        'job runner threw outside runJob'
+      )
+      return 'failed'
+    })
+    .then((outcome) => {
+      releaseReservation(pool, job.queue)
+      pool.active.delete(promise)
+      opts.onSettled?.(job.queue, outcome)
+    })
+  pool.active.add(promise)
+}
+
+/**
+ * Try to claim `jobIds` now, honouring the same pool caps as `dispatchPass`.
+ * Returns how many jobs were claimed. A miss is success — the sweeper still runs.
+ */
+export async function startJobsById(opts: {
+  pool: JobPool
+  config: RunnerConfig
+  jobIds: readonly string[]
+  run: (job: ClaimedJob) => Promise<'succeeded' | 'failed' | 'retrying'>
+  onSettled?: (queue: string, outcome: 'succeeded' | 'failed' | 'retrying') => void
+}): Promise<number> {
+  return withClaimLock(opts.pool, async () => {
+    let claimed = 0
+    for (const jobId of opts.jobIds) {
+      const peek = await peekRunnableJob(jobId)
+      if (!peek) continue
+      const def = findJobDefinition(peek.queue)
+      if (!def) continue
+      const free = Math.min(
+        concurrencyFor(def) - (opts.pool.inFlight.get(peek.queue) ?? 0),
+        opts.config.maxConcurrency - poolSize(opts.pool)
+      )
+      if (free < 1) continue
+      opts.pool.inFlight.set(peek.queue, (opts.pool.inFlight.get(peek.queue) ?? 0) + 1)
+      let job: ClaimedJob | null = null
+      try {
+        job = await claimById(jobId, leaseMsFor(def))
+      } finally {
+        if (!job) releaseReservation(opts.pool, peek.queue)
+      }
+      if (!job) continue
+      startClaimedJob({
+        pool: opts.pool,
+        job,
+        run: opts.run,
+        onSettled: opts.onSettled,
+        counted: true,
       })
-      .then((outcome) => {
-        const held = pool.inFlight.get(job.queue) ?? 1
-        if (held <= 1) pool.inFlight.delete(job.queue)
-        else pool.inFlight.set(job.queue, held - 1)
-        pool.active.delete(promise)
-        opts.onSettled?.(job.queue, outcome)
-      })
-    pool.active.add(promise)
-  }
-  return { claimed: jobs.length, saturated: false }
+      claimed += 1
+    }
+    return claimed
+  })
 }
 
 /** Wait for every job the pool is running. */

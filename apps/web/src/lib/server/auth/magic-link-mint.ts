@@ -17,6 +17,10 @@ interface MintOptions {
 
 const DEFAULT_EXPIRES_IN_SECONDS = 10 * 60
 
+// Better Auth 1.7.7 isolates magic links from other verification capabilities.
+// The public token remains unprefixed; only its storage identifier is scoped.
+const magicLinkIdentifier = (token: string) => `magic-link:${token}`
+
 /** Build the `/verify-magic-link?token=…` URL. */
 export function buildVerifyMagicLinkUrl(opts: {
   origin: string
@@ -57,8 +61,8 @@ export async function mintMagicLinkUrl(
   // is a plain object. `await` handles both.
   const ctx = await auth.$context
   await ctx.internalAdapter.createVerificationValue({
-    identifier: token,
-    value: JSON.stringify({ email: opts.email, attempt: 0 }),
+    identifier: magicLinkIdentifier(token),
+    value: JSON.stringify({ type: 'magic-link', email: opts.email }),
     expiresAt: new Date(Date.now() + expiresInSeconds * 1000),
   })
 
@@ -68,7 +72,7 @@ export async function mintMagicLinkUrl(
     callbackPath: opts.callbackPath,
     errorCallbackPath: opts.errorCallbackPath,
   })
-  // `token` is the verification-row identifier. Callers that need to be able
+  // `token` is the public token, without its storage prefix. Callers that need to be able
   // to invalidate the link later (invitations) persist it; sign-in callers
   // ignore it.
   //
@@ -87,9 +91,7 @@ export async function mintMagicLinkUrl(
  */
 export async function revokeMagicLinkToken(token: string | null | undefined): Promise<void> {
   if (!token) return
-  // `token` is the row's `identifier` — see `createVerificationValue` in
-  // mintMagicLinkUrl above, which stores the raw token as the identifier.
-  await db.delete(verification).where(eq(verification.identifier, token))
+  await db.delete(verification).where(eq(verification.identifier, magicLinkIdentifier(token)))
 }
 
 /**
@@ -99,5 +101,7 @@ export async function revokeMagicLinkToken(token: string | null | undefined): Pr
  */
 export async function revokeMagicLinkTokens(tokens: string[]): Promise<void> {
   if (tokens.length === 0) return
-  await db.delete(verification).where(inArray(verification.identifier, tokens))
+  await db
+    .delete(verification)
+    .where(inArray(verification.identifier, tokens.map(magicLinkIdentifier)))
 }

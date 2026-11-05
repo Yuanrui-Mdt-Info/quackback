@@ -87,14 +87,15 @@ export function WidgetCommentForm({
           minHeight="52px"
           features={COMMENT_EDITOR_FEATURES}
           onImageUpload={onImageUpload}
+          onVideoUpload={onImageUpload}
           disabled={isSubmitting}
           placeholder={intl.formatMessage({
             id: 'widget.commentForm.placeholder',
             defaultMessage: 'Write a comment...',
           })}
-          onChange={(json, _html, markdown) => {
-            editorJsonRef.current = json as TiptapContent
-            setCommentText(markdown ?? '')
+          onDocumentChange={(document) => {
+            editorJsonRef.current = document.json() as TiptapContent
+            setCommentText(document.markdown())
           }}
         />
       </div>

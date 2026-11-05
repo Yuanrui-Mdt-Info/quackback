@@ -14,18 +14,17 @@
 import { jwtVerify, createLocalJWKSet, decodeProtectedHeader, decodeJwt } from 'jose'
 import type { JsonValue } from '@/lib/server/audit/log'
 import { explainAuthorizeError, explainTokenError } from './oidc-error-explain'
+import type { IdTokenNonceChoice } from '@/lib/shared/oidc-request'
+import { SSO_TEST_NONCE_NOT_RETURNED_LABEL } from '@/lib/shared/sso-test-keys'
 import {
   DEFAULT_IDENTITY_SOURCES,
   claimMappingFor,
   type IdentityProviderClaimMapping,
   type IdentitySource,
+  type ProviderIdentityMapping,
   type SourceUnavailableReason,
 } from '@/lib/shared/oidc-claim-mapping'
-import {
-  finishBinding,
-  replayClaimMapping,
-  type IdentityMapping,
-} from '@/lib/shared/sso-claim-binder'
+import { finishBinding, replayClaimMapping } from '@/lib/shared/sso-claim-binder'
 import { finalizeProfileOutcome, type ProfileOutcome } from '@/lib/shared/sso-profile-outcome'
 import type {
   CapturedIdentity,
@@ -47,7 +46,8 @@ export interface HandshakeInput {
   state: string | null
   code: string | null
   expectedState: string
-  expectedNonce: string
+  /** Undefined when the provider is set to not use a nonce, so none was sent. */
+  expectedNonce?: string
   /** Present for discovery providers (endpoints fetched from the doc). Absent
    *  for manual-endpoint providers, which pass the resolved endpoints below. */
   discoveryUrl?: string
@@ -73,7 +73,7 @@ export interface HandshakeInput {
    */
   allowMissingEmail?: boolean
   /** Identity sources and claim paths — the same mapping production uses. */
-  identityMapping?: IdentityMapping
+  identityMapping?: ProviderIdentityMapping
   /**
    * Full stored mapping snapshotted at test start. Pre-deploy sessions may omit
    * this and carry only `identityMapping` for the existing 600-second TTL.
@@ -134,6 +134,10 @@ export type HandshakeResult =
       }
       mappingOutcome?: ProfileOutcome
       capture?: SsoTestCaptureV2
+      /** Whether the provider echoed the nonce ('check') or signed a valid ID
+       *  token without it ('off'). Saved with a passing result so sign-in
+       *  follows what the test saw. Undefined when no nonce was sent. */
+      idTokenNonce?: IdTokenNonceChoice
     }
   | {
       ok: false
@@ -346,6 +350,8 @@ export async function runHandshake(input: HandshakeInput): Promise<HandshakeResu
 
   let header: ReturnType<typeof decodeProtectedHeader> | undefined
   let verifiedPayload: ReturnType<typeof decodeJwt> | undefined
+  /** What this exchange showed about the nonce; undefined when none was sent. */
+  let idTokenNonce: IdTokenNonceChoice | undefined
 
   if (hasIdToken) {
     try {
@@ -413,15 +419,32 @@ export async function runHandshake(input: HandshakeInput): Promise<HandshakeResu
     }
     steps.push({ ok: true, stage: 'signature-verify', label: 'Signature verified against JWKS' })
 
-    if (verifiedPayload.nonce !== input.expectedNonce) {
+    if (input.expectedNonce === undefined) {
+      steps.push({ ok: true, stage: 'claim-check', label: 'Nonce not used for this provider' })
+    } else if (verifiedPayload.nonce === undefined) {
+      // Signature, issuer and audience verified, so this is a provider that
+      // does not echo the nonce rather than a replayed token. Recording it
+      // stops sign-in sending one; a token carrying a different nonce is a
+      // failure instead.
+      idTokenNonce = 'off'
+      steps.push({
+        ok: true,
+        stage: 'claim-check',
+        label: SSO_TEST_NONCE_NOT_RETURNED_LABEL,
+        detail: "Sign-in won't send one. The signature, issuer and audience are still checked.",
+        severity: 'info',
+      })
+    } else if (verifiedPayload.nonce !== input.expectedNonce) {
       return {
         ok: false,
         stage: 'claim-check',
         hint: 'Nonce mismatch in ID token. Possible replay attack or IdP not honoring nonce.',
         steps,
       }
+    } else {
+      idTokenNonce = 'check'
+      steps.push({ ok: true, stage: 'claim-check', label: 'Nonce matched' })
     }
-    steps.push({ ok: true, stage: 'claim-check', label: 'Nonce matched' })
   }
 
   const identityMapping = input.identityMapping
@@ -493,6 +516,7 @@ export async function runHandshake(input: HandshakeInput): Promise<HandshakeResu
   )
   const mappingOutcome = finalizeProfileOutcome(bound, {
     allowMissingEmail: input.allowMissingEmail === true,
+    usernameClaim: identityMapping?.usernameClaim,
   })
   const diagnosticClaims = mergeSnapshotClaims(snapshots)
   const capture = buildTestCapture({
@@ -630,6 +654,7 @@ export async function runHandshake(input: HandshakeInput): Promise<HandshakeResu
       : undefined,
     mappingOutcome,
     capture,
+    ...(idTokenNonce ? { idTokenNonce } : {}),
   }
 }
 

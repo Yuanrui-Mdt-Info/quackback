@@ -29,7 +29,10 @@ beforeAll(() => {
 afterEach(cleanup)
 
 vi.mock('@tanstack/react-router', () => ({
-  useRouteContext: () => ({ principal: { id: 'principal_1' } }),
+  useRouteContext: (opts?: { select?: (context: never) => unknown }) => {
+    const context = { principal: { id: 'principal_1' } }
+    return opts?.select ? opts.select(context as never) : context
+  },
 }))
 
 const hoisted = vi.hoisted(() => ({
@@ -215,7 +218,7 @@ describe('<CopilotPanel> ask -> stream -> answer', () => {
     vi.unstubAllGlobals()
   })
 
-  it('shows a retry affordance on an error response', async () => {
+  it('shows a try again affordance on an error response', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
@@ -231,7 +234,7 @@ describe('<CopilotPanel> ask -> stream -> answer', () => {
     await ask('Hello?')
 
     expect(await screen.findByText('The assistant is not configured')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /try again/i })).toBeInTheDocument()
     vi.unstubAllGlobals()
   })
 
@@ -666,7 +669,7 @@ describe('<CopilotPanel> Answer-sources popover', () => {
     }
 
     const checkboxes = screen.getAllByRole('checkbox')
-    expect(checkboxes.some((cb) => cb.getAttribute('data-state') === 'checked')).toBe(true)
+    expect(checkboxes.some((cb) => cb.hasAttribute('data-checked'))).toBe(true)
     vi.unstubAllGlobals()
   })
 })
@@ -1138,10 +1141,10 @@ describe('<CopilotPanel> answer rewrite menu', () => {
 
     const user = userEvent.setup()
     await user.click(screen.getByRole('button', { name: /^modify$/i }))
-    fireEvent.pointerMove(await screen.findByRole('menuitem', { name: 'Translate to' }), {
-      pointerType: 'mouse',
-    })
-    await user.click(await screen.findByRole('menuitem', { name: 'Español' }))
+    const translate = await screen.findByRole('menuitem', { name: 'Translate to' })
+    translate.focus()
+    await user.keyboard('{ArrowRight}')
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Español' }))
 
     expect(hoisted.runTransform).toHaveBeenCalledWith('translate', DEFAULT_ANSWER, {
       language: 'Spanish',

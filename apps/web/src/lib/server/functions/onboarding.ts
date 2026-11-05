@@ -8,7 +8,7 @@ import {
   type OnboardingOutcome,
   type SetupState,
 } from '@/lib/server/db'
-import { isAdmin } from '@/lib/shared/roles'
+import { isAdmin, toSessionScope } from '@/lib/shared/roles'
 import { getSession } from '@/lib/server/auth/session'
 import { getSettings } from './workspace'
 import { syncPrincipalProfile } from '@/lib/server/domains/principals/principal.service'
@@ -20,6 +20,7 @@ import {
   bootstrapAdminLock,
   findHumanAdmin,
   isOpenToBootstrapClaim,
+  isSetupOpenToClaim,
 } from '@/lib/server/domains/principals/bootstrap-admin'
 import { db, settings, principal, user, postStatuses, eq, DEFAULT_STATUSES } from '@/lib/server/db'
 import { isOnboardingComplete } from '@/lib/shared/db-types'
@@ -34,10 +35,14 @@ import {
   resolveFeatureFlags,
 } from '@/lib/server/domains/settings/settings.types'
 import { isPathManaged } from '@/lib/server/config-file/managed-paths'
-import { slugify } from '@/lib/shared/utils'
+import { slugify } from '@/lib/shared/utils/slugify'
 import { getSetupState } from '@/lib/shared/db-types'
 import { logger } from '@/lib/server/logger'
-import { applyDeferredLaunchStartingPoint, mutateSetupStateAtomic } from '@/lib/server/setup-state'
+import {
+  applyDeferredLaunchStartingPoint,
+  finishIdentityOnboarding,
+  mutateSetupStateAtomic,
+} from '@/lib/server/setup-state'
 import { parseIdentityProjection } from '@/lib/server/domains/settings/cloud/identity-projection'
 
 const log = logger.child({ component: 'onboarding' })
@@ -45,6 +50,10 @@ const log = logger.child({ component: 'onboarding' })
 /** Refusal for a workspace whose owner is decided somewhere other than here. */
 export const NOT_OPEN_TO_CLAIM_MESSAGE =
   'This workspace is not open to be set up here. Sign in with the account it was created for.'
+
+/** Refusal for a claim on a workspace whose setup is already finished. */
+export const SETUP_ALREADY_COMPLETE_MESSAGE =
+  'This workspace is already set up. Sign in with an admin account.'
 
 /**
  * The one place a workspace's first admin is created, and the one place the
@@ -84,6 +93,14 @@ async function ensureBootstrapAdmin(userId: UserId): Promise<void> {
       throw new Error(NOT_OPEN_TO_CLAIM_MESSAGE)
     }
 
+    // A finished workspace with no human admin left is not unclaimed setup.
+    // Claiming is how setup gets finished, so once it is finished nobody
+    // claims it by arriving, however its admins came to be gone.
+    if (!(await isSetupOpenToClaim(tx))) {
+      log.warn({ user_id: userId }, 'bootstrap admin promotion refused: setup is complete')
+      throw new Error(SETUP_ALREADY_COMPLETE_MESSAGE)
+    }
+
     const { created, principal: p } = await ensurePrincipalForUser({ userId, role: 'admin' }, tx)
     if (!created && !isAdmin(p.role)) {
       await setPrincipalRole({ userId }, 'admin', { executor: tx, knownUserId: userId })
@@ -111,11 +128,18 @@ export interface WorkspaceClaim {
    * Whether arriving here is still a way to become this workspace's admin.
    *
    * False on a workspace a control plane provisioned, whose owner is recorded
-   * where it was created. A screen that offered account creation on such a
-   * workspace would be offering a path the promoter refuses, which is the
-   * disagreement this whole answer exists to prevent.
+   * where it was created, and on a workspace whose setup is already finished.
+   * A screen that offered account creation on such a workspace would be
+   * offering a path the promoter refuses, which is the disagreement this whole
+   * answer exists to prevent.
    */
   openToClaim: boolean
+  /**
+   * Why {@link openToClaim} is false, so the screen can say the true thing:
+   * `provisioned` (created for a named account) or `setupComplete` (already
+   * set up; an admin signs in). Null while it is open.
+   */
+  closedReason: 'provisioned' | 'setupComplete' | null
 }
 
 /**
@@ -149,12 +173,18 @@ export const getWorkspaceClaimFn = createServerFn({ method: 'GET' }).handler(
     // Existence only, on the same predicates the promoter guards with, so the
     // screen and the promoter can never disagree about who owns setup or about
     // whether it is still there to be taken.
-    const [owner, openToClaim] = await Promise.all([findHumanAdmin(db), isOpenToBootstrapClaim(db)])
+    const [owner, unprovisioned, setupOpen] = await Promise.all([
+      findHumanAdmin(db),
+      isOpenToBootstrapClaim(db),
+      isSetupOpenToClaim(db),
+    ])
 
     const current = await getSettings()
     const setupComplete = isOnboardingComplete(getSetupState(current?.setupState ?? null))
 
-    return { claimed: !!owner, setupComplete, openToClaim }
+    // Same order the promoter refuses in: provenance first, then setup state.
+    const closedReason = !unprovisioned ? 'provisioned' : !setupOpen ? 'setupComplete' : null
+    return { claimed: !!owner, setupComplete, openToClaim: closedReason === null, closedReason }
   }
 )
 
@@ -172,7 +202,7 @@ const saveWorkspaceAndGoalSchema = z.object({
     .min(2, 'Name must be at least 2 characters')
     .max(100, 'Name must be 100 characters or less')
     .optional(),
-  useCase: z.enum(ONBOARDING_OUTCOMES),
+  useCase: z.enum(ONBOARDING_OUTCOMES).optional(),
 })
 
 // ============================================
@@ -207,15 +237,17 @@ export const saveWorkspaceAndGoalFn = createServerFn({ method: 'POST' })
   .handler(
     async ({ data }: { data: SaveWorkspaceAndGoalInput }): Promise<SaveWorkspaceAndGoalResult> => {
       log.debug(
-        { workspace_name: data.workspaceName, use_case: data.useCase },
+        { workspace_name: data.workspaceName, use_case: data.useCase ?? 'product_feedback' },
         'save workspace and goal'
       )
       const session = await getSession()
       if (!session?.user) throw new Error('Authentication required')
+      if (session.session.scope !== 'dashboard') throw new Error('Only admin can change setup')
 
       const workspaceName = data.workspaceName.trim()
       const slug = slugify(workspaceName)
       if (slug.length < 2) throw new Error('Invalid workspace name - cannot generate valid slug')
+      const useCase = data.useCase ?? 'product_feedback'
       const existingSettings = await getSettings()
 
       // Who owns setup decides this, not what the setup state says. An earlier
@@ -250,34 +282,36 @@ export const saveWorkspaceAndGoalFn = createServerFn({ method: 'POST' })
 
       let result: SaveWorkspaceAndGoalResult
       if (!existingSettings) {
-        const initialState: SetupState = {
-          ...applyDeferredLaunchStartingPoint(
-            { ...DEFAULT_SETUP_STATE, steps: { ...DEFAULT_SETUP_STATE.steps, workspace: true } },
-            data.useCase
-          ),
-        }
-        const { flags, enabledModules } = flagsForGoal(DEFAULT_FEATURE_FLAGS, data.useCase)
-        const [created] = await db
-          .insert(settings)
-          .values({
-            id: generateId('workspace'),
-            name: workspaceName,
-            slug,
-            createdAt: new Date(),
-            portalConfig: JSON.stringify(DEFAULT_PORTAL_CONFIG),
-            widgetConfig: JSON.stringify(DEFAULT_WIDGET_CONFIG),
-            assistantConfig: DEFAULT_ASSISTANT_CONFIG,
-            authConfig: JSON.stringify({ ...DEFAULT_AUTH_CONFIG, openSignup: true }),
-            setupState: JSON.stringify(initialState),
-            featureFlags: JSON.stringify(flags),
-          })
-          .returning()
+        const initialState: SetupState = finishIdentityOnboarding(
+          { ...DEFAULT_SETUP_STATE, steps: { ...DEFAULT_SETUP_STATE.steps, workspace: true } },
+          useCase
+        )
+        const { flags, enabledModules } = flagsForGoal(DEFAULT_FEATURE_FLAGS, useCase)
+        const created = await db.transaction(async (tx) => {
+          const [row] = await tx
+            .insert(settings)
+            .values({
+              id: generateId('workspace'),
+              name: workspaceName,
+              slug,
+              createdAt: new Date(),
+              portalConfig: JSON.stringify(DEFAULT_PORTAL_CONFIG),
+              widgetConfig: JSON.stringify(DEFAULT_WIDGET_CONFIG),
+              assistantConfig: DEFAULT_ASSISTANT_CONFIG,
+              authConfig: JSON.stringify({ ...DEFAULT_AUTH_CONFIG, openSignup: true }),
+              setupState: JSON.stringify(initialState),
+              featureFlags: JSON.stringify(flags),
+            })
+            .returning()
+          if (!row) throw new Error('Failed to create workspace settings')
+          return row
+        })
         await invalidateSettingsCache()
         result = {
           id: created.id,
           name: created.name,
           slug: created.slug,
-          useCase: data.useCase,
+          useCase,
           managed: { name: false, slug: false, useCase: false },
           enabledModules,
         }
@@ -289,10 +323,10 @@ export const saveWorkspaceAndGoalFn = createServerFn({ method: 'POST' })
           if (nameManaged && workspaceName !== row.name) {
             throw new Error('Workspace name is managed by your workspace admin')
           }
-          if (useCaseManaged && data.useCase !== current.useCase) {
+          if (useCaseManaged && data.useCase && data.useCase !== current.useCase) {
             throw new Error('Workspace goal is managed by your workspace admin')
           }
-          const goal = useCaseManaged ? (current.useCase ?? data.useCase) : data.useCase
+          const goal = useCaseManaged ? (current.useCase ?? useCase) : useCase
           const { flags, enabledModules } = flagsForGoal(
             resolveFeatureFlags(row.featureFlags),
             goal
@@ -311,7 +345,7 @@ export const saveWorkspaceAndGoalFn = createServerFn({ method: 'POST' })
             .where(eq(settings.id, row.id))
             .returning()
           return {
-            state: applyDeferredLaunchStartingPoint(current, goal),
+            state: finishIdentityOnboarding(current, goal),
             value: {
               updated,
               goal,
@@ -354,6 +388,7 @@ export const saveCloudOnboardingGoalFn = createServerFn({ method: 'POST' })
   .handler(async ({ data }) => {
     const session = await getSession()
     if (!session?.user) throw new Error('Authentication required')
+    if (session.session.scope !== 'dashboard') throw new Error('Only admin can change setup')
     const caller = await db.query.principal.findFirst({
       where: eq(principal.userId, session.user.id as UserId),
     })
@@ -393,6 +428,46 @@ export const saveCloudOnboardingGoalFn = createServerFn({ method: 'POST' })
     return { useCase: state.useCase!, enabledModules: value.enabledModules }
   })
 
+/** Stamp default outcome, friendly-host details, and handoff so Home can open. */
+export const ensureOnboardingHomeReadyFn = createServerFn({ method: 'POST' }).handler(async () => {
+  const session = await getSession()
+  if (!session?.user) return { ok: false as const }
+  if (session.session.scope !== 'dashboard') return { ok: false as const }
+  const existingSettings = await getSettings()
+  if (!existingSettings) return { ok: false as const }
+  const caller = await db.query.principal.findFirst({
+    where: eq(principal.userId, session.user.id as UserId),
+  })
+  if (!caller || !isAdmin(caller.role)) return { ok: false as const }
+
+  const identity = parseIdentityProjection(existingSettings.cloudIdentity)
+  const { friendlyPlatformLabel } = await import('@/lib/shared/platform-label')
+  const hasFriendlyHost = Boolean(friendlyPlatformLabel(identity?.platformHostname))
+
+  await mutateSetupStateAtomic(async (current, row, tx) => {
+    const now = new Date().toISOString()
+    const goal =
+      current.useCase && current.useCase !== 'internal' ? current.useCase : 'product_feedback'
+    let next = current
+    if (hasFriendlyHost && !current.workspaceDetailsSeenAt) {
+      next = { ...next, workspaceDetailsSeenAt: now }
+    }
+    if (!next.steps.startingPoint || next.steps.startingPoint.source === 'managed') {
+      const { flags } = flagsForGoal(resolveFeatureFlags(row.featureFlags), goal)
+      await tx
+        .update(settings)
+        .set({ featureFlags: JSON.stringify(flags) })
+        .where(eq(settings.id, row.id))
+      next = applyDeferredLaunchStartingPoint(next, goal, now)
+    }
+    if (!next.activationHandoffSeenAt) {
+      next = { ...next, activationHandoffSeenAt: now }
+    }
+    return { state: next, value: undefined }
+  })
+  return { ok: true as const }
+})
+
 /**
  * Save user name during onboarding.
  * Called after OTP verification if user doesn't have a name set.
@@ -408,6 +483,9 @@ export const saveUserNameFn = createServerFn({ method: 'POST' })
     const session = await getSession()
     if (!session?.user) {
       throw new Error('Authentication required')
+    }
+    if (toSessionScope(session.session?.scope) !== 'dashboard') {
+      throw new Error('Only admin can change setup')
     }
 
     await db

@@ -16,6 +16,7 @@ import {
   WorkspaceScopeMissingError,
 } from '@/lib/server/workspaces/workspace-context'
 import { wrapDbTransaction } from '@/lib/server/workspaces/after-commit'
+import { countingQueryLogger } from '@/lib/server/request-metrics'
 
 // Import drizzle-orm operators explicitly to work around Nitro bundler issues
 // with nested barrel exports. If we use `export { asc } from 'drizzle-orm'`,
@@ -115,6 +116,7 @@ function getDatabase(): Database {
     globalThis.__db = createDb(config.databaseUrl, {
       max: config.dbPoolMax,
       idleTimeout: config.dbIdleTimeout,
+      logger: countingQueryLogger,
     })
   }
   return globalThis.__db
@@ -161,6 +163,7 @@ export {
   // Schema tables - auth
   account,
   accountRelations,
+  accountProfileSync,
   invitation,
   invitationRelations,
   jwks,
@@ -168,10 +171,15 @@ export {
   oauthAccessTokenRelations,
   oauthClient,
   oauthClientRelations,
+  oauthClientAssertion,
+  oauthClientResource,
+  oauthClientResourceRelations,
   oauthConsent,
   oauthConsentRelations,
   oauthRefreshToken,
   oauthRefreshTokenRelations,
+  oauthResource,
+  oauthResourceRelations,
   principal,
   principalRelations,
   oneTimeToken,
@@ -179,6 +187,8 @@ export {
   sessionRelations,
   settings,
   settingsRelations,
+  workspaceExperiments,
+  workspaceExperimentsRelations,
   identityProvider,
   ssoVerifiedDomain,
   twoFactor,
@@ -457,6 +467,8 @@ export {
   // Schema tables - assistant knowledge documents
   assistantDocuments,
   assistantDocumentsRelations,
+  files,
+  filesRelations,
   // Schema tables - assistant web sources
   assistantWebSources,
   // Schema tables - assistant pending actions
@@ -470,6 +482,9 @@ export {
   slackUserLinks,
   slackThreadSessions,
   integrationDeliveries,
+  integrationSyncOperations,
+  integrationSyncAttempts,
+  integrationSyncActions,
   // Schema tables - RBAC
   roles,
   permissions,
@@ -485,6 +500,8 @@ export {
   SYSTEM_ROLE_DEFS,
   SYSTEM_ROLE_PERMISSIONS,
   presetForLegacyRole,
+  // Client-safe permissions mirror renderer (pure; used by the drift test)
+  renderPermissionsMirror,
   // Migration ledger status (readiness probe)
   getMigrationStatus,
   // System-data reconcile (integration tests exercise the assignment heal)
@@ -511,6 +528,7 @@ export type {
   MacroAction,
 } from '@quackback/db'
 export type { ServiceMetadata } from '@quackback/db'
+export type { FileRecord, NewFileRecord } from '@quackback/db'
 export type { IdentityProviderClaimMapping, ClaimRoleMapping } from '@quackback/db'
 export type { PermissionKey, PermissionCategory, SystemRoleKey } from '@quackback/db'
 export type {

@@ -30,8 +30,6 @@ import {
 import { StatusSyncConfig } from '@/components/admin/settings/integrations/status-sync-config'
 import { TicketStatusSyncConfig } from '@/components/admin/settings/integrations/ticket-status-sync-config'
 import { OnDeleteConfig } from '@/components/admin/settings/integrations/on-delete-config'
-import { IntegrationHealthPanel } from '@/components/admin/settings/integrations/integration-health-panel'
-import type { IntegrationHealth } from '@/components/admin/settings/integrations/integration-health-panel'
 
 interface EventMapping {
   id: string
@@ -44,7 +42,6 @@ interface GitHubConfigProps {
   initialConfig: Record<string, unknown>
   initialEventMappings: EventMapping[]
   enabled: boolean
-  health?: IntegrationHealth
 }
 
 const EVENT_CONFIG = [
@@ -52,11 +49,6 @@ const EVENT_CONFIG = [
     id: 'post.created' as const,
     label: 'Create issue from new feedback',
     description: 'Automatically create a GitHub issue when new feedback is submitted.',
-  },
-  {
-    id: 'post.status_changed' as const,
-    label: 'Sync status changes',
-    description: 'Update linked issues when feedback status changes.',
   },
 ]
 
@@ -70,7 +62,6 @@ export function GitHubConfig({
   initialConfig,
   initialEventMappings,
   enabled,
-  health,
 }: GitHubConfigProps) {
   const updateMutation = useUpdateIntegration()
   const [repos, setRepos] = useState<GitHubRepo[]>([])
@@ -230,8 +221,6 @@ export function GitHubConfig({
         </div>
       </section>
 
-      <IntegrationHealthPanel health={health} />
-
       <div className="space-y-2">
         <span className={MENU_LABEL}>Feedback</span>
         <section className="overflow-hidden rounded-xl border border-border/60 bg-card">
@@ -288,7 +277,7 @@ export function GitHubConfig({
               </div>
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <Badge size="sm" shape="pill" variant={inboxBadge.variant}>
+              <Badge size="sm" variant={inboxBadge.variant}>
                 {inboxBadge.label}
               </Badge>
               <ChevronRightIcon className="size-3.5 text-muted-foreground" />

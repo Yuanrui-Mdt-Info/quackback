@@ -1,12 +1,7 @@
 import { DEFAULT_LOCALE, resolveLocale } from './i18n'
 
-/**
- * Returns the base path for the inline help center.
- * The help center is always served inline at /hc on the workspace's main domain.
- */
-export function getHelpCenterBaseUrl(): string {
-  return '/hc'
-}
+/** Sticky manual override so browser-detect doesn't fight an explicit choice. */
+export const HC_LOCALE_COOKIE = 'hc_locale'
 
 /**
  * Join a public numeric id and slug as `{urlId}-{slug}`.

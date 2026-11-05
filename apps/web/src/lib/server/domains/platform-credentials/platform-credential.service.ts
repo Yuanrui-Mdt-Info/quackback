@@ -23,7 +23,7 @@ import { encryptPlatformCredentials } from '@/lib/server/integrations/encryption
 import { config } from '@/lib/server/config'
 import { DbCredentialSource, EnvCredentialSource, type CredentialSource } from './credential-source'
 import { AUTH_CREDENTIAL_PREFIX } from '@/lib/server/auth/auth-providers'
-import { memoizePerRequest } from '@/lib/server/functions/auth-request-cache'
+import { memoizePerRequest } from '@/lib/server/request-memo'
 
 interface SavePlatformCredentialsInput {
   integrationType: string
@@ -68,8 +68,15 @@ function isAuthCredentialType(integrationType: string): boolean {
   return integrationType.startsWith(AUTH_CREDENTIAL_PREFIX)
 }
 
-async function sourceForType(integrationType: string): Promise<CredentialSource> {
-  return (await arePlatformCredentialsManaged(integrationType)) ? activeSource() : dbSource()
+async function sourceForType(
+  integrationType: string,
+  executor?: Pick<typeof db, 'query'>
+): Promise<CredentialSource> {
+  return (await arePlatformCredentialsManaged(integrationType))
+    ? activeSource()
+    : executor
+      ? new DbCredentialSource(executor)
+      : dbSource()
 }
 
 /** Only complete provider-specific environment credentials lock the settings UI. */
@@ -158,9 +165,10 @@ export async function savePlatformCredentials({
  * carry plaintext credentials.
  */
 export async function getPlatformCredentials(
-  integrationType: string
+  integrationType: string,
+  executor?: Pick<typeof db, 'query'>
 ): Promise<Record<string, string> | null> {
-  return (await sourceForType(integrationType)).get(integrationType)
+  return (await sourceForType(integrationType, executor)).get(integrationType)
 }
 
 /**

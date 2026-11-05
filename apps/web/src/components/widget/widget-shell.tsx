@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
+import { AnimatePresence, m, useReducedMotion } from 'framer-motion'
 import {
   ArrowLeftIcon,
   ArrowsPointingInIcon,
@@ -18,12 +18,13 @@ import { cn } from '@/lib/shared/utils'
 import { Avatar } from '@/components/ui/avatar'
 import { UserStatsBar } from '@/components/shared/user-stats'
 import { getWidgetAuthHeaders, generateOneTimeToken } from '@/lib/client/widget-auth'
+import { widgetGetUserStatsFn } from '@/lib/server/functions/widget/user'
 import { sendToHost } from '@/lib/client/widget-bridge'
 import { useWidgetAuth } from './widget-auth-provider'
 import { useMessengerUnread } from './use-messenger-unread'
 import { useChangelogUnread } from './use-changelog-unread'
 import { useTicketStageBadge } from './use-ticket-stage-badge'
-import { hasOpenSuggestionPopup } from '@/components/ui/suggestion-popup'
+import { hasOpenSuggestionPopup } from '@/components/ui/suggestion-popup-marker'
 
 import { type WidgetTab, type EnabledTabs, visibleTabsForVisitor } from './widget-nav'
 export type { WidgetTab }
@@ -90,8 +91,6 @@ interface WidgetShellProps {
    * separate domain).
    */
   portalOrigin?: string
-  /** Teammate avatars shown as a small cluster in the Home header. */
-  team?: { name: string; avatarUrl: string | null }[]
   /** Workspace logo shown top-left on Home (null hides it). */
   logoUrl?: string | null
   /** Extra header content beside the back button (e.g. the messenger thread's
@@ -114,14 +113,12 @@ interface WidgetShellProps {
 }
 
 export function WidgetShell({
-  orgSlug,
   activeTab,
   onTabChange,
   onBack,
   enabledTabs = { feedback: true, changelog: false, help: false, messages: false },
   portalAccess,
   portalOrigin,
-  team = [],
   logoUrl = null,
   headerContent,
   backdrop,
@@ -187,7 +184,7 @@ export function WidgetShell({
         reduceMotion || expanded ? { duration: 0 } : { duration: 0.16, ease: 'easeIn' as const },
     }),
   }
-  const { user, isIdentified, hmacRequired, closeWidget } = useWidgetAuth()
+  const { user, isIdentified, hmacRequired, canPortalHandoff, closeWidget } = useWidgetAuth()
 
   const onHome = activeTab === 'home' && !onBack
 
@@ -238,6 +235,13 @@ export function WidgetShell({
   const [portalCtaError, setPortalCtaError] = useState(false)
   const handleGoToPortal = useCallback(async () => {
     setPortalCtaError(false)
+    const origin = portalOrigin || window.location.origin
+    // Teammates skip OTT mint entirely — a portal cookie would replace a
+    // dashboard login. Send them to the site unsigned.
+    if (!canPortalHandoff) {
+      sendToHost({ type: 'quackback:navigate', url: `${origin}/?auth=signin` })
+      return
+    }
     const ott = await generateOneTimeToken()
     if (!ott) {
       setPortalCtaError(true)
@@ -246,10 +250,9 @@ export function WidgetShell({
     // Prefer the server-resolved portal origin so the handoff URL targets the
     // portal host — not the widget iframe's origin, which may differ in
     // self-hosted setups where the widget is served from a separate domain.
-    const origin = portalOrigin || window.location.origin
     const portalUrl = `${origin}/auth/widget-handoff?ott=${encodeURIComponent(ott)}`
     sendToHost({ type: 'quackback:navigate', url: portalUrl })
-  }, [])
+  }, [canPortalHandoff, portalOrigin])
 
   return (
     <div className="relative flex flex-col h-full bg-background text-foreground overflow-x-hidden">
@@ -306,19 +309,6 @@ export function WidgetShell({
 
         {/* Right: portal CTA, user menu, and the always-present close. */}
         <div className="flex items-center gap-1">
-          {/* Teammate cluster — Home only, a friendly "real people are here" cue. */}
-          {activeTab === 'home' && !onBack && team.length > 0 && (
-            <div className="flex items-center -space-x-2 me-1" aria-hidden>
-              {team.map((member, i) => (
-                <Avatar
-                  key={`${member.name}-${i}`}
-                  src={member.avatarUrl}
-                  name={member.name}
-                  className="size-7 text-xs ring-2 ring-background"
-                />
-              ))}
-            </div>
-          )}
           {showPortalCta && (
             <button
               type="button"
@@ -390,7 +380,7 @@ export function WidgetShell({
       >
         <AnimatePresence initial={false} custom={panelExpanded}>
           {showTabBar && (
-            <motion.div
+            <m.div
               key="tab-bar"
               custom={panelExpanded}
               variants={tabBarVariants}
@@ -472,29 +462,30 @@ export function WidgetShell({
                   )
                 })}
               </div>
-            </motion.div>
+            </m.div>
           )}
         </AnimatePresence>
 
         {showPoweredBy ? (
           <div className="border-t border-border/20 py-2 flex items-center justify-center">
             <a
-              href={`https://quackback.io?utm_campaign=${encodeURIComponent(orgSlug || 'unknown')}&utm_content=widget&utm_medium=referral&utm_source=powered-by`}
+              href="https://www.faray.org"
               target="_blank"
+              rel="noopener noreferrer"
               className="group inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-all"
             >
               <img
-                src="/logo.png"
+                src="/faray-logo.webp"
                 alt=""
-                width={11}
-                height={11}
-                className="opacity-60 group-hover:opacity-100 transition-opacity"
+                width={16}
+                height={16}
+                className="shrink-0 object-contain"
               />
               <span>
                 <FormattedMessage
                   id="widget.shell.poweredBy"
                   defaultMessage="Powered by {brand}"
-                  values={{ brand: <span className="font-medium">Quackback</span> }}
+                  values={{ brand: <span className="font-medium">Faray</span> }}
                 />
               </span>
             </a>
@@ -551,7 +542,10 @@ function UserAvatarPopover({
             </div>
           </div>
           <div className="border-t border-border px-3 py-2.5">
-            <UserStatsBar compact headers={getWidgetAuthHeaders()} />
+            <UserStatsBar
+              compact
+              fetchStats={() => widgetGetUserStatsFn({ headers: getWidgetAuthHeaders() })}
+            />
           </div>
         </div>
       )}

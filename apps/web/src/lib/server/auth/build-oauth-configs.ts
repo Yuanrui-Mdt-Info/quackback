@@ -19,10 +19,13 @@
  * `getIdentityProviderCredentials`.
  */
 
+import type { GenericOAuthConfig as LibraryGenericOAuthConfig } from 'better-auth/plugins'
 import type { IdentityProvider } from '@/lib/server/domains/settings/identity-providers.service'
 import { authorizeRequestFor, supportsPrompt } from '@/lib/shared/oidc-request'
-import { resolveIdentity, pickAvatarUrl } from './resolve-identity'
-import { finalizeProfileOutcome } from '@/lib/shared/sso-profile-outcome'
+import { oidcRedirectStyleFrom, oidcRedirectUri } from '@/lib/shared/oidc-redirect'
+import { resolveIdentity } from './resolve-identity'
+import type { ResolvedSignIn } from './resolved-claims-stash'
+import { finalizeProfileOutcome, generatedNames } from '@/lib/shared/sso-profile-outcome'
 import {
   allowsMissingEmail,
   claimMappingFor,
@@ -58,7 +61,25 @@ export interface GenericOAuthConfig {
   clientId: string
   clientSecret: string
   disableSignUp?: boolean
+  /**
+   * Keep sign-out local to Quackback.
+   *
+   * Better Auth 1.7 RP-initiated logout ([docs](https://better-auth.com/docs/plugins/generic-oauth#rp-initiated-logout),
+   * #9368) redirects `signOut()` to whichever linked OIDC provider exposes
+   * `end_session_endpoint`, picking the most recently updated account. GitHub
+   * has no logout URL, so a GitHub session still federates out of Microsoft
+   * when that account is linked. Discovery fills `end_session_endpoint` for
+   * Entra automatically. We always disable it.
+   */
+  disableProviderLogout: true
   discoveryUrl?: string
+  /**
+   * The redirect URI sent on the authorize request AND the token exchange.
+   * The library uses this one value for both, which is what keeps a code
+   * minted for this URI redeemable. Set only for a `legacy` provider; a
+   * `current` one leaves it to the library's own `/callback/<id>` default.
+   */
+  redirectURI?: string
   pkce?: boolean
   authorizationUrl?: string
   tokenUrl?: string
@@ -88,10 +109,17 @@ export interface GenericOAuthConfig {
     | 'select_account'
     | 'select_account consent'
     | 'login consent'
-  // Emit `login_hint` to pre-select the typed email in the IdP picker.
-  authorizationUrlParams?: (ctx: {
-    body?: { additionalData?: { loginHint?: string } }
-  }) => Record<string, string>
+  /**
+   * Stop sending a `nonce` and stop requiring the ID token to echo it, for a
+   * provider that never does. Typed from the library's own config so a rename
+   * there fails the typecheck instead of silently turning this into a no-op.
+   */
+  disableIdTokenNonceBinding?: LibraryGenericOAuthConfig['disableIdTokenNonceBinding']
+  /**
+   * 1.7 keys OIDC accounts on profile `sub` by default. We keep the
+   * identity-resolution `id` so claim-mapped subjects stay stable.
+   */
+  accountSubject?: (ctx: { profile: Record<string, unknown> }) => string
 }
 
 /**
@@ -112,6 +140,12 @@ export interface BuildGenericOAuthConfigsArgs {
   /** `tierLimits.features.customOidcProvider` — gates ALL OIDC registration. */
   tierAllowsOidc: boolean
   /**
+   * The server's base URL, which the library also builds its callback URLs
+   * from. Needed to send a `legacy` provider's redirect URI; without it every
+   * provider falls back to the library default.
+   */
+  baseUrl?: string
+  /**
    * Fetches a provider's discovery document, or null when it is unreachable.
    *
    * Injected the same way `creds` is, which keeps this module free of fetch and
@@ -130,9 +164,10 @@ export interface BuildGenericOAuthConfigsArgs {
   /** Called when resolution succeeds but observed a discrepancy. Injected so
    *  this module needs no audit or DB imports. */
   onResolutionWarning?: (registrationId: string, warnings: readonly string[]) => void
-  /** Called with the claims behind a successful resolution, so downstream
-   *  consumers need not re-derive them from stored tokens. */
-  onResolved?: (registrationId: string, accountId: string, claims: Record<string, unknown>) => void
+  /** Called with the claims and profile decisions behind a successful
+   *  resolution, so downstream consumers need not re-derive them from stored
+   *  tokens. */
+  onResolved?: (registrationId: string, accountId: string, resolved: ResolvedSignIn) => void
   /** Value-free failure signal. Callers may log the reason, never a profile. */
   onIdentityFailure?: (registrationId: string, reason: IdentityProfileFailureReason) => void
   /**
@@ -145,15 +180,15 @@ export interface BuildGenericOAuthConfigsArgs {
    * this module keeps needing no DB import.
    */
   placeholderEmailFor?: (registrationId: string, accountId: string) => Promise<string>
+  /**
+   * Called with the address the provider itself released, before Better Auth
+   * looks for an account to sign in or link. Lets a domain's enforcing provider
+   * vouch for an existing account at that domain. Must not throw; injected so
+   * this module keeps needing no DB import.
+   */
+  onProviderEmail?: (registrationId: string, accountId: string, email: string) => Promise<void>
   /** Attached to every config so `user.locale` populates from sign-in. */
   mapProfileToUser?: (profile: unknown) => Record<string, unknown>
-  /**
-   * Builds the `login_hint` authorizationUrlParams. Carried to EVERY
-   * provider (any provider may be domain-routed), not just the legacy sso one.
-   */
-  buildLoginHintParams?: (ctx: {
-    body?: { additionalData?: { loginHint?: string } }
-  }) => Record<string, string>
 }
 
 /**
@@ -166,14 +201,15 @@ export async function buildGenericOAuthConfigs({
   providers,
   creds,
   tierAllowsOidc,
+  baseUrl,
   discovery,
   fetchUserInfo,
   onResolutionWarning,
   onResolved,
   onIdentityFailure,
   placeholderEmailFor,
+  onProviderEmail,
   mapProfileToUser,
-  buildLoginHintParams,
 }: BuildGenericOAuthConfigsArgs): Promise<GenericOAuthConfig[]> {
   // Defense-in-depth: a workspace downgraded off the OIDC tier keeps its
   // provider rows in the DB. Skip registration so no login button renders
@@ -241,10 +277,10 @@ export async function buildGenericOAuthConfigs({
             : null,
         mapping: identityMapping,
         requiredClaimPaths: requiredClaimPaths.length > 0 ? requiredClaimPaths : undefined,
-        // Pursue the avatar through the cascade — a `picture` claim commonly
+        // Pursue the avatar through the cascade: an avatar claim commonly
         // lives only at userinfo, past where id + email + name already stopped
-        // the fast path. `claims` (merged) then carries it for the after-hook
-        // backfill via `onResolved`.
+        // the fast path. The bound `image` then reaches the profile refresh
+        // via `onResolved`.
         wantImage: true,
       })
       if (!result.ok) {
@@ -259,10 +295,20 @@ export async function buildGenericOAuthConfigs({
       if (warnings?.length && onResolutionWarning) {
         onResolutionWarning(provider.registrationId, warnings)
       }
-      // Hand the freshly-validated claims to role provisioning, which would
-      // otherwise re-read the stored ID token — and find nothing for a provider
-      // that resolves identity from userinfo or an access token.
-      onResolved?.(provider.registrationId, id, claims)
+      // Hand the freshly-validated claims and profile decisions to the
+      // after-hooks, which would otherwise re-read the stored ID token, and
+      // find nothing for a provider that resolves identity from userinfo or an
+      // access token. The name is the one the provider sent, never a
+      // synthesized one; the generated names let profile sync tell a name
+      // sign-up made up from one a person typed.
+      onResolved?.(provider.registrationId, id, {
+        claims,
+        profile: {
+          ...(name !== undefined ? { name } : {}),
+          ...(image !== undefined ? { image } : {}),
+          generatedNames: generatedNames(claims, id, identityMapping.usernameClaim),
+        },
+      })
 
       const outcome = finalizeProfileOutcome(
         {
@@ -271,7 +317,10 @@ export async function buildGenericOAuthConfigs({
           warnings: warnings ?? [],
           provenance: {},
         },
-        { allowMissingEmail: allowsMissingEmail(provider.claimMapping) }
+        {
+          allowMissingEmail: allowsMissingEmail(provider.claimMapping),
+          usernameClaim: identityMapping.usernameClaim,
+        }
       )
 
       // Gap-fill runs LAST, after every real source has been tried, so it can
@@ -289,6 +338,12 @@ export async function buildGenericOAuthConfigs({
         resolvedEmailVerified = false
       }
 
+      // Only an address the provider released, never a placeholder or a
+      // stored address standing in for one.
+      if (email && outcome.kind !== 'placeholder_required') {
+        await onProviderEmail?.(provider.registrationId, id, email)
+      }
+
       // Better-Auth logs the entire userInfo on email_is_missing. Returning
       // null keeps a claims profile (and any leftover raw email) off that path.
       if (!resolvedEmail) {
@@ -297,10 +352,11 @@ export async function buildGenericOAuthConfigs({
       }
 
       // Better-Auth's genericOAuth derives the avatar from `image` only, so
-      // hand it the resolved `picture` URL. Better-Auth persists it only when it
-      // CREATES the user; an existing account is backfilled by
-      // `handleAvatarBackfillAfter` (fill-if-empty, never overwrites).
-      const resolvedImage = image ?? pickAvatarUrl(claims)
+      // hand it the bound avatar URL (the mapped claim, else `picture`).
+      // Better-Auth persists name and avatar only when it CREATES the user. For
+      // an existing account, `handleProfileRefreshAfter` fills an empty avatar
+      // and, with profile sync on, keeps provider-set values following the
+      // provider. It never overwrites a name or avatar a person chose.
 
       // Raw claims first, mapped fields last: the mapped values are the
       // resolved answer and must not be shadowed by a same-named raw claim.
@@ -313,15 +369,25 @@ export async function buildGenericOAuthConfigs({
         emailVerified: resolvedEmailVerified,
         email_verified: resolvedEmailVerified,
         ...(resolvedName ? { name: resolvedName } : {}),
-        ...(resolvedImage ? { image: resolvedImage } : {}),
+        ...(image ? { image } : {}),
       }
     }
+
+    // A provider registered at its IdP before the callback path moved keeps
+    // sending the URL it registered. Many IdPs match it exactly, and would
+    // refuse the authorize request before any rewrite on the way back in
+    // could help.
+    const redirectURI =
+      baseUrl && oidcRedirectStyleFrom(provider.redirectStyle) === 'legacy'
+        ? oidcRedirectUri(baseUrl, provider.registrationId, 'legacy')
+        : undefined
 
     configs.push({
       getUserInfo,
       providerId: provider.registrationId,
       clientId,
       clientSecret: c.clientSecret,
+      ...(redirectURI ? { redirectURI } : {}),
       ...(discoveryUrl ? { discoveryUrl } : {}),
       ...(authorizationUrl ? { authorizationUrl } : {}),
       ...(tokenUrl ? { tokenUrl } : {}),
@@ -331,14 +397,16 @@ export async function buildGenericOAuthConfigs({
       // reject without it; RFC 7636 §5 makes the params backwards-compatible
       // (IdPs without PKCE support simply ignore them).
       pkce: true,
+      disableProviderLogout: true,
       ...(prompt ? { prompt } : {}),
+      ...(request.idTokenNonce === 'off' ? { disableIdTokenNonceBinding: true } : {}),
       authentication: request.tokenAuth,
       // Better-Auth's JIT block. When false, the OAuth callback aborts in
       // handleOAuthUserInfo before any user/session is created. Existing
       // users still link via accountLinking.trustedProviders.
       disableSignUp: provider.autoCreateUsers === false,
       ...(mapProfileToUser ? { mapProfileToUser } : {}),
-      ...(buildLoginHintParams ? { authorizationUrlParams: buildLoginHintParams } : {}),
+      accountSubject: ({ profile }) => String(profile.id ?? profile.sub ?? ''),
     })
   }
 

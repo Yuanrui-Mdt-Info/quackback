@@ -4,8 +4,10 @@ import type { ConversationId } from '@quackback/ids'
 import { VisitorConversationThread } from '@/components/shared/conversation/visitor-conversation-thread'
 import { useWidgetAuth } from './widget-auth-provider'
 import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
+import { VisitorSurfaceRpcProvider } from '@/lib/client/visitor-surface-rpc'
+import { widgetVisitorRpc } from '@/lib/client/widget-visitor-rpc'
 import { useConversationPresence, markAgentPresentInCache } from './use-messenger-presence'
-import { useWidgetImageUpload } from './use-widget-image-upload'
+import { useWidgetFileUpload } from './use-widget-file-upload'
 
 interface WidgetMessengerProps {
   /** Whether the help center is available (gates in-conversation article suggestions). */
@@ -15,8 +17,6 @@ interface WidgetMessengerProps {
   /** Which thread to open: an id opens that thread, 'new' starts a fresh one,
    *  undefined resumes the visitor's active/most-recent thread. */
   conversationTarget?: ConversationId | 'new'
-  /** When true, render link preview cards below message bubbles. */
-  linkPreviews?: boolean
   /** Put the cursor in the composer on mount (new-thread landings on desktop). */
   autofocusComposer?: boolean
 }
@@ -31,7 +31,6 @@ export function WidgetMessenger({
   helpEnabled,
   onArticleSelect,
   conversationTarget,
-  linkPreviews = false,
   autofocusComposer = false,
 }: WidgetMessengerProps = {}) {
   const queryClient = useQueryClient()
@@ -39,7 +38,7 @@ export function WidgetMessenger({
   // Presence (online/offline + office hours) comes from the one shared query —
   // SSR-seeded, polled once, and shared with every other widget surface.
   const presence = useConversationPresence(true)
-  const { upload } = useWidgetImageUpload()
+  const { upload } = useWidgetFileUpload()
 
   const onAgentActivity = useCallback(() => markAgentPresentInCache(queryClient), [queryClient])
 
@@ -49,6 +48,7 @@ export function WidgetMessenger({
       search: async (q: string, signal: AbortSignal) => {
         const res = await fetch(`/api/widget/kb-search?q=${encodeURIComponent(q)}&limit=3`, {
           signal,
+          headers: getWidgetAuthHeaders(),
         })
         if (!res.ok) return []
         const json = (await res.json()) as {
@@ -58,23 +58,28 @@ export function WidgetMessenger({
       },
       onSelect: onArticleSelect,
     }
-  }, [helpEnabled, onArticleSelect])
+  }, [helpEnabled, onArticleSelect, sessionVersion])
 
   return (
-    <VisitorConversationThread
-      conversationTarget={conversationTarget}
-      linkPreviews={linkPreviews}
-      getAuthHeaders={getWidgetAuthHeaders}
-      ensureSession={ensureSession}
-      sessionVersion={sessionVersion}
-      currentUser={user}
-      uploadImage={upload}
-      presence={presence}
-      onAgentActivity={onAgentActivity}
-      helpSearch={helpSearch}
-      embedOpenMode="newTab"
-      showHeader={false}
-      autofocusComposer={autofocusComposer}
-    />
+    <VisitorSurfaceRpcProvider value={widgetVisitorRpc}>
+      <VisitorConversationThread
+        conversationTarget={conversationTarget}
+        // No link previews: the unfurl endpoint serves site sessions only and
+        // refuses the widget's Bearer session.
+        linkPreviews={false}
+        getAuthHeaders={getWidgetAuthHeaders}
+        ensureSession={ensureSession}
+        sessionVersion={sessionVersion}
+        currentUser={user}
+        uploadFile={upload}
+        presence={presence}
+        onAgentActivity={onAgentActivity}
+        helpSearch={helpSearch}
+        embedOpenMode="newTab"
+        showHeader={false}
+        autofocusComposer={autofocusComposer}
+        compact
+      />
+    </VisitorSurfaceRpcProvider>
   )
 }

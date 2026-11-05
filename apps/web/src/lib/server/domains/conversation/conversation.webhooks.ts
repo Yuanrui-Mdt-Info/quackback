@@ -30,10 +30,13 @@ import {
   dispatchMessageCreated,
   dispatchMessageNoteCreated,
   dispatchMessageDeleted,
+  dispatchMessageUpdated,
 } from '@/lib/server/events/dispatch'
 import { logger } from '@/lib/server/logger'
+import { makeSafeDispatch } from '@/lib/server/events/safe-dispatch'
 
 const log = logger.child({ component: 'conversation-webhooks' })
+const safe = makeSafeDispatch(log)
 
 function toEventActor(actor: Actor, author?: ConversationAuthorInput | null): EventActor {
   const principalId = actor.principalId ?? undefined
@@ -90,14 +93,6 @@ function messageData(
     authorEmail: realEmail(author.email ?? null),
     content: m.content,
     createdAt: m.createdAt.toISOString(),
-  }
-}
-
-async function safe(label: string, fn: () => Promise<void>): Promise<void> {
-  try {
-    await fn()
-  } catch (err) {
-    log.warn({ err, label }, 'webhook failed')
   }
 }
 
@@ -166,6 +161,22 @@ export async function emitMessageDeleted(
       toEventActor(actor),
       { id: message.id, conversationId: conversation.id },
       conversationRef(conversation)
+    )
+  )
+}
+
+export async function emitMessageUpdated(
+  actor: Actor,
+  author: ConversationAuthorInput,
+  message: ConversationMessage,
+  conversation: Conversation
+): Promise<void> {
+  await safe('message.updated', () =>
+    dispatchMessageUpdated(
+      toEventActor(actor, author),
+      messageData(message, author, conversation),
+      conversationRef(conversation),
+      (message.editedAt ?? new Date()).toISOString()
     )
   )
 }

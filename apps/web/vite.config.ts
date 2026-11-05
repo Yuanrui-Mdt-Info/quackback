@@ -7,6 +7,8 @@ import path from 'path'
 import { execSync } from 'child_process'
 import { readFileSync } from 'fs'
 import { CLIENT_PROTECTED_SPECIFIERS } from './src/lib/server/policy/client-import-protection'
+import { routeChunksImportTheirParent } from './src/lib/build/route-chunk-parents'
+import { serverWorkers } from './src/lib/build/server-workers'
 
 /**
  * Replace the server-only structured logger with a no-op stub in the CLIENT
@@ -92,6 +94,38 @@ function keepSsrOnlyDepsOutOfClientOptimizer(): PluginOption {
   }
 }
 
+/**
+ * Nitro's Vite pre-middleware skips any request it classifies as a static
+ * asset (`sec-fetch-dest: image`, or a `.png`/`.jpg`/… extension without
+ * `Accept: text/html`) and marks it `_nitroHandled` so the post-middleware
+ * never sees it either. Browser `<img src="/api/storage/…/file.png">` is
+ * exactly that shape, so the splat route never runs and Vite answers
+ * `Cannot GET`. Clear the asset signals for this prefix only; Nitro's
+ * post-middleware then serves the bytes.
+ */
+function letNitroServeStorageAssets(): PluginOption {
+  return {
+    name: 'quackback:let-nitro-serve-storage-assets',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use((req, _res, next) => {
+        const pathname = req.url?.split('?')[0] ?? ''
+        if (!pathname.startsWith('/api/storage/')) {
+          next()
+          return
+        }
+        // Drop dest so Nitro does not take the `image`/`style` branch.
+        delete req.headers['sec-fetch-dest']
+        const accept = req.headers.accept
+        if (typeof accept !== 'string' || !/\btext\/html\b/.test(accept)) {
+          req.headers.accept = accept ? `${accept}, text/html` : 'text/html'
+        }
+        next()
+      })
+    },
+  }
+}
+
 function getBuildInfo() {
   const pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'utf-8'))
   let gitCommit = 'unknown'
@@ -133,6 +167,9 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
+      // PERF_UNMINIFIED=1 keeps component names readable for the perf bench's
+      // render profiler (`bun perf/bench.ts --renders`). Never for a release.
+      ...(process.env.PERF_UNMINIFIED === '1' && { minify: false }),
       rolldownOptions: {
         // TanStack Router SSR code imports node builtins (node:stream, node:async_hooks)
         // that end up in the client bundle. Mark node: imports as external since they're
@@ -150,15 +187,51 @@ export default defineConfig(({ mode }) => {
         // scripts/check-widget-bundle.ts guards the widget's eager graph in CI.
       },
     },
+    environments: {
+      client: {
+        build: {
+          rolldownOptions: {
+            output: {
+              codeSplitting: {
+                // Merge the client entry's static import closure into the
+                // entry chunk. Every document loads all of it before it can
+                // hydrate, so this moves no code across a lazy boundary; it
+                // only stops usage-based splitting from cutting that eager
+                // set into ~200 tiny chunks, each a request on every first
+                // load. `$initial` is rolldown's tag for exactly that set, so
+                // unlike directory pinning it cannot pull a lazy module in.
+                groups: [{ name: 'entry', tags: ['$initial'] }],
+              },
+            },
+          },
+        },
+      },
+    },
     resolve: {
       tsconfigPaths: true,
     },
     plugins: [
+      // `?server-worker` imports: worker-thread scripts for server code.
+      serverWorkers(),
+      letNitroServeStorageAssets(),
       keepSsrOnlyDepsOutOfClientOptimizer(),
       stubServerLoggerInClient(),
       tailwindcss(),
       nitro({
         preset: 'bun',
+        // The file-preview job's PDF engine loads `mupdf-wasm.wasm` from
+        // beside its own module, which a bundled chunk would not have: keep
+        // the whole package in the traced server node_modules instead.
+        traceDeps: ['mupdf*'],
+        // The bare Bun preset has no reverse proxy in front of it, so
+        // without this every static asset ships uncompressed: gzip and
+        // brotli siblings are written next to each build asset over 1 KB
+        // (nitro/dist/_build/common.mjs compressPublicAssets) and the
+        // static handler picks whichever the client's Accept-Encoding
+        // allows, setting Content-Encoding and Vary itself. Dynamic
+        // responses (SSR documents, server-function JSON) are unaffected;
+        // see compression.ts for those.
+        compressPublicAssets: { gzip: true, brotli: true },
       }),
       tanstackStart({
         srcDirectory: 'src',
@@ -172,6 +245,9 @@ export default defineConfig(({ mode }) => {
         },
       }),
       viteReact(),
+      // A route's chunks import the chunk of the route they render under, so
+      // what a layout shares with its pages stays in the layout's chunk.
+      routeChunksImportTheirParent(path.resolve(__dirname, 'src/routeTree.gen.ts')),
     ].filter(Boolean) as PluginOption[],
   }
 })

@@ -93,9 +93,27 @@ vi.mock('@/lib/server/setup-state', async (importOriginal) => ({
 
 vi.mock('@/lib/server/db', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/server/db')>()
+  const insert = vi.fn((table: unknown) => ({
+    values: vi.fn((values: Record<string, unknown>) => {
+      if (table === actual.settings) {
+        hoisted.settingsInsert(values)
+        return {
+          returning: vi.fn(async () => [
+            {
+              id: 'workspace_test',
+              name: values.name,
+              slug: values.slug,
+            },
+          ]),
+        }
+      }
+      return Promise.resolve()
+    }),
+  }))
   const tx = {
     execute: hoisted.txExecute,
     query: { principal: { findFirst: hoisted.txPrincipalFindFirst } },
+    insert,
   }
   return {
     ...actual,
@@ -107,23 +125,7 @@ vi.mock('@/lib/server/db', async (importOriginal) => {
         principal: { findFirst: hoisted.principalFindFirst },
         postStatuses: { findFirst: hoisted.postStatusesFindFirst },
       },
-      insert: vi.fn((table: unknown) => ({
-        values: vi.fn((values: Record<string, unknown>) => {
-          if (table === actual.settings) {
-            hoisted.settingsInsert(values)
-            return {
-              returning: vi.fn(async () => [
-                {
-                  id: 'workspace_test',
-                  name: values.name,
-                  slug: values.slug,
-                },
-              ]),
-            }
-          }
-          return Promise.resolve()
-        }),
-      })),
+      insert,
     },
   }
 })
@@ -136,7 +138,10 @@ const { bootstrapAdminLock } = await import('@/lib/server/domains/principals/boo
 beforeEach(() => {
   vi.clearAllMocks()
   hoisted.flagWrites = []
-  hoisted.getSession.mockResolvedValue({ user: { id: 'user_caller' } })
+  hoisted.getSession.mockResolvedValue({
+    session: { scope: 'dashboard' },
+    user: { id: 'user_caller' },
+  })
   hoisted.postStatusesFindFirst.mockResolvedValue({ id: 'status_existing' })
   hoisted.stamp.value = null
   // The transaction's `execute` answers by statement, as the real one does: the
@@ -146,6 +151,10 @@ beforeEach(() => {
   // about the ordering between exactly those two.
   hoisted.txExecute.mockImplementation(async (statement: { queryChunks?: unknown[] }) => {
     const text = JSON.stringify(statement?.queryChunks ?? '')
+    if (text.includes('setup_state')) {
+      const row = await hoisted.getSettings()
+      return row ? [{ setup_state: row.setupState ?? null }] : []
+    }
     if (!text.includes('cloud_workspace_key')) return undefined
     return [{ stamp_column: hoisted.stamp.value, metadata: null }]
   })

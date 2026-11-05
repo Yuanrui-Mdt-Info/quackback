@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from '@tanstack/react-router'
 import { useSuspenseQuery, useQueryClient, type InfiniteData } from '@tanstack/react-query'
@@ -17,6 +17,7 @@ import { RoadmapSidebar } from './roadmap-sidebar'
 import { RoadmapColumn } from './roadmap-column'
 import { RoadmapCardOverlay } from './roadmap-card'
 import { RoadmapFiltersBar } from './roadmap/roadmap-filters-bar'
+import { PageHeader } from '@/components/shared/page-header'
 import { EmptyState } from '@/components/shared/empty-state'
 import { useRoadmaps } from '@/lib/client/hooks/use-roadmaps-query'
 import { useRoadmapDateBuckets } from '@/lib/client/hooks/use-roadmaps-query'
@@ -30,6 +31,17 @@ import { Route } from '@/routes/admin/roadmap'
 import type { RoadmapViewPost, RoadmapPostsListResult } from '@/lib/shared/types'
 import type { PostStatusId, PostId, RoadmapId } from '@quackback/ids'
 
+/**
+ * Renders into document.body once mounted. The board renders on the server
+ * when its roadmaps arrive with the page, and there is no body to portal into
+ * there; the drag overlay only matters once someone drags.
+ */
+function BodyPortal({ children }: { children: ReactNode }) {
+  const [body, setBody] = useState<HTMLElement | null>(null)
+  useEffect(() => setBody(document.body), [])
+  return body ? createPortal(children, body) : null
+}
+
 export function RoadmapAdmin() {
   const navigate = useNavigate({ from: Route.fullPath })
   const search = Route.useSearch()
@@ -42,8 +54,8 @@ export function RoadmapAdmin() {
   const { data: boards } = useSuspenseQuery(adminQueries.boards())
   const { data: tags } = useSuspenseQuery(adminQueries.tags())
   const { data: segments } = useSegments()
-  const { selectedRoadmapId, setSelectedRoadmap } = useRoadmapSelection()
   const { data: roadmaps } = useRoadmaps()
+  const { selectedRoadmapId, setSelectedRoadmap } = useRoadmapSelection(roadmaps)
   const changeStatus = useChangePostStatusId()
   const setEta = useSetPostEta()
   const queryClient = useQueryClient()
@@ -51,13 +63,6 @@ export function RoadmapAdmin() {
   const handleCardClick = (postId: string) => {
     navigate({ search: { ...search, post: postId } })
   }
-
-  // Auto-select first roadmap
-  useEffect(() => {
-    if (roadmaps?.length && !selectedRoadmapId) {
-      setSelectedRoadmap(roadmaps[0].id)
-    }
-  }, [roadmaps, selectedRoadmapId, setSelectedRoadmap])
 
   const selectedRoadmap = roadmaps?.find((r) => r.id === selectedRoadmapId)
   const { data: dateBuckets = [] } = useRoadmapDateBuckets(
@@ -178,26 +183,26 @@ export function RoadmapAdmin() {
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {selectedRoadmap ? (
           <>
-            <div className="px-4 sm:px-6 py-3 sm:py-4 border-b border-border/50 bg-card/50 space-y-3">
-              <div>
-                <h2 className="text-lg font-semibold">{selectedRoadmap.name}</h2>
-                {selectedRoadmap.description && (
-                  <p className="mt-0.5 text-sm text-muted-foreground">
-                    {selectedRoadmap.description}
-                  </p>
-                )}
+            <div className="border-b border-border/50">
+              <div className="px-4 pt-3.5 sm:px-6">
+                <PageHeader
+                  title={selectedRoadmap.name}
+                  description={selectedRoadmap.description ?? undefined}
+                />
               </div>
-              <RoadmapFiltersBar
-                filters={filters}
-                onFiltersChange={setFilters}
-                onClearAll={clearFilters}
-                boards={boards}
-                tags={tags}
-                segments={segments}
-                onToggleBoard={toggleBoard}
-                onToggleTag={toggleTag}
-                onToggleSegment={toggleSegment}
-              />
+              <div className="px-1 sm:px-3">
+                <RoadmapFiltersBar
+                  filters={filters}
+                  onFiltersChange={setFilters}
+                  onClearAll={clearFilters}
+                  boards={boards}
+                  tags={tags}
+                  segments={segments}
+                  onToggleBoard={toggleBoard}
+                  onToggleTag={toggleTag}
+                  onToggleSegment={toggleSegment}
+                />
+              </div>
             </div>
 
             <DndContext
@@ -247,12 +252,11 @@ export function RoadmapAdmin() {
                 </div>
               </div>
 
-              {createPortal(
+              <BodyPortal>
                 <DragOverlay dropAnimation={null}>
                   {activePost && <RoadmapCardOverlay post={activePost} />}
-                </DragOverlay>,
-                document.body
-              )}
+                </DragOverlay>
+              </BodyPortal>
             </DndContext>
           </>
         ) : (

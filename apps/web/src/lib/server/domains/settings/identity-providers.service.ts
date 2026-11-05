@@ -23,20 +23,26 @@ import {
   eq,
   identityProvider,
   isNull,
+  settings,
   ssoVerifiedDomain,
   type IdentityProviderClaimMapping,
 } from '@/lib/server/db'
-import type { IdentityProviderId } from '@quackback/ids'
+import type { Database, Transaction } from '@/lib/server/db'
+import { oidcRedirectStyleFrom, type OidcRedirectStyle } from '@/lib/shared/oidc-redirect'
+import type { IdentityProviderId, UserId } from '@quackback/ids'
 import { parseSsoTestCapture, type SsoTestCapture } from '@/lib/shared/sso-test-capture'
 import {
   applyClaimMappingEdits,
   effectiveProfileSignature,
   mappingSaveRisks,
   mappingWouldStripUnsupported,
+  roleRuleGrantsToCheck,
   storedJsonEqual,
   type ClaimMappingOperation,
+  type RoleRuleGrantCheck,
 } from '@/lib/shared/sso-claim-mapping-edit'
 import { logger } from '@/lib/server/logger'
+import { isPlainRecord } from '@/lib/shared/record'
 import { getPublicUrlOrNull } from '@/lib/server/storage/s3'
 import { absolutizeOffHostAssetUrl } from '@/lib/server/storage/asset-url'
 import {
@@ -49,7 +55,7 @@ import { AUTH_CREDENTIAL_PREFIX } from '@/lib/server/auth/auth-providers'
 import { verifiedDomainCount, shouldRenderPublicButton } from '@/lib/server/auth/provider-ids'
 import type { VerifiedDomain } from './settings.types'
 import { invalidateSettingsCache, wrapDbError } from './settings.helpers'
-import { ConflictError, ValidationError } from '@/lib/shared/errors'
+import { ConflictError, ForbiddenError, ValidationError } from '@/lib/shared/errors'
 
 const log = logger.child({ component: 'identity-providers' })
 
@@ -86,6 +92,7 @@ export interface IdentityProvider {
   scopes: string | null
   prompt: string | null
   tokenEndpointAuthMethod: string | null
+  idTokenNonce: string | null
   enabled: boolean
   /** True when a client secret is saved at `auth_<registrationId>`. An enabled
    *  provider without one registers nothing, so it is not a usable sign-in
@@ -94,6 +101,9 @@ export interface IdentityProvider {
   autoCreateUsers: boolean
   autoProvisionRole: Role | null
   claimMapping: IdentityProviderClaimMapping | null
+  /** Which callback URL sign-in sends as the redirect URI. `current` unless
+   *  the provider was recorded as `legacy`; see `oidc-redirect.ts`. */
+  redirectStyle: OidcRedirectStyle
   showButton: boolean
   /** S3 storage key for the uploaded provider logo, or null. */
   logoKey: string | null
@@ -135,6 +145,7 @@ export interface UpsertIdentityProviderInput {
   scopes?: string | null
   prompt?: string | null
   tokenEndpointAuthMethod?: string | null
+  idTokenNonce?: string | null
   enabled?: boolean
   autoCreateUsers?: boolean
   autoProvisionRole?: Role | null
@@ -142,6 +153,12 @@ export interface UpsertIdentityProviderInput {
   showButton?: boolean
   acknowledgeIdentifierChange?: boolean
   acknowledgeAdminRules?: boolean
+  /**
+   * The grant check for the saving admin (`roleRuleGrantCheck` in the roles
+   * domain). Saving a rule that grants a workspace role is a grant, so such a
+   * save without one is refused.
+   */
+  checkRoleGrants?: RoleRuleGrantCheck
 }
 
 // ============================================================================
@@ -178,10 +195,12 @@ const CONNECTION_FIELDS = [
   // Scopes decide which claims the IdP releases, which is precisely what the
   // test validates. Omitting them let a stale pass keep vouching for a scope
   // set the test never exercised. Prompt and the token-endpoint auth method are
-  // here for the same reason: both can make a request the IdP refuses.
+  // here for the same reason: both can make a request the IdP refuses. The
+  // nonce setting decides whether the test checks the echo at all.
   'scopes',
   'prompt',
   'tokenEndpointAuthMethod',
+  'idTokenNonce',
 ] as const
 
 type ConnectionField = (typeof CONNECTION_FIELDS)[number]
@@ -237,10 +256,101 @@ function rowToVerifiedDomain(row: typeof ssoVerifiedDomain.$inferSelect): Verifi
   }
 }
 
+/**
+ * The recorded redirect styles, keyed by registrationId, from the raw
+ * `settings.auth_config` JSON. Read directly rather than through the settings
+ * cache so a write in the same request is seen.
+ */
+async function readRedirectStyles(
+  exec: Database | Transaction
+): Promise<Record<string, OidcRedirectStyle>> {
+  const [row] = await exec.select({ authConfig: settings.authConfig }).from(settings).limit(1)
+  return parseRedirectStyles(parseAuthConfigJson(row?.authConfig ?? null))
+}
+
+/**
+ * The same styles from the workspace settings row every request already reads
+ * (memoized per request and cached across them), so listing providers costs no
+ * extra query. A caller that already holds the row passes its `auth_config`,
+ * which the workspace-settings loader must do: it lists providers while that
+ * very memo is being filled, and waiting on it from inside would never return.
+ * Writes read through {@link readRedirectStyles} instead, after their commit.
+ */
+async function readCachedRedirectStyles(opts: {
+  authConfig?: string | null
+}): Promise<Record<string, OidcRedirectStyle>> {
+  let authConfig = opts.authConfig ?? null
+  if (!('authConfig' in opts)) {
+    const { getWorkspaceSettingsRow } = await import('./settings.service')
+    authConfig = (await getWorkspaceSettingsRow())?.authConfig ?? null
+  }
+  return parseRedirectStyles(parseAuthConfigJson(authConfig))
+}
+
+function parseAuthConfigJson(json: string | null): Record<string, unknown> {
+  if (!json) return {}
+  try {
+    const parsed: unknown = JSON.parse(json)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+function parseRedirectStyles(
+  authConfig: Record<string, unknown>
+): Record<string, OidcRedirectStyle> {
+  const raw = authConfig.oidcRedirectStyles
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const styles: Record<string, OidcRedirectStyle> = {}
+  for (const [registrationId, value] of Object.entries(raw)) {
+    styles[registrationId] = oidcRedirectStyleFrom(value)
+  }
+  return styles
+}
+
+/**
+ * Record (or with `null`, forget) a provider's redirect style, inside the
+ * caller's transaction when it passes one. Rewrites only the
+ * `oidcRedirectStyles` key of the stored JSON and leaves every other key
+ * exactly as stored, reading under `FOR UPDATE`. The other `auth_config`
+ * writers (`updateAuthConfig`, `patchSsoOidc`) take the same row lock and keep
+ * `oidcRedirectStyles` as the locked row has it, so neither side can write a
+ * stale copy of the other's keys back. A caller holding a provider row must
+ * have locked it before calling this. A workspace with no settings row has
+ * nothing to record against and is left alone.
+ */
+export async function writeRedirectStyle(
+  tx: Database | Transaction,
+  registrationId: string,
+  style: OidcRedirectStyle | null
+): Promise<void> {
+  const [row] = await tx
+    .select({ id: settings.id, authConfig: settings.authConfig })
+    .from(settings)
+    .limit(1)
+    .for('update')
+  if (!row) return
+  const stored = parseAuthConfigJson(row.authConfig)
+  const styles = parseRedirectStyles(stored)
+  if (style) {
+    styles[registrationId] = style
+  } else {
+    delete styles[registrationId]
+  }
+  await tx
+    .update(settings)
+    .set({ authConfig: JSON.stringify({ ...stored, oidcRedirectStyles: styles }) })
+    .where(eq(settings.id, row.id))
+}
+
 function rowToIdentityProvider(
   row: typeof identityProvider.$inferSelect,
   domains: VerifiedDomain[],
-  configured: boolean
+  configured: boolean,
+  redirectStyles: Record<string, OidcRedirectStyle>
 ): IdentityProvider {
   return {
     id: row.id,
@@ -257,11 +367,13 @@ function rowToIdentityProvider(
     scopes: row.scopes,
     prompt: row.prompt,
     tokenEndpointAuthMethod: row.tokenEndpointAuthMethod,
+    idTokenNonce: row.idTokenNonce,
     enabled: row.enabled,
     configured,
     autoCreateUsers: row.autoCreateUsers,
     autoProvisionRole: row.autoProvisionRole,
     claimMapping: row.claimMapping ?? null,
+    redirectStyle: oidcRedirectStyleFrom(redirectStyles[row.registrationId]),
     showButton: row.showButton,
     logoKey: row.logoKey,
     logoUrl: offHostPublicUrl(row.logoKey),
@@ -282,13 +394,19 @@ function rowToIdentityProvider(
  * List every identity provider with its linked verified domains and the
  * derived visibility. Domains are grouped from `sso_verified_domain` by
  * `provider_id`; unlinked domains (null `provider_id`) are excluded.
+ *
+ * `opts.authConfig` is the raw `settings.auth_config` the caller already holds
+ * (null for none); omitted, it comes from the request's cached settings row.
  */
-export async function listIdentityProviders(): Promise<IdentityProvider[]> {
+export async function listIdentityProviders(
+  opts: { authConfig?: string | null } = {}
+): Promise<IdentityProvider[]> {
   try {
-    const [providers, domains, configuredTypes] = await Promise.all([
+    const [providers, domains, configuredTypes, redirectStyles] = await Promise.all([
       db.select().from(identityProvider).orderBy(identityProvider.createdAt),
       db.select().from(ssoVerifiedDomain).orderBy(ssoVerifiedDomain.createdAt),
       getConfiguredIntegrationTypes(),
+      readCachedRedirectStyles(opts),
     ])
 
     const byProvider = new Map<string, VerifiedDomain[]>()
@@ -306,7 +424,8 @@ export async function listIdentityProviders(): Promise<IdentityProvider[]> {
       rowToIdentityProvider(
         p,
         byProvider.get(p.id) ?? [],
-        configuredTypes.has(`${AUTH_CREDENTIAL_PREFIX}${p.registrationId}`)
+        configuredTypes.has(`${AUTH_CREDENTIAL_PREFIX}${p.registrationId}`),
+        redirectStyles
       )
     )
   } catch (error) {
@@ -457,6 +576,7 @@ export async function upsertIdentityProvider(
         if (input.prompt !== undefined) patch.prompt = input.prompt
         if (input.tokenEndpointAuthMethod !== undefined)
           patch.tokenEndpointAuthMethod = input.tokenEndpointAuthMethod
+        if (input.idTokenNonce !== undefined) patch.idTokenNonce = input.idTokenNonce
         if (input.enabled !== undefined) patch.enabled = input.enabled
         if (input.autoCreateUsers !== undefined) patch.autoCreateUsers = input.autoCreateUsers
         if (input.autoProvisionRole !== undefined) patch.autoProvisionRole = input.autoProvisionRole
@@ -468,7 +588,12 @@ export async function upsertIdentityProvider(
             )
           }
           if (!storedJsonEqual(existing.claimMapping, input.claimMapping)) {
-            const risks = mappingSaveRisks(existing.claimMapping, input.claimMapping)
+            const grants = await runRoleGrantCheck(
+              existing.claimMapping,
+              input.claimMapping,
+              input.checkRoleGrants
+            )
+            const risks = mappingSaveRisks(existing.claimMapping, input.claimMapping, grants)
             if (risks.identifierChanged && !input.acknowledgeIdentifierChange) {
               throw new ValidationError(
                 'MAPPING_IDENTIFIER_ACK_REQUIRED',
@@ -483,6 +608,19 @@ export async function upsertIdentityProvider(
             }
           }
           patch.claimMapping = input.claimMapping
+        }
+        // A new default role or a new mapping can each turn sync into a lockout.
+        const nextMapping =
+          input.claimMapping !== undefined ? input.claimMapping : existing.claimMapping
+        const nextDefault =
+          input.autoProvisionRole !== undefined
+            ? input.autoProvisionRole
+            : existing.autoProvisionRole
+        if (
+          !storedJsonEqual(existing.claimMapping, nextMapping) ||
+          existing.autoProvisionRole !== nextDefault
+        ) {
+          await refuseSyncLockout(existing.id, nextMapping, nextDefault)
         }
         if (input.showButton !== undefined) patch.showButton = input.showButton
 
@@ -501,6 +639,9 @@ export async function upsertIdentityProvider(
           .where(eq(identityProvider.id, existing.id))
           .returning()
       } else {
+        if (input.claimMapping) {
+          await runRoleGrantCheck(null, input.claimMapping, input.checkRoleGrants)
+        }
         // Insert: omit `id` so the typeIdWithDefault column generates it.
         ;[row] = await tx
           .insert(identityProvider)
@@ -518,6 +659,7 @@ export async function upsertIdentityProvider(
             scopes: input.scopes ?? null,
             prompt: input.prompt ?? null,
             tokenEndpointAuthMethod: input.tokenEndpointAuthMethod ?? null,
+            idTokenNonce: input.idTokenNonce ?? null,
             enabled: input.enabled ?? false,
             autoCreateUsers: input.autoCreateUsers ?? true,
             autoProvisionRole: input.autoProvisionRole ?? null,
@@ -533,11 +675,12 @@ export async function upsertIdentityProvider(
     resetAuth()
     await invalidateSettingsCache()
 
-    const [domains, configured] = await Promise.all([
+    const [domains, configured, redirectStyles] = await Promise.all([
       listDomainsForProvider(saved.id),
       hasPlatformCredentials(`${AUTH_CREDENTIAL_PREFIX}${saved.registrationId}`),
+      readRedirectStyles(db),
     ])
-    return rowToIdentityProvider(saved, domains, configured)
+    return rowToIdentityProvider(saved, domains, configured, redirectStyles)
   } catch (error) {
     log.error({ err: error }, 'upsert identity provider failed')
     wrapDbError('upsert identity provider', error)
@@ -587,6 +730,7 @@ export async function deleteIdentityProvider(id: IdentityProviderId): Promise<vo
         .where(eq(identityProvider.id, id))
         .returning({ registrationId: identityProvider.registrationId })
       if (!row) return null
+      await writeRedirectStyle(tx, row.registrationId, null)
       await bumpAuthConfigVersionInTx(tx)
       return row
     })
@@ -602,6 +746,64 @@ export async function deleteIdentityProvider(id: IdentityProviderId): Promise<vo
     if (error instanceof ValidationError) throw error
     log.error({ err: error }, 'delete identity provider failed')
     wrapDbError('delete identity provider', error)
+  }
+}
+
+/**
+ * Switch which callback URL a provider sends as its redirect URI. Sign-in
+ * reads it at registration, so the write bumps the auth config version. It
+ * also restamps `detailsChangedAt`: a test made through the old URL says
+ * nothing about whether the IdP accepts the new one. Returns the updated
+ * provider, or null when it does not exist.
+ */
+export async function setIdentityProviderRedirectStyle(
+  id: IdentityProviderId,
+  style: OidcRedirectStyle
+): Promise<IdentityProvider | null> {
+  log.info({ id, style }, 'set identity provider redirect style')
+  try {
+    const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
+    const { resetAuth } = await import('@/lib/server/auth')
+
+    const saved = await db.transaction(async (tx) => {
+      // Lock the provider row FIRST, then settings (inside writeRedirectStyle):
+      // the order upsert and delete take them in, which write the provider row
+      // and then bump the version on settings. The opposite order would let a
+      // switch and a save of the same provider each hold the lock the other
+      // waits for.
+      const [existing] = await tx
+        .select({ registrationId: identityProvider.registrationId })
+        .from(identityProvider)
+        .where(eq(identityProvider.id, id))
+        .for('update')
+      if (!existing) return null
+      const current = oidcRedirectStyleFrom((await readRedirectStyles(tx))[existing.registrationId])
+      if (current === style) {
+        const [row] = await tx.select().from(identityProvider).where(eq(identityProvider.id, id))
+        return row ?? null
+      }
+      await writeRedirectStyle(tx, existing.registrationId, style)
+      const [row] = await tx
+        .update(identityProvider)
+        .set({ detailsChangedAt: new Date() })
+        .where(eq(identityProvider.id, id))
+        .returning()
+      await bumpAuthConfigVersionInTx(tx)
+      return row ?? null
+    })
+    if (!saved) return null
+
+    resetAuth()
+    await invalidateSettingsCache()
+    const [domains, configured, redirectStyles] = await Promise.all([
+      listDomainsForProvider(saved.id),
+      hasPlatformCredentials(`${AUTH_CREDENTIAL_PREFIX}${saved.registrationId}`),
+      readRedirectStyles(db),
+    ])
+    return rowToIdentityProvider(saved, domains, configured, redirectStyles)
+  } catch (error) {
+    log.error({ err: error }, 'set identity provider redirect style failed')
+    wrapDbError('set identity provider redirect style', error)
   }
 }
 
@@ -659,6 +861,11 @@ export async function persistTestResult(
     expectedDetailsChangedAt: string | null
     outcome: 'success' | 'mapping_failed'
     capture: SsoTestCapture
+    /** What the test saw of the nonce. Written only with a passing result, and
+     *  without restamping `detailsChangedAt`, which would void this very pass. */
+    idTokenNonce?: 'check' | 'off'
+    /** The admin who ran the test; a nonce change it makes is audited as theirs. */
+    auditActorUserId?: UserId
   }
 ): Promise<'stamped' | 'stale'> {
   const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
@@ -671,18 +878,42 @@ export async function persistTestResult(
         ? isNull(identityProvider.detailsChangedAt)
         : eq(identityProvider.detailsChangedAt, new Date(args.expectedDetailsChangedAt))
 
+    const writesNonce = args.outcome === 'success' && args.idTokenNonce !== undefined
+    const nextNonce = args.idTokenNonce === 'off' ? 'off' : null
+
     const result = await db.transaction(async (tx) => {
+      // Read under the row lock the update takes anyway, so the audited
+      // "before" is the value this write replaces even when tests overlap.
+      const [prior] = writesNonce
+        ? await tx
+            .select({ idTokenNonce: identityProvider.idTokenNonce })
+            .from(identityProvider)
+            .where(eq(identityProvider.id, id))
+            .for('update')
+        : []
       const [row] = await tx
         .update(identityProvider)
         .set({
           lastTestCapture: args.capture,
           ...(args.outcome === 'success' ? { lastSuccessfulTestAt: new Date() } : {}),
+          ...(writesNonce ? { idTokenNonce: nextNonce } : {}),
         })
         .where(and(eq(identityProvider.id, id), detailsMatch))
         .returning({ id: identityProvider.id })
       if (!row) return 'stale' as const
       if (args.outcome === 'success') {
         await bumpAuthConfigVersionInTx(tx)
+      }
+      if (writesNonce && prior && (prior.idTokenNonce ?? null) !== nextNonce) {
+        const { recordAuditEventInTransaction } = await import('@/lib/server/audit/log')
+        await recordAuditEventInTransaction(tx, {
+          event: 'idp.updated',
+          actor: { userId: args.auditActorUserId ?? null },
+          target: { type: 'identity_provider', id },
+          before: { idTokenNonce: prior.idTokenNonce ?? null },
+          after: { idTokenNonce: nextNonce },
+          metadata: { source: 'connection_test' },
+        })
       }
       return 'stamped' as const
     })
@@ -699,6 +930,41 @@ export async function persistTestResult(
   }
 }
 
+/**
+ * Refuse a save that would, with sync on, demote every person able to fix it.
+ * See `syncLockoutCount`.
+ */
+async function refuseSyncLockout(
+  id: IdentityProviderId,
+  mapping: unknown,
+  defaultRole: Role | null
+): Promise<void> {
+  const { syncLockoutCount } = await import('./identity-provider-accounts')
+  const n = await syncLockoutCount(id, mapping, defaultRole)
+  if (n === 0) return
+  throw new ValidationError(
+    'SYNC_LOCKOUT',
+    `Saving would stop ${n} ${n === 1 ? 'person' : 'people'} from managing SSO the next time they sign in. Add a rule that gives them a role that can manage SSO, make the default role Admin, or keep sync off.`
+  )
+}
+
+/**
+ * Run the caller's grant check over a mapping save. Without one, a save that
+ * grants a workspace role is refused (fail closed) and no role counts as
+ * admin-tier, which only matters for rules that were already stored.
+ */
+async function runRoleGrantCheck(
+  before: unknown,
+  after: unknown,
+  check: RoleRuleGrantCheck | undefined
+): Promise<{ adminTierRoleIds: ReadonlySet<string> }> {
+  if (check) return check(before, after)
+  if (roleRuleGrantsToCheck(before, after).length > 0) {
+    throw new ForbiddenError('GRANT_CEILING', 'Assigner permission set is required')
+  }
+  return { adminTierRoleIds: new Set() }
+}
+
 export async function saveIdentityProviderClaimMapping(
   id: IdentityProviderId,
   args: {
@@ -706,6 +972,8 @@ export async function saveIdentityProviderClaimMapping(
     operations: ClaimMappingOperation[]
     acknowledgeIdentifierChange?: boolean
     acknowledgeAdminRules?: boolean
+    /** The saving admin's grant check; see `UpsertIdentityProviderInput`. */
+    checkRoleGrants?: RoleRuleGrantCheck
   }
 ): Promise<IdentityProvider> {
   const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
@@ -729,7 +997,8 @@ export async function saveIdentityProviderClaimMapping(
         )
       }
       const next = applyClaimMappingEdits(existing.claimMapping, args.operations)
-      const risks = mappingSaveRisks(existing.claimMapping, next)
+      const grants = await runRoleGrantCheck(existing.claimMapping, next, args.checkRoleGrants)
+      const risks = mappingSaveRisks(existing.claimMapping, next, grants)
       if (risks.identifierChanged && !args.acknowledgeIdentifierChange) {
         throw new ValidationError(
           'MAPPING_IDENTIFIER_ACK_REQUIRED',
@@ -741,6 +1010,10 @@ export async function saveIdentityProviderClaimMapping(
           'MAPPING_ADMIN_ACK_REQUIRED',
           'Saving admin role rules requires explicit acknowledgement.'
         )
+      }
+      const roleSection = (m: unknown) => (isPlainRecord(m) ? m.role : undefined)
+      if (!storedJsonEqual(roleSection(existing.claimMapping), roleSection(next))) {
+        await refuseSyncLockout(id, next, existing.autoProvisionRole)
       }
       const restamp =
         effectiveProfileSignature(existing.claimMapping) !== effectiveProfileSignature(next)
@@ -758,13 +1031,20 @@ export async function saveIdentityProviderClaimMapping(
 
     resetAuth()
     await invalidateSettingsCache()
-    const [domains, configured] = await Promise.all([
+    const [domains, configured, redirectStyles] = await Promise.all([
       listDomainsForProvider(saved.id),
       hasPlatformCredentials(`${AUTH_CREDENTIAL_PREFIX}${saved.registrationId}`),
+      readRedirectStyles(db),
     ])
-    return rowToIdentityProvider(saved, domains, configured)
+    return rowToIdentityProvider(saved, domains, configured, redirectStyles)
   } catch (error) {
-    if (error instanceof ValidationError || error instanceof ConflictError) throw error
+    if (
+      error instanceof ValidationError ||
+      error instanceof ConflictError ||
+      error instanceof ForbiddenError
+    ) {
+      throw error
+    }
     log.error({ err: error }, 'save identity provider claim mapping failed')
     wrapDbError('save identity provider claim mapping', error)
     throw error

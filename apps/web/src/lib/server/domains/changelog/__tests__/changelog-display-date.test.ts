@@ -49,7 +49,9 @@ vi.mock('@/lib/server/events/scheduler', () => ({
 }))
 
 const ENTRY_ID = 'changelog_01test' as ChangelogId
-const PUBLISHED_AT = new Date('2025-06-01T12:00:00Z')
+// Calendar-day normalization follows the server's local timezone. Use local
+// fixtures so this same-day case also holds outside UTC (for example UTC+8).
+const PUBLISHED_AT = new Date(2025, 5, 1, 12)
 
 function baseEntry(overrides: Record<string, unknown> = {}) {
   return {
@@ -103,7 +105,7 @@ describe('displayDate', () => {
 
   it('stores null when displayDate matches publishedAt calendar day', async () => {
     const { updateChangelog } = await import('../changelog.service')
-    const sameDay = new Date('2025-06-01T18:00:00Z')
+    const sameDay = new Date(2025, 5, 1, 18)
 
     mockEntryFindFirst.mockResolvedValueOnce(baseEntry()).mockResolvedValueOnce(baseEntry())
 

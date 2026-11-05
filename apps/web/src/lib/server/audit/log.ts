@@ -156,11 +156,14 @@ export type AuditEventType =
   // webhooks and announcements are not sent a second time. The metadata
   // carries the restore instant and the per-column outcome.
   | 'restore.side_effects_settled'
+  // Labs: visibility or enablement changed for a registered experiment
+  | 'labs.experiment.changed'
 
 export type AuditEventOutcome = 'success' | 'failure'
 
 export type AuditActorType = 'user' | 'service' | 'anonymous' | 'system' | 'api_key' | 'support'
-export type AuditAuthMethod = 'password' | 'sso' | 'magic_link' | 'ott' | 'api_key' | 'session'
+export type AuditAuthMethod =
+  'password' | 'sso' | 'oauth' | 'magic_link' | 'ott' | 'api_key' | 'session'
 
 export interface AuditActor {
   userId?: UserId | null

@@ -162,6 +162,7 @@ async function applyGitHubCommentEdit(githubCommentId: string, body: string | un
     .set({
       content: content || row.content,
       contentJson: contentJson ?? row.contentJson,
+      editedAt: new Date(),
       updatedAt: new Date(),
     })
     .where(eq(conversationMessages.id, row.id))
@@ -217,7 +218,7 @@ async function applyGitHubIssueState(
   })
   const { conversationToDTO } = await import('./conversation.query')
   const { publishConversationUpdate } = await import('@/lib/server/realtime/conversation-channels')
-  publishConversationUpdate(conversationId, await conversationToDTO(updated, 'agent'))
+  await publishConversationUpdate(conversationId, await conversationToDTO(updated, 'agent'))
 }
 
 async function bumpLastInbound(integrationId: IntegrationId): Promise<void> {

@@ -26,6 +26,8 @@ import {
 } from '@/lib/shared/assistant/config'
 import { isWidgetMessengerEnabled } from '@/lib/shared/support-surfaces'
 
+import { logSettingsReadError } from './settings-log'
+
 const log = logger.child({ component: 'settings-widget' })
 export const WIDGET_OBSERVATION_THROTTLE_MS = 15 * 60 * 1000
 
@@ -168,19 +170,23 @@ export function publicMessengerConfig(
 import {
   requireSettings,
   requireSettingsCached,
+  readSettingsRow,
+  type SettingsFreshness,
   wrapDbError,
   parseWidgetConfig,
   deepMerge,
   invalidateSettingsCache,
 } from './settings.helpers'
 
-export async function getWidgetConfig(): Promise<WidgetConfig> {
+export async function getWidgetConfig(
+  freshness: SettingsFreshness = 'cached'
+): Promise<WidgetConfig> {
   try {
-    // Read-only + on public hot paths (sdk.js, identify): cached row.
-    const org = await requireSettingsCached()
+    // Public hot paths (sdk.js, identify) read the cached row.
+    const org = await readSettingsRow(freshness)
     return parseWidgetConfig(org.widgetConfig)
   } catch (error) {
-    log.error({ err: error }, 'get widget config failed')
+    logSettingsReadError(log, error, 'get widget config failed')
     wrapDbError('fetch widget config', error)
   }
 }
@@ -344,7 +350,7 @@ export async function getPublicWidgetConfig(): Promise<PublicWidgetConfig> {
     const flags = resolveFeatureFlags(org.featureFlags)
     return projectPublicWidgetConfig(config, flags, identity)
   } catch (error) {
-    log.error({ err: error }, 'get public widget config failed')
+    logSettingsReadError(log, error, 'get public widget config failed')
     wrapDbError('fetch public widget config', error)
   }
 }
@@ -381,7 +387,7 @@ export async function isMessengerEnabled(): Promise<boolean> {
 export async function saveWidgetHeroImageKey(key: string): Promise<void> {
   log.info('save widget hero image key')
   try {
-    const config = await getWidgetConfig()
+    const config = await getWidgetConfig('fresh')
     const oldKey = config.home?.heroImageKey
     if (oldKey && oldKey !== key) {
       try {
@@ -401,7 +407,7 @@ export async function saveWidgetHeroImageKey(key: string): Promise<void> {
 export async function deleteWidgetHeroImage(): Promise<void> {
   log.info('delete widget hero image')
   try {
-    const config = await getWidgetConfig()
+    const config = await getWidgetConfig('fresh')
     const oldKey = config.home?.heroImageKey
     if (oldKey) {
       try {
@@ -430,6 +436,39 @@ export async function getWidgetSecret(): Promise<string | null> {
   } catch (error) {
     log.error({ err: error }, 'get widget secret failed')
     wrapDbError('fetch widget secret', error)
+  }
+}
+
+/**
+ * Admin-only: return the workspace signing secret, minting one if missing.
+ * Identify and other public paths must keep using {@link getWidgetSecret}.
+ */
+export async function ensureWidgetSecret(): Promise<string> {
+  log.debug('ensure widget secret')
+  try {
+    const org = await requireSettings()
+    if (org.widgetSecret) return org.widgetSecret
+
+    const secret = generateWidgetSecret()
+    const [updated] = await db
+      .update(settings)
+      .set({ widgetSecret: secret })
+      .where(and(eq(settings.id, org.id), isNull(settings.widgetSecret)))
+      .returning({ widgetSecret: settings.widgetSecret })
+    if (updated?.widgetSecret) {
+      log.info('minted widget secret')
+      await invalidateSettingsCache()
+      return updated.widgetSecret
+    }
+
+    const again = await requireSettings()
+    if (!again.widgetSecret) {
+      throw new Error('widget secret missing after ensure')
+    }
+    return again.widgetSecret
+  } catch (error) {
+    log.error({ err: error }, 'ensure widget secret failed')
+    wrapDbError('ensure widget secret', error)
   }
 }
 

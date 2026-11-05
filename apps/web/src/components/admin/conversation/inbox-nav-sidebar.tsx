@@ -1,16 +1,13 @@
+import { memo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useRouteContext } from '@tanstack/react-router'
 import {
-  ChatBubbleLeftRightIcon,
   InboxIcon,
   AtSymbolIcon,
   InboxArrowDownIcon,
   ChevronDownIcon,
   UserIcon,
-  MagnifyingGlassIcon,
   BookmarkIcon,
   FunnelIcon,
-  PlusIcon,
   EllipsisHorizontalIcon,
   StarIcon,
   SparklesIcon,
@@ -24,7 +21,6 @@ import { StarIcon as StarOutlineIcon } from '@heroicons/react/24/outline'
 import type { ConversationTagId, SegmentId, TeamId, ConversationViewId } from '@quackback/ids'
 import { fetchConversationTagsWithCountsFn } from '@/lib/server/functions/conversation-tags'
 import { fetchInboxSegmentsWithCountsFn } from '@/lib/server/functions/conversation-segments'
-import { listTeamsFn } from '@/lib/server/functions/teams'
 import {
   listConversationViewsFn,
   pinConversationViewFn,
@@ -34,7 +30,6 @@ import {
 import { conversationKeys } from '@/lib/client/queries/conversation-keys'
 import { inboxQueries } from '@/lib/client/queries/inbox'
 import type { ConversationViewDTO } from '@/lib/shared/conversation/views'
-import type { FeatureFlags } from '@/lib/shared/types/settings'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -45,7 +40,9 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { PageHeader } from '@/components/shared/page-header'
 import { FilterSection } from '@/components/shared/filter-section'
+import { PaneAddButton } from '@/components/shared/pane-add-button'
 import { MENU_ROW } from '@/components/ui/menu'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/shared/utils'
 
 // The active left-nav selection (one view / label / segment / team / custom
@@ -54,6 +51,7 @@ import { cn } from '@/lib/shared/utils'
 // nav consumers are unaffected.
 export {
   inboxNavKey,
+  isInboxView,
   isTicketInboxView,
   type InboxView,
   type InboxNavItem,
@@ -64,6 +62,8 @@ import {
   type InboxView,
   type InboxNavItem,
 } from '@/lib/client/conversation/inbox-scope'
+import { inboxTeamsQueryOptions, type InboxTeam } from '@/lib/client/queries/inbox-teams'
+import { useFeatureFlag } from '@/lib/client/hooks/use-root-context'
 
 // Start with the broad conversation queue, then progressively narrow to the
 // teammate's own work and secondary personal feeds.
@@ -92,27 +92,9 @@ export const TICKET_INBOX_VIEWS = [
   { view: 'tickets_tracker', label: 'Trackers', Icon: RectangleStackIcon },
 ] as const
 
-/**
- * URL-safe guard: is `v` one of the canonical inbox views (conversation scopes,
- * Quinn AI, or a Tickets-section scope)? Derived from the view lists so the
- * route's `?view=` allowlist tracks the nav definition and can't drift — a new
- * view is accepted in the URL the moment it's listed above, instead of needing
- * a second hand-maintained list in validateSearch.
- */
-export function isInboxView(v: unknown): v is InboxView {
-  return (
-    typeof v === 'string' &&
-    (CONVERSATION_VIEWS.some((c) => c.view === v) ||
-      TICKET_INBOX_VIEWS.some((c) => c.view === v) ||
-      v === QUINN_VIEW.view)
-  )
-}
-
 /** Shared (deduped) source of `supportTickets` — gates the Tickets nav section. */
 export function useSupportTicketsEnabled(): boolean {
-  const { settings } = useRouteContext({ from: '__root__' })
-  const flags = settings?.featureFlags as FeatureFlags | undefined
-  return flags?.supportTickets ?? false
+  return useFeatureFlag('supportTickets')
 }
 
 /** Shared (deduped) source of the inbox nav-badge counts (mine/unassigned/
@@ -161,26 +143,10 @@ export function useConversationViews() {
   })
 }
 
-export type InboxTeam = {
-  id: TeamId
-  name: string
-  icon: string | null
-  color: string
-  memberCount: number
-}
+export { inboxTeamsQueryOptions, type InboxTeam }
 
-const INBOX_TEAMS_KEY = ['admin', 'inbox', 'teams'] as const
-
-/** Shared (deduped) source of the per-team inbox roster. */
 export function useInboxTeams(): { data: InboxTeam[] | undefined } {
-  return useQuery({
-    queryKey: INBOX_TEAMS_KEY,
-    queryFn: async (): Promise<InboxTeam[]> => {
-      const teams = await listTeamsFn()
-      return teams.map((t) => ({ ...t, id: t.id as TeamId, color: t.color ?? 'gray' }))
-    },
-    staleTime: 60_000,
-  })
+  return useQuery(inboxTeamsQueryOptions())
 }
 
 /** Human label for the active scope, resolving a tag/segment/team/view id. */
@@ -270,6 +236,7 @@ function ScopeFilterSection({
               key={r.id}
               type="button"
               onClick={() => onSelect(item)}
+              data-active={active || undefined}
               className={itemClass(active)}
             >
               <span
@@ -308,7 +275,7 @@ function ScopeMenuSection({
   return (
     <>
       <DropdownMenuSeparator />
-      <DropdownMenuLabel className="text-[11px] uppercase tracking-wide text-muted-foreground">
+      <DropdownMenuLabel className="uppercase tracking-wide text-muted-foreground">
         {title}
       </DropdownMenuLabel>
       {rows.map((r) => {
@@ -404,30 +371,19 @@ function ViewsFilterSection({
   return (
     <FilterSection
       title="Saved views"
-      collapsible={false}
-      action={
-        onCreateView ? (
-          <button
-            type="button"
-            onClick={onCreateView}
-            title="Create view"
-            aria-label="Create view"
-            className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          >
-            <PlusIcon className="h-3 w-3" />
-          </button>
-        ) : undefined
-      }
+      action={onCreateView ? <PaneAddButton label="New view" onClick={onCreateView} /> : undefined}
     >
-      {views.length === 0 ? (
-        <p className="px-2.5 text-[11px] text-muted-foreground/60">No saved views yet</p>
-      ) : (
+      {views.length > 0 && (
         <div className="space-y-1">
           {views.map((v) => {
             const item: InboxNavItem = { kind: 'custom', viewId: v.id }
             const active = activeKey === inboxNavKey(item)
             return (
-              <div key={v.id} className={cn('group flex items-center gap-1', itemClass(active))}>
+              <div
+                key={v.id}
+                data-active={active || undefined}
+                className={cn('group flex items-center gap-1', itemClass(active))}
+              >
                 <button
                   type="button"
                   onClick={() => onSelect(item)}
@@ -515,20 +471,17 @@ function countForTicketView(
  * Grouped inbox navigation: broad queues first, followed by personal feeds,
  * ticket scopes, AI activity, and workspace-defined views/taxonomy.
  * All scopes are mutually exclusive. Desktop-only (lg+); the mobile equivalent
- * is InboxScopeMenu in the list header.
+ * is InboxScopeMenu in the list header. Memoized: the route re-renders on every
+ * URL change, including opening an item, which leaves these props unchanged.
  */
-export function InboxNavSidebar({
+export const InboxNavSidebar = memo(function InboxNavSidebar({
   nav,
   onSelect,
-  search,
-  onSearch,
   onCreateView,
   onEditView,
 }: {
   nav: InboxNavItem
   onSelect: (item: InboxNavItem) => void
-  search: string
-  onSearch: (value: string) => void
   onCreateView?: () => void
   onEditView?: (view: ConversationViewDTO) => void
 }) {
@@ -544,114 +497,105 @@ export function InboxNavSidebar({
   const quinnActive = activeKey === inboxNavKey(quinnItem)
 
   return (
-    <nav className="hidden w-64 shrink-0 flex-col border-r border-border/50 bg-card/30 lg:flex xl:w-72">
-      <div className="px-4 py-3.5">
-        <PageHeader icon={ChatBubbleLeftRightIcon} title="Inbox" />
+    <nav
+      data-side-pane=""
+      className="hidden w-64 shrink-0 flex-col overflow-hidden border-e border-chrome-hairline bg-background lg:flex xl:w-72"
+    >
+      <div className="px-5 py-3.5">
+        <PageHeader as="h2" title="Support" />
       </div>
-      {/* Search sits at the top of the pane, directly under the header. */}
-      <div className="px-4 pb-3">
-        <div className="relative">
-          <MagnifyingGlassIcon className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/50" />
-          <input
-            type="search"
-            value={search}
-            onChange={(e) => onSearch(e.target.value)}
-            placeholder="Search inbox…"
-            aria-label="Search inbox"
-            className="w-full rounded-md border border-border bg-background py-1.5 pl-8 pr-2.5 text-xs outline-none focus:ring-2 focus:ring-primary/20"
-          />
-        </div>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
-        <FilterSection title="Conversations">
-          <div className="space-y-1">
-            {CONVERSATION_VIEWS.map(({ view, label, Icon }) => {
-              const item: InboxNavItem = { kind: 'view', view }
-              const active = activeKey === inboxNavKey(item)
-              return (
-                <button
-                  key={view}
-                  type="button"
-                  onClick={() => onSelect(item)}
-                  className={itemClass(active)}
-                >
-                  <Icon className={cn('size-4 shrink-0', active && 'text-primary')} />
-                  <span className="min-w-0 flex-1 truncate text-left">{label}</span>
-                  <NavRowCount count={countForConversationView(view, counts)} />
-                </button>
-              )
-            })}
-          </div>
-        </FilterSection>
-
-        {showTickets && (
-          <FilterSection title="Tickets">
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="px-2.5 pb-5">
+          <FilterSection title="Conversations">
             <div className="space-y-1">
-              {TICKET_INBOX_VIEWS.map(({ view, label, Icon }) => {
+              {CONVERSATION_VIEWS.map(({ view, label, Icon }) => {
                 const item: InboxNavItem = { kind: 'view', view }
                 const active = activeKey === inboxNavKey(item)
-                const count = countForTicketView(view, counts)
                 return (
                   <button
                     key={view}
                     type="button"
                     onClick={() => onSelect(item)}
+                    data-active={active || undefined}
                     className={itemClass(active)}
                   >
                     <Icon className={cn('size-4 shrink-0', active && 'text-primary')} />
                     <span className="min-w-0 flex-1 truncate text-left">{label}</span>
-                    <NavRowCount count={count} />
+                    <NavRowCount count={countForConversationView(view, counts)} />
                   </button>
                 )
               })}
+              <button
+                type="button"
+                onClick={() => onSelect(quinnItem)}
+                data-active={quinnActive || undefined}
+                className={itemClass(quinnActive)}
+              >
+                <QUINN_VIEW.Icon className={cn('size-4 shrink-0', quinnActive && 'text-primary')} />
+                <span className="min-w-0 flex-1 truncate text-left">{QUINN_VIEW.label}</span>
+              </button>
             </div>
           </FilterSection>
-        )}
 
-        <FilterSection title="AI" collapsible={false}>
-          <button
-            type="button"
-            onClick={() => onSelect(quinnItem)}
-            className={itemClass(quinnActive)}
-          >
-            <QUINN_VIEW.Icon className={cn('size-4 shrink-0', quinnActive && 'text-primary')} />
-            {QUINN_VIEW.label}
-          </button>
-        </FilterSection>
+          {showTickets && (
+            <FilterSection title="Tickets">
+              <div className="space-y-1">
+                {TICKET_INBOX_VIEWS.map(({ view, label, Icon }) => {
+                  const item: InboxNavItem = { kind: 'view', view }
+                  const active = activeKey === inboxNavKey(item)
+                  const count = countForTicketView(view, counts)
+                  return (
+                    <button
+                      key={view}
+                      type="button"
+                      onClick={() => onSelect(item)}
+                      data-active={active || undefined}
+                      className={itemClass(active)}
+                    >
+                      <Icon className={cn('size-4 shrink-0', active && 'text-primary')} />
+                      <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+                      <NavRowCount count={count} />
+                    </button>
+                  )
+                })}
+              </div>
+            </FilterSection>
+          )}
 
-        <ScopeFilterSection
-          title="Teams"
-          rows={teamRows}
-          activeKey={activeKey}
-          onSelect={onSelect}
-          makeItem={teamNavItem}
-          showCounts={false}
-        />
-        <ViewsFilterSection
-          views={views ?? []}
-          activeKey={activeKey}
-          onSelect={onSelect}
-          onCreateView={onCreateView}
-          onEditView={onEditView}
-        />
-        <ScopeFilterSection
-          title="Tags"
-          rows={tags ?? []}
-          activeKey={activeKey}
-          onSelect={onSelect}
-          makeItem={tagNavItem}
-        />
-        <ScopeFilterSection
-          title="Segments"
-          rows={segments ?? []}
-          activeKey={activeKey}
-          onSelect={onSelect}
-          makeItem={segmentNavItem}
-        />
-      </div>
+          <ScopeFilterSection
+            title="Teams"
+            rows={teamRows}
+            activeKey={activeKey}
+            onSelect={onSelect}
+            makeItem={teamNavItem}
+            showCounts={false}
+          />
+          <ViewsFilterSection
+            views={views ?? []}
+            activeKey={activeKey}
+            onSelect={onSelect}
+            onCreateView={onCreateView}
+            onEditView={onEditView}
+          />
+          <ScopeFilterSection
+            title="Tags"
+            rows={tags ?? []}
+            activeKey={activeKey}
+            onSelect={onSelect}
+            makeItem={tagNavItem}
+          />
+          <ScopeFilterSection
+            title="Segments"
+            rows={segments ?? []}
+            activeKey={activeKey}
+            onSelect={onSelect}
+            makeItem={segmentNavItem}
+          />
+        </div>
+      </ScrollArea>
     </nav>
   )
-}
+})
 
 /**
  * Mobile scope switcher (lg:hidden) shown in the list header, since the nav
@@ -687,7 +631,7 @@ export function InboxScopeMenu({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-56">
-        <DropdownMenuLabel className="text-[11px] uppercase tracking-wide text-muted-foreground">
+        <DropdownMenuLabel className="uppercase tracking-wide text-muted-foreground">
           Conversations
         </DropdownMenuLabel>
         {CONVERSATION_VIEWS.map(({ view, label, Icon }) => {
@@ -708,7 +652,7 @@ export function InboxScopeMenu({
         {showTickets && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-[11px] uppercase tracking-wide text-muted-foreground">
+            <DropdownMenuLabel className="uppercase tracking-wide text-muted-foreground">
               Tickets
             </DropdownMenuLabel>
             {TICKET_INBOX_VIEWS.map(({ view, label, Icon }) => {
@@ -747,7 +691,7 @@ export function InboxScopeMenu({
         {(views ?? []).length > 0 && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-[11px] uppercase tracking-wide text-muted-foreground">
+            <DropdownMenuLabel className="uppercase tracking-wide text-muted-foreground">
               Saved views
             </DropdownMenuLabel>
             {(views ?? []).map((v) => {

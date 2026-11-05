@@ -22,6 +22,7 @@ let principalRows: Array<{
   id: PrincipalId
   displayName: string | null
   avatarUrl: string | null
+  accountName?: string | null
 }> = []
 // Records the argument handed to inArray so we can assert dedupe behavior.
 const inArrayCalls: unknown[][] = []
@@ -99,6 +100,8 @@ import {
   authorFromInput,
   fallbackAuthor,
   loadAuthors,
+  resolveAuthor,
+  resolveAuthorAudiences,
   listConversationsForAgent,
   resolveVisitorConversation,
   enrichMessagesForAgent,
@@ -188,7 +191,7 @@ describe('toMessageDTO', () => {
       makeMessage({ attachments, isInternal: true, senderType: 'agent' }),
       visitorAuthor
     )
-    expect(dto.attachments).toBe(attachments)
+    expect(dto.attachments).toEqual(attachments)
     expect(dto.isInternal).toBe(true)
     expect(dto.senderType).toBe('agent')
   })
@@ -434,6 +437,54 @@ describe('loadAuthors', () => {
       displayName: null,
       avatarUrl: 'https://x/a.png',
     })
+  })
+
+  it('prefers the account name for support surfaces and leaves the public name otherwise', async () => {
+    principalRows = [
+      {
+        id: visitorId,
+        displayName: 'Quiet Otter',
+        avatarUrl: null,
+        accountName: 'Ada Lovelace',
+      },
+    ]
+    const support = await loadAuthors([visitorId], { preferAccountName: true })
+    expect(support.get(visitorId)?.displayName).toBe('Ada Lovelace')
+
+    const publicName = await loadAuthors([visitorId])
+    expect(publicName.get(visitorId)?.displayName).toBe('Quiet Otter')
+  })
+})
+
+describe('resolveAuthorAudiences', () => {
+  it('uses account names for live internal notes and suggestion cards', async () => {
+    principalRows = [
+      { id: agentId, displayName: 'Support Ada', accountName: 'Ada Lovelace', avatarUrl: null },
+    ]
+    const author = await resolveAuthor({ principalId: agentId, displayName: 'Support Ada' })
+    expect(author.displayName).toBe('Ada Lovelace')
+  })
+
+  it('uses the stored public name even when the caller supplies an account name', async () => {
+    principalRows = [
+      { id: agentId, displayName: 'Support Ada', accountName: 'Ada Lovelace', avatarUrl: null },
+    ]
+    const authors = await resolveAuthorAudiences({
+      principalId: agentId,
+      displayName: 'Ada Lovelace',
+    })
+    expect(authors.publicAuthor.displayName).toBe('Support Ada')
+    expect(authors.supportAuthor.displayName).toBe('Ada Lovelace')
+    expect(inArrayCalls).toEqual([[agentId]])
+  })
+
+  it('keeps a caller-provided account name off the public fallback when the principal is missing', async () => {
+    const authors = await resolveAuthorAudiences({
+      principalId: agentId,
+      displayName: 'Ada Lovelace',
+    })
+    expect(authors.publicAuthor).toEqual(fallbackAuthor(agentId))
+    expect(authors.supportAuthor.displayName).toBe('Ada Lovelace')
   })
 })
 

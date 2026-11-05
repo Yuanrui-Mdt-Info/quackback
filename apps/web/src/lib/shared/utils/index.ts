@@ -13,13 +13,11 @@ export {
   normalizeStrength,
   strengthTier,
   formatBadgeCount,
-  slugify,
 } from './string'
 export {
   escapeHtmlAttr,
   sanitizeUrl,
   sanitizeImageUrl,
-  sanitizeImageUrl as sanitizeImageSrc,
   safePositiveInt,
   extractYoutubeId,
 } from './sanitize'
@@ -28,6 +26,8 @@ export {
   toIsoStringOrNull,
   toIsoDateOnly,
   formatMonthYear,
+  parseCalendarDate,
+  formatCalendarDate,
   tomorrowAt,
   startOfUtcMonth,
   inHours,

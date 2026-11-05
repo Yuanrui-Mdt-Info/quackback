@@ -68,7 +68,9 @@ export interface JobDefinition {
    *
    * This is the reference's per-`Worker` `concurrency`, and it is the reason
    * the job worker runs a bounded pool rather than a serial drain — see runner.ts.
-   * `workflow-dispatch` pins 1 deliberately: it is a global FIFO.
+   * `workflow-dispatch` and `event-reactions` pin 1 deliberately: one job at a
+   * time, claimed in enqueue order, within this process. That is not a global
+   * order (see runner.ts), so a handler must not depend on it for correctness.
    */
   concurrency?: number
   /** How long succeeded rows are kept. Defaults to the process-wide setting. */
@@ -105,6 +107,17 @@ export interface JobDefinition {
    * the job's own outcome is already decided.
    */
   onFailure?: (job: ClaimedJob, error: unknown, permanent: boolean) => Promise<void>
+}
+
+/** A confirmed provider rejection can impose a minimum delay before the next attempt. */
+export class RetryAfterError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs: number
+  ) {
+    super(message)
+    this.name = 'RetryAfterError'
+  }
 }
 
 /**
@@ -160,6 +173,10 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
     failedRetentionMs: 60 * 60_000,
     handler: async () =>
       (await import('@/lib/server/integrations/slack-hook-queue')).handleSlackHookJob,
+    onFailure: (job, error, permanent) =>
+      import('@/lib/server/integrations/sync/worker').then((m) =>
+        m.onIntegrationSyncFailure(job, error, permanent)
+      ),
   },
   {
     name: 'integration-deliveries-sweep',
@@ -305,6 +322,25 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
       import('@/lib/server/events/hook-job').then((m) => m.onHookJobFailure(job, error, permanent)),
   },
   {
+    name: 'integration-sync',
+    concurrency: 5,
+    leaseMs: 90_000,
+    maxAttempts: 6,
+    backoffMs: (attemptsMade) => hookRetryDelayMs(attemptsMade),
+    handler: () => import('@/lib/server/integrations/sync/queue').then((m) => m.runIntegrationSync),
+    onFailure: (job, error, permanent) =>
+      import('@/lib/server/integrations/sync/worker').then((m) =>
+        m.onIntegrationSyncFailure(job, error, permanent)
+      ),
+  },
+  {
+    name: 'integration-sync-sweep',
+    cron: '* * * * *',
+    concurrency: 1,
+    handler: () =>
+      import('@/lib/server/integrations/sync/sweep-queue').then((m) => m.sweepIntegrationSync),
+  },
+  {
     // Drains one job-owned outbox row. The row is written in emit()'s
     // transaction so rollback leaves nothing.
     name: 'event-dispatch',
@@ -314,6 +350,34 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
     failedRetentionMs: 30 * DAY_MS,
     handler: () =>
       import('@/lib/server/events/event-dispatch-queue').then((m) => m.runEventDispatch),
+  },
+  {
+    // One event's reactions that read state an earlier event left (SLA
+    // clocks, pair-ticket reopen, CSAT confirm), queued in emit()'s
+    // transaction. `concurrency: 1` runs them one at a time in enqueue order
+    // within a process, which keeps the common case in event order. It is not
+    // a global order (retries, a second worker process, a lapsed lease), so the
+    // order-sensitive reactions read the database instead of relying on it:
+    // see events/event-reactions.ts.
+    name: 'event-reactions',
+    concurrency: 1,
+    maxAttempts: 3,
+    retryBackoffMs: 1_000,
+    retentionMs: DAY_MS,
+    failedRetentionMs: 30 * DAY_MS,
+    handler: () =>
+      import('@/lib/server/events/event-reactions-queue').then((m) => m.runEventReactions),
+  },
+  {
+    // The close summaries, queued next to event-reactions. Slow AI calls that
+    // do not depend on order, so they run concurrently off the serial queue.
+    name: 'event-summaries',
+    concurrency: 2,
+    maxAttempts: 3,
+    retentionMs: DAY_MS,
+    failedRetentionMs: 30 * DAY_MS,
+    handler: () =>
+      import('@/lib/server/events/event-summaries-queue').then((m) => m.runEventSummaries),
   },
   {
     // Was `{segment-evaluation}`. Its schedules are rows in the workspace's own
@@ -330,6 +394,28 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
       import('@/lib/server/events/segment-scheduler').then((m) => m.runSegmentEvaluation),
   },
   {
+    // Thumbnails, counts and text excerpts for uploaded files. Bounded so a burst
+    // of uploads cannot starve the other queues of CPU.
+    name: 'file-preview',
+    concurrency: 2,
+    maxAttempts: 2,
+    leaseMs: 120_000,
+    retryBackoffMs: 5_000,
+    retentionMs: DAY_MS,
+    failedRetentionMs: 7 * DAY_MS,
+    handler: () => import('@/lib/server/messages/file-preview-job').then((m) => m.runFilePreview),
+  },
+  {
+    // Removes uploads never sent and files whose message was deleted for good.
+    // Offset from the other daily sweeps: it is bounded by object-store deletes
+    // rather than by rows.
+    name: 'file-retention',
+    cron: '40 4 * * *',
+    maxAttempts: 3,
+    handler: () =>
+      import('@/lib/server/domains/files/files.retention').then((m) => m.runFileRetention),
+  },
+  {
     // Was `{help-center-translate}`. The 120s lease is the case §7.2 was built
     // for, and the reason this tier runs a bounded pool instead of one serial
     // drain — see runner.ts.
@@ -343,6 +429,23 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
     handler: () =>
       import('@/lib/server/domains/help-center/help-center-translate-queue').then(
         (m) => m.runHelpCenterTranslate
+      ),
+  },
+  {
+    // Releases auto-translations parked at the AI allowance once allowance is
+    // available again (an upgrade mid-window). Parked rows run on their own at
+    // the window's end; this only brings them forward. Inert while nothing is
+    // parked.
+    name: 'help-center-translate-resume',
+    cron: '25 * * * *',
+    maxAttempts: 1,
+    cronEnabled: () =>
+      import('@/lib/server/domains/help-center/help-center-translate-resume').then((m) =>
+        m.hasPausedTranslations()
+      ),
+    handler: () =>
+      import('@/lib/server/domains/help-center/help-center-translate-resume').then(
+        (m) => m.runHelpCenterTranslateResume
       ),
   },
   {
@@ -365,10 +468,11 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
       ),
   },
   {
-    // Was `{workflow-dispatch}`. `concurrency: 1` is a deliberate global FIFO,
-    // not a throughput default — two events on one conversation (a reply then
-    // a close) are two jobs, and only a serial queue keeps their dispatch in
-    // enqueue order.
+    // Was `{workflow-dispatch}`. `concurrency: 1` is deliberate, not a
+    // throughput default: two events on one conversation (a reply then a
+    // close) are two jobs, and only a serial queue keeps their dispatch in
+    // enqueue order. That order holds per worker process (see
+    // workflow-dispatch-queue.ts for its limits).
     name: 'workflow-dispatch',
     concurrency: 1,
     maxAttempts: 3,

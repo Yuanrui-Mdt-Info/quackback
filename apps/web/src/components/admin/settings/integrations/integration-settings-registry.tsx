@@ -3,9 +3,9 @@
  * single dynamic `$type` settings route, replacing 25 near-identical route
  * files. Each entry supplies only what varies per provider: catalog metadata,
  * brand icon, connect/disconnect actions, the not-connected setup copy, and
- * (when connected) either a config panel or an enrichment banner. Everything
- * shared — the header, platform-credentials dialog, health panel, and setup
- * card chrome — lives in the route itself.
+ * (when connected) a capability configuration panel. Everything
+ * shared (the header, platform-credentials dialog, health panel, and setup
+ * card chrome) lives in the route itself.
  *
  * Config panels and connection actions are `React.lazy` so opening one
  * provider's settings page never pulls the other 24 providers' panels into the
@@ -13,7 +13,7 @@
  * in WO-11.)
  */
 import { lazy, type ComponentType, type ReactNode } from 'react'
-import { CheckCircleIcon } from '@heroicons/react/24/solid'
+import { CustomerContextConfig } from './shared/customer-context-config'
 import type { IntegrationCatalogEntry } from '@/lib/shared/integration-types'
 import type { NotificationChannel } from '@/components/admin/settings/integrations/shared/notification-channel-router'
 import type { IntegrationHealth } from './integration-health-panel'
@@ -21,6 +21,7 @@ import { getIntegrationIcon } from './integration-ui'
 
 // Catalogs (metadata: name/description/iconBg/docsUrl/platformCredentialFields/settingsPath).
 import * as catalogs from '@/lib/shared/integration-catalog'
+import { INLINE_LINK } from '@/components/admin/settings/inline-link'
 
 /** The `integration` object returned by `fetchIntegrationByType`. */
 export interface IntegrationSettingsData {
@@ -50,13 +51,8 @@ export interface IntegrationSettingsEntry {
   ConnectionActions: ConnectionActionsComponent
   /** Setup card copy shown when not connected. */
   setup: { title: string; description: string; steps: ReactNode[] }
-  /**
-   * Connected-state config panel. Omit for enrichment-only providers that show
-   * `connectedBanner` instead.
-   */
+  /** Connected-state capability configuration. */
   renderConfig?: (ctx: { integration: IntegrationSettingsData; isConnected: boolean }) => ReactNode
-  /** Connected-state banner for providers with no config panel (enrichment CRMs). */
-  connectedBanner?: ReactNode
   /** Override the "Connected to X" workspace label (e.g. azure_devops → organizationName). */
   getWorkspaceName?: (integration: IntegrationSettingsData) => string | null | undefined
   /**
@@ -64,6 +60,11 @@ export interface IntegrationSettingsEntry {
    * so this config can own Connection / Health / product sections.
    */
   bareConfig?: boolean
+  /**
+   * The connect step needs typed input (a URL, key or token), so it renders in
+   * the setup card rather than as a single header button.
+   */
+  connectForm?: boolean
 }
 
 // ── lazy per-provider components ────────────────────────────────────────────
@@ -83,11 +84,6 @@ const ClickUpConfig = lazy(() =>
 )
 const DiscordConfig = lazy(() =>
   import('@/integrations/discord/ui/discord-config').then((m) => ({ default: m.DiscordConfig }))
-)
-const FreshdeskConfig = lazy(() =>
-  import('@/integrations/freshdesk/ui/freshdesk-config').then((m) => ({
-    default: m.FreshdeskConfig,
-  }))
 )
 const GitHubConfig = lazy(() =>
   import('@/integrations/github/ui/github-config').then((m) => ({ default: m.GitHubConfig }))
@@ -116,19 +112,11 @@ const NotionConfig = lazy(() =>
 const NtfyConfig = lazy(() =>
   import('@/integrations/ntfy/ui/ntfy-config').then((m) => ({ default: m.NtfyConfig }))
 )
-const SalesforceConfig = lazy(() =>
-  import('@/integrations/salesforce/ui/salesforce-config').then((m) => ({
-    default: m.SalesforceConfig,
-  }))
-)
 const ShortcutConfig = lazy(() =>
   import('@/integrations/shortcut/ui/shortcut-config').then((m) => ({ default: m.ShortcutConfig }))
 )
 const SlackConfig = lazy(() =>
   import('@/integrations/slack/ui/slack-config').then((m) => ({ default: m.SlackConfig }))
-)
-const StripeConfig = lazy(() =>
-  import('@/integrations/stripe/ui/stripe-config').then((m) => ({ default: m.StripeConfig }))
 )
 const TeamsConfig = lazy(() =>
   import('@/integrations/teams/ui/teams-config').then((m) => ({ default: m.TeamsConfig }))
@@ -268,7 +256,7 @@ const ZendeskConnectionActions = lazy(() =>
 )
 
 /** Segment has no icon registered in `INTEGRATION_UI` (it isn't a tracker or a
- * feedback source badge) — its route renders an inline "S" glyph instead of a
+ * feedback source badge) - its route renders an inline "S" glyph instead of a
  * brand icon component. We keep that glyph here as a component so it fits the
  * `Icon: ComponentType<{ className?: string }>` shape the rest of the registry
  * expects. */
@@ -290,11 +278,11 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     setup: {
       title: 'Connect your Asana workspace',
       description:
-        'Connect Asana to automatically create tasks from feedback and keep statuses in sync across both platforms.',
+        'Connect Asana to create tasks from feedback and review incoming status changes.',
       steps: [
         <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to create tasks in your Asana workspace.
+          Click <span className="font-medium text-foreground">Connect Asana</span> to authorize
+          Quackback to create tasks in your Asana workspace.
         </p>,
         <p key="2">Select which project new feedback tasks should be created in.</p>,
         <p key="3">
@@ -314,6 +302,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   azure_devops: {
     type: 'azure_devops',
+    connectForm: true,
     catalog: catalogs.azureDevOpsCatalog,
     Icon: getIntegrationIcon('azure_devops')!,
     ConnectionActions: AzureDevOpsConnectionActions,
@@ -328,9 +317,9 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
             href="https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate"
             target="_blank"
             rel="noopener noreferrer"
-            className="font-medium text-primary underline underline-offset-2"
+            className={INLINE_LINK}
           >
-            Personal Access Token
+            Personal access token
           </a>{' '}
           in Azure DevOps with{' '}
           <span className="font-medium text-foreground">Work Items (Read & Write)</span> scope.
@@ -369,8 +358,8 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
         'Connect ClickUp to turn feedback into tasks and track progress directly from your workspace.',
       steps: [
         <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to create tasks in your ClickUp workspace.
+          Click <span className="font-medium text-foreground">Connect ClickUp</span> to authorize
+          Quackback to create tasks in your ClickUp workspace.
         </p>,
         <p key="2">Select a space and list where new feedback tasks should be created.</p>,
         <p key="3">
@@ -399,8 +388,8 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
         'Connect Discord to receive notifications when users submit feedback, when statuses change, and when comments are added.',
       steps: [
         <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to add the Quackback
-          bot to your Discord server.
+          Click <span className="font-medium text-foreground">Connect Discord</span> to add the
+          Quackback bot to your Discord server.
         </p>,
         <p key="2">
           Select which text channel notifications should be posted to. The bot needs access to the
@@ -425,13 +414,14 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   freshdesk: {
     type: 'freshdesk',
+    connectForm: true,
     catalog: catalogs.freshdeskCatalog,
     Icon: getIntegrationIcon('freshdesk')!,
     ConnectionActions: FreshdeskConnectionActions,
     setup: {
       title: 'Connect Freshdesk',
       description:
-        'Connect Freshdesk to enrich feedback with support ticket data. See open tickets, satisfaction scores, and contact details alongside each submission.',
+        'Connect Freshdesk to see contact details and open the customer’s Freshdesk profile.',
       steps: [
         <p key="1">
           Find your <span className="font-medium text-foreground">API key</span> in your Freshdesk
@@ -442,17 +432,11 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
           <span className="font-medium text-foreground">Save</span>. Quackback will verify the
           connection.
         </p>,
-        <p key="3">
-          Contact data will be automatically looked up by email when new feedback is submitted.
-        </p>,
+        <p key="3">Customer details are looked up by email when you open customer context.</p>,
       ],
     },
     renderConfig: ({ integration, isConnected }) => (
-      <FreshdeskConfig
-        integrationId={integration.id}
-        initialEventMappings={integration.eventMappings}
-        enabled={isConnected}
-      />
+      <CustomerContextConfig integrationId={integration.id} enabled={isConnected} />
     ),
   },
 
@@ -467,8 +451,8 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
         'Connect GitHub to automatically create issues from user feedback and sync statuses when issues are closed or reopened.',
       steps: [
         <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to create issues in your GitHub repositories.
+          Click <span className="font-medium text-foreground">Connect GitHub</span> to authorize
+          Quackback to create issues in your GitHub repositories.
         </p>,
         <p key="2">Select which repository new feedback issues should be created in.</p>,
         <p key="3">
@@ -483,7 +467,6 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
         initialConfig={integration.config}
         initialEventMappings={integration.eventMappings}
         enabled={isConnected}
-        health={integration.health}
       />
     ),
   },
@@ -496,7 +479,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     setup: {
       title: 'Connect GitLab',
       description:
-        'Connect GitLab.com or a self-hosted GitLab instance to create issues from feedback and sync statuses.',
+        'Connect GitLab.com or a self-hosted GitLab instance to create issues from feedback and review incoming status changes.',
       steps: [
         <p key="1">
           Configure your GitLab{' '}
@@ -506,9 +489,9 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
           redirect URI shown in the credentials form on your GitLab OAuth application.
         </p>,
         <p key="2">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          with your GitLab account. You will be sent to GitLab.com or your instance, depending on
-          the URL you configured.
+          Click <span className="font-medium text-foreground">Connect GitLab</span> to authorize
+          Quackback with your GitLab account. You will be sent to GitLab.com or your instance,
+          depending on the URL you configured.
         </p>,
         <p key="3">
           Select a project to create issues in, then choose which events should trigger new issues.
@@ -538,25 +521,15 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
         <p key="1">
           Connect your HubSpot account to authorize read-only access to contact and deal data.
         </p>,
-        <p key="2">
-          When feedback is submitted by a known email, Quackback looks up their HubSpot profile.
-        </p>,
+        <p key="2">Open customer context to look up the customer’s HubSpot profile by email.</p>,
         <p key="3">
           CRM context (company, deal value, lifecycle stage) appears alongside their feedback to
           help you prioritize by revenue impact.
         </p>,
       ],
     },
-    connectedBanner: (
-      <div className="rounded-xl border border-green-500/20 bg-green-500/5 p-6 shadow-sm">
-        <div className="flex items-start gap-3">
-          <CheckCircleIcon className="mt-0.5 h-5 w-5 shrink-0 text-green-500" />
-          <p className="text-sm text-foreground">
-            HubSpot enrichment is active. CRM data will automatically appear alongside feedback from
-            known contacts.
-          </p>
-        </div>
-      </div>
+    renderConfig: ({ integration, isConnected }) => (
+      <CustomerContextConfig integrationId={integration.id} enabled={isConnected} />
     ),
   },
 
@@ -568,29 +541,18 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     setup: {
       title: 'Connect your Intercom account',
       description:
-        'Connect Intercom to enrich feedback with customer context like company, plan, and conversation history.',
+        'Connect Intercom to enrich feedback with customer context like company, plan, and tags.',
       steps: [
         <p key="1">Connect your Intercom account to authorize read-only access to contact data.</p>,
-        <p key="2">
-          When feedback is submitted by a known email, Quackback automatically looks up their
-          Intercom profile.
-        </p>,
+        <p key="2">Open customer context to look up the customer’s Intercom profile by email.</p>,
         <p key="3">
           Customer context (company, plan, tags) appears alongside their feedback to help you
           prioritize.
         </p>,
       ],
     },
-    connectedBanner: (
-      <div className="rounded-xl border border-green-500/20 bg-green-500/5 p-6 shadow-sm">
-        <div className="flex items-start gap-3">
-          <CheckCircleIcon className="mt-0.5 h-5 w-5 shrink-0 text-green-500" />
-          <p className="text-sm text-foreground">
-            Intercom enrichment is active. Customer data from Intercom will automatically appear
-            alongside feedback from known contacts.
-          </p>
-        </div>
-      </div>
+    renderConfig: ({ integration, isConnected }) => (
+      <CustomerContextConfig integrationId={integration.id} enabled={isConnected} />
     ),
   },
 
@@ -602,11 +564,11 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     setup: {
       title: 'Connect your Jira instance',
       description:
-        "Connect Jira to automatically create and sync issues from feedback posts, keeping your team's workflow in sync.",
+        'Connect Jira to create issues from feedback and review incoming status changes.',
       steps: [
         <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to create issues in your Jira instance.
+          Click <span className="font-medium text-foreground">Connect Jira</span> to authorize
+          Quackback to create issues in your Jira instance.
         </p>,
         <p key="2">Select which project and issue type to use for new feedback issues.</p>,
         <p key="3">
@@ -632,11 +594,11 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     setup: {
       title: 'Connect your Linear workspace',
       description:
-        'Connect Linear to automatically create issues from user feedback and keep statuses in sync across both platforms.',
+        'Connect Linear to create issues from feedback and receive verified status updates on linked items.',
       steps: [
         <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to create issues in your Linear workspace.
+          Click <span className="font-medium text-foreground">Connect Linear</span> to authorize
+          Quackback to create issues in your Linear workspace.
         </p>,
         <p key="2">Select which team new feedback issues should be created in.</p>,
         <p key="3">
@@ -656,6 +618,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   make: {
     type: 'make',
+    connectForm: true,
     catalog: catalogs.makeCatalog,
     Icon: getIntegrationIcon('make')!,
     ConnectionActions: MakeConnectionActions,
@@ -694,8 +657,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     ConnectionActions: MondayConnectionActions,
     setup: {
       title: 'Connect Monday.com',
-      description:
-        'Connect Monday.com to automatically create items from feedback and sync statuses between platforms.',
+      description: 'Connect Monday.com to create items from feedback in your selected board.',
       steps: [
         <p key="1">
           Configure your Monday.com{' '}
@@ -703,8 +665,8 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
           settings.
         </p>,
         <p key="2">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          with your Monday.com workspace.
+          Click <span className="font-medium text-foreground">Connect Monday.com</span> to authorize
+          Quackback with your Monday.com workspace.
         </p>,
         <p key="3">
           Select a board to create items in, then choose which events should trigger new items.
@@ -723,6 +685,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   n8n: {
     type: 'n8n',
+    connectForm: true,
     catalog: catalogs.n8nCatalog,
     Icon: getIntegrationIcon('n8n')!,
     ConnectionActions: N8nConnectionActions,
@@ -765,8 +728,8 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
         'Connect Notion to automatically create database items when users submit feedback. Link feedback to your product roadmap in Notion.',
       steps: [
         <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          with your Notion workspace.
+          Click <span className="font-medium text-foreground">Connect Notion</span> to authorize
+          Quackback with your Notion workspace.
         </p>,
         <p key="2">
           Select which database new feedback items should be created in. The database must have a
@@ -789,6 +752,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   ntfy: {
     type: 'ntfy',
+    connectForm: true,
     catalog: catalogs.ntfyCatalog,
     Icon: getIntegrationIcon('ntfy')!,
     ConnectionActions: NtfyConnectionActions,
@@ -804,7 +768,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
         </p>,
         <p key="2">
           Paste the topic URL below. If your topic is protected, add an access token too. Click{' '}
-          <span className="font-medium text-foreground">Save</span> — Quackback will send a test
+          <span className="font-medium text-foreground">Save</span>. Quackback will send a test
           notification to verify the channel.
         </p>,
         <p key="3">
@@ -829,8 +793,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     ConnectionActions: SalesforceConnectionActions,
     setup: {
       title: 'Connect Salesforce',
-      description:
-        'Connect Salesforce to enrich feedback with CRM data. See account details, opportunity stage, and deal value alongside each feedback submission.',
+      description: 'Connect Salesforce to see customer and account details alongside feedback.',
       steps: [
         <p key="1">
           Configure your Salesforce{' '}
@@ -838,27 +801,21 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
           platform settings.
         </p>,
         <p key="2">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          with your Salesforce org.
+          Click <span className="font-medium text-foreground">Connect Salesforce</span> to authorize
+          Quackback with your Salesforce org.
         </p>,
-        <p key="3">
-          Contact data will be automatically looked up by email when new feedback is submitted.
-        </p>,
+        <p key="3">Customer details are looked up by email when you open customer context.</p>,
       ],
     },
     renderConfig: ({ integration, isConnected }) => (
-      <SalesforceConfig
-        integrationId={integration.id}
-        initialEventMappings={integration.eventMappings}
-        enabled={isConnected}
-      />
+      <CustomerContextConfig integrationId={integration.id} enabled={isConnected} />
     ),
   },
 
   // NOTE: segment's route diverges from the standard shape in three ways,
   // preserved here: (1) no `getIntegrationIcon` entry exists for segment (it's
   // neither a tracker nor a feedback-source badge in integration-ui.tsx), so
-  // its route renders an inline "S" glyph rather than a brand icon — wrapped
+  // its route renders an inline "S" glyph rather than a brand icon - wrapped
   // in `SegmentIcon` above to fit the `Icon` contract; (2) it has no config
   // panel and no `PlatformCredentialsDialog`/credentials button at all, just
   // connect/disconnect actions; (3) "connected" for segment covers both
@@ -866,6 +823,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
   // union elsewhere, so no divergence in the shared route's rendering).
   segment: {
     type: 'segment',
+    connectForm: true,
     catalog: catalogs.segmentCatalog,
     Icon: SegmentIcon,
     ConnectionActions: SegmentConnectionActions,
@@ -885,13 +843,14 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   shortcut: {
     type: 'shortcut',
+    connectForm: true,
     catalog: catalogs.shortcutCatalog,
     Icon: getIntegrationIcon('shortcut')!,
     ConnectionActions: ShortcutConnectionActions,
     setup: {
       title: 'Connect your Shortcut workspace',
       description:
-        'Connect Shortcut to automatically create stories from feedback and keep statuses in sync across both platforms.',
+        'Connect Shortcut to create stories from feedback and review incoming status changes.',
       steps: [
         <p key="1">
           Generate an API token from your Shortcut account settings and paste it below.
@@ -919,13 +878,9 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     ConnectionActions: SlackConnectionActions,
     setup: {
       title: 'Connect your Slack workspace',
-      description:
-        'Connect Slack to receive notifications when users submit feedback, when statuses change, and when comments are added.',
+      description: 'Post notifications to the Slack channel you choose.',
       steps: [
-        <p key="1">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to post messages to your Slack workspace.
-        </p>,
+        <p key="1">Authorize Quackback to post messages to your Slack workspace.</p>,
         <p key="2">
           Select which channel notifications should be posted to. The bot must be added to private
           channels before they appear in the list.
@@ -949,13 +904,13 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   stripe: {
     type: 'stripe',
+    connectForm: true,
     catalog: catalogs.stripeCatalog,
     Icon: getIntegrationIcon('stripe')!,
     ConnectionActions: StripeConnectionActions,
     setup: {
       title: 'Connect Stripe',
-      description:
-        'Connect Stripe to enrich feedback with customer revenue data. See MRR, plan tier, and billing status alongside each feedback submission.',
+      description: 'Connect Stripe to find customers by email and open their billing profile.',
       steps: [
         <p key="1">
           Create a <span className="font-medium text-foreground">restricted API key</span> in your
@@ -972,11 +927,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
       ],
     },
     renderConfig: ({ integration, isConnected }) => (
-      <StripeConfig
-        integrationId={integration.id}
-        initialEventMappings={integration.eventMappings}
-        enabled={isConnected}
-      />
+      <CustomerContextConfig integrationId={integration.id} enabled={isConnected} />
     ),
   },
 
@@ -994,8 +945,8 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
           Register Quackback in your Azure AD workspace and add the Teams bot permissions.
         </p>,
         <p key="2">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to post to your Teams channels.
+          Click <span className="font-medium text-foreground">Connect Teams</span> to authorize
+          Quackback to post to your Teams channels.
         </p>,
         <p key="3">
           Select a team and channel for notifications, then choose which events trigger messages.
@@ -1019,15 +970,14 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
     ConnectionActions: TrelloConnectionActions,
     setup: {
       title: 'Connect your Trello workspace',
-      description:
-        'Connect Trello to create cards from feedback and sync statuses between Trello lists and Quackback.',
+      description: 'Connect Trello to create cards from feedback and review incoming list changes.',
       steps: [
         <p key="1">
           Create a Trello Power-Up in your workspace (optional, only needed for custom branding).
         </p>,
         <p key="2">
-          Click <span className="font-medium text-foreground">Connect</span> to authorize Quackback
-          to access your Trello workspace.
+          Click <span className="font-medium text-foreground">Connect Trello</span> to authorize
+          Quackback to access your Trello workspace.
         </p>,
         <p key="3">Select which board and list new feedback cards should be created in.</p>,
         <p key="4">
@@ -1048,6 +998,7 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   zapier: {
     type: 'zapier',
+    connectForm: true,
     catalog: catalogs.zapierCatalog,
     Icon: getIntegrationIcon('zapier')!,
     ConnectionActions: ZapierConnectionActions,
@@ -1083,35 +1034,22 @@ export const INTEGRATION_SETTINGS: Record<string, IntegrationSettingsEntry> = {
 
   zendesk: {
     type: 'zendesk',
+    connectForm: true,
     catalog: catalogs.zendeskCatalog,
     Icon: getIntegrationIcon('zendesk')!,
     ConnectionActions: ZendeskConnectionActions,
     setup: {
       title: 'Connect your Zendesk account',
       description:
-        'Connect Zendesk to enrich feedback with support context like organization, tags, and ticket history.',
+        'Connect Zendesk to enrich feedback with support context like organization, role, and tags.',
       steps: [
-        <p key="1">
-          Connect your Zendesk account to authorize read-only access to user and ticket data.
-        </p>,
-        <p key="2">
-          When feedback is submitted by a known email, Quackback looks up their Zendesk profile.
-        </p>,
-        <p key="3">
-          Support context (organization, ticket history) appears alongside their feedback.
-        </p>,
+        <p key="1">Connect your Zendesk account to authorize read-only access to user data.</p>,
+        <p key="2">Open customer context to look up the customer’s Zendesk profile by email.</p>,
+        <p key="3">Support context (organization, role, tags) appears alongside their feedback.</p>,
       ],
     },
-    connectedBanner: (
-      <div className="rounded-xl border border-green-500/20 bg-green-500/5 p-6 shadow-sm">
-        <div className="flex items-start gap-3">
-          <CheckCircleIcon className="mt-0.5 h-5 w-5 shrink-0 text-green-500" />
-          <p className="text-sm text-foreground">
-            Zendesk enrichment is active. Support ticket data will automatically appear alongside
-            feedback from known contacts.
-          </p>
-        </div>
-      </div>
+    renderConfig: ({ integration, isConnected }) => (
+      <CustomerContextConfig integrationId={integration.id} enabled={isConnected} />
     ),
   },
 }

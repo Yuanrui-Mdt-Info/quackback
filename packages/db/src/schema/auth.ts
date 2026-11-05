@@ -223,6 +223,12 @@ export const user = pgTable(
  * during the brief window between `/two-factor/enable` and the
  * subsequent `/two-factor/verify-totp`; the default `true` matches
  * Better-Auth's expectation for newly-inserted rows.
+ *
+ * `failedVerificationCount` / `lockedUntil` are the 1.6.30 account-
+ * lockout fields. The plugin writes both on every TOTP verify (success
+ * resets, failure increments). Drizzle drops unknown keys from `.set()`,
+ * so omitting them produces `update "two_factor" set  where …` and
+ * enrolment / sign-in 500. See #432.
  */
 export const twoFactor = pgTable(
   'two_factor',
@@ -233,6 +239,8 @@ export const twoFactor = pgTable(
     backupCodes: text('backup_codes').notNull(),
     verified: boolean('verified').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    failedVerificationCount: integer('failed_verification_count').notNull().default(0),
+    lockedUntil: timestamp('locked_until', { withTimezone: true }),
   },
   (table) => [
     // Named to match the constraint the SQL migration created.
@@ -258,6 +266,8 @@ export const session = pgTable(
       .notNull(),
     ipAddress: text('ip_address'),
     userAgent: text('user_agent'),
+    // Session audience: dashboard | widget | portal. Only dashboard may satisfy team/permission gates.
+    scope: text('scope').notNull().default('dashboard'),
     userId: typeIdColumn('user')('user_id')
       .notNull()
       .references(() => user.id, { onDelete: 'cascade' }),
@@ -312,6 +322,25 @@ export const account = pgTable(
     index('account_user_provider_idx').on(table.userId, table.providerId),
   ]
 )
+
+/**
+ * The name and avatar URL an identity provider last wrote to an account's
+ * user, each kept only while the user's stored value still equals it. Profile
+ * sync on sign-in refreshes a recorded field and never one a person chose.
+ *
+ * A table of its own rather than columns on `account`: Better-Auth's adapter
+ * selects every `account` column, so a column there would fail every sign-in
+ * on a database that has not applied its migration yet. Nothing in Better-Auth
+ * reads this table. See 0292.
+ */
+export const accountProfileSync = pgTable('account_profile_sync', {
+  accountId: typeIdColumn('account')('account_id')
+    .primaryKey()
+    .references(() => account.id, { onDelete: 'cascade' }),
+  name: text('name'),
+  image: text('image'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+})
 
 export const verification = pgTable(
   'verification',
@@ -485,8 +514,10 @@ export const settings = pgTable('settings', {
   featureFlags: text('feature_flags'),
   /**
    * Inbound spam-filter configuration (JSON)
-   * Structure: { trustedSenders: string[] } — exact addresses or domains
-   * whose inbound messages bypass spam classification entirely.
+   * Structure: { trustedSenders: string[], aiClassifier: boolean }.
+   * trustedSenders: exact addresses or domains whose inbound messages bypass
+   * spam classification entirely. aiClassifier: whether new conversations go
+   * to the AI classifier (absent reads as on).
    */
   spamFilterConfig: text('spam_filter_config'),
   /**
@@ -563,19 +594,36 @@ export const settings = pgTable('settings', {
 /** Where identity may be read from, in resolver order. */
 export type IdentitySource = 'idToken' | 'userinfo' | 'accessTokenJwt'
 
-/** Profile fields a claim can be bound to. */
-export type ProfileField = 'id' | 'email' | 'name'
+/**
+ * Profile fields a claim can be bound to. `username` has no column of its
+ * own: it names the account when the provider sends no display name. `image`
+ * is the avatar, read as an http(s) URL.
+ */
+export type ProfileField = 'id' | 'email' | 'name' | 'username' | 'image'
 
 /**
  * Role-mapping rules applied to an OIDC claim at sign-in. Now the `role`
  * section of {@link IdentityProviderClaimMapping}; the shape is unchanged from
  * the former `attribute_mapping` column so migrated rows behave identically.
  */
+/** One role rule: when the claim contains a value, grant a role. */
+export type ClaimRoleRule = {
+  whenContains: string
+  role: 'admin' | 'member' | 'user'
+  /**
+   * A workspace role (custom or preset) granted on top of the `member` tier,
+   * the same way a custom-role invite or role change rides it. Only valid with
+   * `role: 'member'`. A matched rule naming a role that no longer exists
+   * grants nothing and leaves the person's role as it is.
+   */
+  roleId?: string
+}
+
 export type ClaimRoleMapping = {
   /** Dotted path or namespaced claim on the ID token. */
   claimPath: string
   /** First-match-wins role assignment from the resolved claim. */
-  rules: Array<{ whenContains: string; role: 'admin' | 'member' | 'user' }>
+  rules: ClaimRoleRule[]
   /** When true, every sign-in re-resolves and may demote/promote. */
   syncOnEverySignIn?: boolean
 }
@@ -591,12 +639,15 @@ export type ClaimRoleMapping = {
  * this is interpreted.
  */
 export type IdentityProviderClaimMapping = {
-  /** Which claim carries the account id, the email, the display name. */
+  /** Which claim carries the account id, the email, the display name, the
+   *  username and the avatar. */
   profile?: {
     sources?: IdentitySource[]
-    claims?: { id?: string; email?: string; name?: string }
+    claims?: Partial<Record<ProfileField, string>>
     /** Mint a placeholder address when the provider supplies no email. */
     allowMissingEmail?: boolean
+    /** Refresh the name and avatar from the provider on every sign-in. */
+    syncOnSignIn?: boolean
   }
   role?: ClaimRoleMapping
   /** Claim to user-attribute copying. */
@@ -707,6 +758,10 @@ export const identityProvider = pgTable(
     /** How the client secret reaches the token endpoint ('post' | 'basic');
      *  'post' when null. Some providers accept only one of the two. */
     tokenEndpointAuthMethod: text('token_endpoint_auth_method'),
+    /** Whether sign-in sends a `nonce` and requires the ID token to echo it
+     *  ('check' | 'off'); 'check' when null. The connection test sets 'off' for
+     *  a provider that never echoes it. See lib/shared/oidc-request.ts. */
+    idTokenNonce: text('id_token_nonce'),
     enabled: boolean('enabled').notNull().default(false),
     /** JIT signup toggle — preserves the legacy auto-provision opt-out. */
     autoCreateUsers: boolean('auto_create_users').notNull().default(true),
@@ -828,8 +883,8 @@ export const principal = pgTable(
      * session). Read by the SSO-enforcement bootstrap guard to refuse
      * enabling enforcement without a recent SSO sign-in window — stops
      * an admin who only signed in via magic-link from locking themselves
-     * out. Null = never signed in via SSO. Written by the
-     * /oauth2/callback/:providerId hooks.after middleware.
+     * out. Null = never signed in via SSO. Written by the OIDC callback
+     * hooks.after middleware (`/callback/:id`).
      */
     lastSsoSignInAt: timestamp('last_sso_sign_in_at', { withTimezone: true }),
     // A reachable address for a principal whose account email cannot receive
@@ -976,6 +1031,9 @@ export const jwks = pgTable('jwks', {
   privateKey: text('private_key').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
   expiresAt: timestamp('expires_at', { withTimezone: true }),
+  // Better Auth 1.7 jwt() plugin — optional, but the schema check requires the columns.
+  alg: text('alg'),
+  crv: text('crv'),
 })
 
 /**
@@ -1014,6 +1072,17 @@ export const oauthClient = pgTable('oauth_client', {
   requirePKCE: boolean('require_pkce'),
   referenceId: text('reference_id'),
   metadata: jsonb('metadata'),
+  // Better Auth 1.7 columns. `public` / `type` stay for expand-only rollback;
+  // 1.7 reads `applicationType` and `tokenEndpointAuthMethod` instead.
+  clientDiscoveryId: text('client_discovery_id'),
+  subjectType: text('subject_type'),
+  clientCredentialsScopes: text('client_credentials_scopes').array().default([]),
+  backchannelLogoutUri: text('backchannel_logout_uri'),
+  backchannelLogoutSessionRequired: boolean('backchannel_logout_session_required'),
+  applicationType: text('application_type'),
+  jwks: text('jwks'),
+  jwksUri: text('jwks_uri'),
+  dpopBoundAccessTokens: boolean('dpop_bound_access_tokens').default(false),
 })
 
 /**
@@ -1037,6 +1106,13 @@ export const oauthRefreshToken = pgTable(
     revoked: timestamp('revoked', { withTimezone: true }),
     authTime: timestamp('auth_time', { withTimezone: true }),
     scopes: text('scopes').array().notNull(),
+    authorizationCodeId: text('authorization_code_id'),
+    resources: text('resources').array(),
+    requestedUserInfoClaims: text('requested_user_info_claims').array(),
+    rotatedAt: timestamp('rotated_at', { withTimezone: true }),
+    rotationReplayResponse: text('rotation_replay_response'),
+    rotationReplayExpiresAt: timestamp('rotation_replay_expires_at', { withTimezone: true }),
+    confirmation: jsonb('confirmation'),
   },
   (table) => [
     // Serves the grace-heal successor lookup (auth/refresh-grace.ts) and
@@ -1050,6 +1126,7 @@ export const oauthRefreshToken = pgTable(
     // check these columns on every referenced-row delete.
     index('oauth_refresh_token_session_id_idx').on(table.sessionId),
     index('oauth_refresh_token_user_id_idx').on(table.userId),
+    index('oauth_refresh_token_authorization_code_id_idx').on(table.authorizationCodeId),
   ]
 )
 
@@ -1071,6 +1148,11 @@ export const oauthAccessToken = pgTable(
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }),
     scopes: text('scopes').array().notNull(),
+    authorizationCodeId: text('authorization_code_id'),
+    resources: text('resources').array(),
+    requestedUserInfoClaims: text('requested_user_info_claims').array(),
+    revoked: timestamp('revoked', { withTimezone: true }),
+    confirmation: jsonb('confirmation'),
   },
   (table) => [
     // FK RI-lookup protection: session logout/expiry, refresh-token
@@ -1079,6 +1161,7 @@ export const oauthAccessToken = pgTable(
     index('oauth_access_token_session_id_idx').on(table.sessionId),
     index('oauth_access_token_user_id_idx').on(table.userId),
     index('oauth_access_token_refresh_id_idx').on(table.refreshId),
+    index('oauth_access_token_authorization_code_id_idx').on(table.authorizationCodeId),
   ]
 )
 
@@ -1095,6 +1178,65 @@ export const oauthConsent = pgTable('oauth_consent', {
   scopes: text('scopes').array().notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }),
   updatedAt: timestamp('updated_at', { withTimezone: true }),
+  resources: text('resources').array(),
+  requestedUserInfoClaims: text('requested_user_info_claims').array(),
+})
+
+/**
+ * Protected resource the AS issues tokens for (RFC 8707). Seeded from
+ * Better Auth 1.7 `resources` config.
+ */
+export const oauthResource = pgTable('oauth_resource', {
+  id: text('id').primaryKey(),
+  identifier: text('identifier').notNull().unique(),
+  name: text('name').notNull(),
+  accessTokenTtl: integer('access_token_ttl'),
+  refreshTokenTtl: integer('refresh_token_ttl'),
+  signingAlgorithm: text('signing_algorithm'),
+  signingKeyId: text('signing_key_id'),
+  allowedScopes: text('allowed_scopes').array(),
+  customClaims: jsonb('custom_claims'),
+  dpopBoundAccessTokensRequired: boolean('dpop_bound_access_tokens_required').default(false),
+  disabled: boolean('disabled').default(false),
+  createdAt: timestamp('created_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }),
+  policyVersion: integer('policy_version').default(1),
+  metadata: jsonb('metadata'),
+})
+
+/**
+ * Client ↔ resource linkage. Authoritative only when
+ * `enforcePerClientResources` is true; we keep the flag off for DCR.
+ */
+export const oauthClientResource = pgTable(
+  'oauth_client_resource',
+  {
+    id: text('id').primaryKey(),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => oauthClient.clientId, { onDelete: 'cascade' }),
+    // Better Auth stores the resource identifier (RFC 8707 URL) here, not
+    // oauth_resource.id — DCR inserts `resourceId: "https://…/api/mcp"`.
+    resourceId: text('resource_id')
+      .notNull()
+      .references(() => oauthResource.identifier, { onDelete: 'cascade' }),
+    metadata: jsonb('metadata'),
+    createdAt: timestamp('created_at', { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex('oauth_client_resource_client_resource_uidx').on(table.clientId, table.resourceId),
+    index('oauth_client_resource_client_id_idx').on(table.clientId),
+    index('oauth_client_resource_resource_id_idx').on(table.resourceId),
+  ]
+)
+
+/**
+ * Single-use `private_key_jwt` client-assertion `jti` digest. Row id is the
+ * digest; insert collision is the replay reject.
+ */
+export const oauthClientAssertion = pgTable('oauth_client_assertion', {
+  id: text('id').primaryKey(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 })
 
 // Relations for Drizzle relational queries (enables experimental joins)
@@ -1158,6 +1300,22 @@ export const oauthClientRelations = relations(oauthClient, ({ one, many }) => ({
   oauthRefreshTokens: many(oauthRefreshToken),
   oauthAccessTokens: many(oauthAccessToken),
   oauthConsents: many(oauthConsent),
+  oauthClientResources: many(oauthClientResource),
+}))
+
+export const oauthResourceRelations = relations(oauthResource, ({ many }) => ({
+  oauthClientResources: many(oauthClientResource),
+}))
+
+export const oauthClientResourceRelations = relations(oauthClientResource, ({ one }) => ({
+  oauthClient: one(oauthClient, {
+    fields: [oauthClientResource.clientId],
+    references: [oauthClient.clientId],
+  }),
+  oauthResource: one(oauthResource, {
+    fields: [oauthClientResource.resourceId],
+    references: [oauthResource.identifier],
+  }),
 }))
 
 export const oauthRefreshTokenRelations = relations(oauthRefreshToken, ({ one, many }) => ({

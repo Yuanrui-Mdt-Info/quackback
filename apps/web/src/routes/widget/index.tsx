@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useQuery, keepPreviousData } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { z } from 'zod'
 import {
   lazy,
@@ -11,7 +11,7 @@ import {
   useRef,
   type ReactNode,
 } from 'react'
-import { motion, useReducedMotion } from 'framer-motion'
+import { LazyMotion, domAnimation, m, useReducedMotion } from 'framer-motion'
 import { FormattedMessage, useIntl } from 'react-intl'
 import { CheckCircleIcon } from '@heroicons/react/24/solid'
 import { ArrowLeftIcon } from '@heroicons/react/24/outline'
@@ -23,25 +23,26 @@ import {
   type WidgetView,
   resolveInitialTab,
   resolveInitialView,
-  homeEnabled,
   contentSurfaceCount,
   isExpandedView,
   visibleTabsForVisitor,
 } from '@/components/widget/widget-nav'
+import { resolveOpenCommand, type WidgetComposeRequest } from '@/components/widget/widget-compose'
 import { WidgetHome } from '@/components/widget/widget-home'
 import { WidgetOverview } from '@/components/widget/widget-overview'
 import { WidgetHeroBackdrop } from '@/components/widget/widget-hero-backdrop'
 import type { ConversationId } from '@quackback/ids'
 import { useWidgetAuth } from '@/components/widget/widget-auth-provider'
 import { portalQueries } from '@/lib/client/queries/portal'
-import { publicChangelogQueries } from '@/lib/client/queries/changelog'
-import { publicHelpCenterQueries } from '@/lib/client/queries/help-center'
-import { fetchBoardCapabilitiesFn } from '@/lib/server/functions/portal'
+import { widgetChangelogListQuery } from '@/components/widget/widget-changelog-query'
+import { widgetHelpCategoriesQuery } from '@/components/widget/widget-help-query'
+import { widgetFetchBoardCapabilitiesFn } from '@/lib/server/functions/widget/posts'
 import { getShowPoweredByFn } from '@/lib/server/functions/powered-by'
-import { listPublicArticlesFn } from '@/lib/server/functions/help-center'
+import { widgetListPublicArticlesFn } from '@/lib/server/functions/widget/help'
 import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
 import { sendToHost } from '@/lib/client/widget-bridge'
 import { widgetQueryKeys, INITIAL_SESSION_VERSION } from '@/lib/client/hooks/use-widget-vote'
+import { DEFAULT_LOCALE } from '@/lib/shared/i18n'
 import {
   CONVERSATION_PRESENCE_QUERY_KEY,
   useConversationPresence,
@@ -61,12 +62,14 @@ import {
 } from '@/components/widget/widget-skeletons'
 import { conversationSummaryKey } from '@/components/widget/use-messenger-summary'
 import { useTicketStageBadge } from '@/components/widget/use-ticket-stage-badge'
+import { useWarmLazyViews } from '@/components/widget/use-warm-lazy-views'
 
 // Secondary views load behind lazy() boundaries so the iframe's first paint
 // only needs the shell + Home/feedback — the detail views carry the
 // rich-text editor (tiptap) and the messenger carries the conversation thread.
-// The shared import thunks below also feed an idle-time prefetch after mount,
-// so by the time a visitor clicks a tab the chunk is already cached.
+// The shared import thunks below also feed an idle-time warm-up of the enabled
+// tabs' views once the widget is shown (useWarmLazyViews), so by the time a
+// visitor clicks a tab the chunk is already cached.
 const loadPostDetail = () => import('@/components/widget/widget-post-detail')
 const loadChangelog = () => import('@/components/widget/widget-changelog')
 const loadChangelogDetail = () => import('@/components/widget/widget-changelog-detail')
@@ -91,17 +94,23 @@ const WidgetMessenger = lazy(() => loadMessenger().then((m) => ({ default: m.Wid
 const WidgetMessages = lazy(() => loadMessagesView().then((m) => ({ default: m.WidgetMessages })))
 const WidgetTickets = lazy(() => loadTicketsView().then((m) => ({ default: m.WidgetTickets })))
 
-const LAZY_VIEW_LOADERS = [
-  loadPostDetail,
-  loadChangelog,
-  loadChangelogDetail,
-  loadHelp,
-  loadHelpCategory,
-  loadHelpDetail,
-  loadMessenger,
-  loadMessagesView,
-  loadTicketsView,
-]
+/** The lazy views a visitor can reach from the enabled tabs. */
+function lazyViewLoadersFor(tabs: {
+  feedback?: boolean
+  changelog?: boolean
+  help?: boolean
+  messages?: boolean
+  tickets?: boolean
+}): (() => Promise<unknown>)[] {
+  const loaders: (() => Promise<unknown>)[] = []
+  if (tabs.feedback) loaders.push(loadPostDetail)
+  if (tabs.changelog) loaders.push(loadChangelog, loadChangelogDetail)
+  if (tabs.help) loaders.push(loadHelp, loadHelpCategory, loadHelpDetail)
+  if (tabs.messages) loaders.push(loadMessagesView)
+  if (tabs.tickets) loaders.push(loadTicketsView)
+  if (tabs.messages || tabs.tickets) loaders.push(loadMessenger)
+  return loaders
+}
 
 const searchSchema = z.object({
   board: z.string().optional(),
@@ -149,6 +158,7 @@ export const Route = createFileRoute('/widget/')({
     // Teammate-avatar cluster for the Home header. Workspace-global and public-safe
     // (name + image only), so the anonymous SSR baseline is correct for everyone.
     let team: { name: string; avatarUrl: string | null }[] = []
+    let showPoweredBy = true
     const [portalData, { getBaseUrl }] = await Promise.all([
       feedbackProductEnabled
         ? queryClient.ensureQueryData(
@@ -172,8 +182,8 @@ export const Route = createFileRoute('/widget/')({
       // unwrapped helper): its handler — and the database-reaching presence
       // import inside it — is stripped from the client bundle.
       messengerTabEnabled
-        ? import('@/lib/server/functions/conversation')
-            .then(({ getConversationPresenceFn }) => getConversationPresenceFn())
+        ? import('@/lib/server/functions/widget/conversation')
+            .then(({ widgetGetConversationPresenceFn }) => widgetGetConversationPresenceFn())
             .then((presence) => {
               queryClient.setQueryData(CONVERSATION_PRESENCE_QUERY_KEY, presence)
             })
@@ -181,29 +191,33 @@ export const Route = createFileRoute('/widget/')({
         : Promise.resolve(),
       // Never break the widget load over the decorative header avatar cluster.
       (settings?.publicWidgetConfig?.home?.showTeamAvatars ?? true)
-        ? import('@/lib/server/functions/conversation')
-            .then(({ getWidgetTeamAvatarsFn }) => getWidgetTeamAvatarsFn())
+        ? import('@/lib/server/functions/widget/conversation')
+            .then(({ widgetGetTeamAvatarsFn }) => widgetGetTeamAvatarsFn())
             .then((avatars) => {
               team = avatars
             })
             .catch(() => {})
         : Promise.resolve(),
       changelogTabEnabled
-        ? queryClient.ensureInfiniteQueryData(publicChangelogQueries.list()).catch(() => {})
+        ? queryClient
+            .ensureInfiniteQueryData(widgetChangelogListQuery(INITIAL_SESSION_VERSION))
+            .catch(() => {})
         : Promise.resolve(),
       helpTabEnabled
-        ? queryClient.ensureQueryData(publicHelpCenterQueries.categories()).catch(() => {})
+        ? queryClient
+            .ensureQueryData(widgetHelpCategoriesQuery(INITIAL_SESSION_VERSION, DEFAULT_LOCALE))
+            .catch(() => {})
         : Promise.resolve(),
       helpTabEnabled
-        ? listPublicArticlesFn({ data: { limit: 4 } })
+        ? widgetListPublicArticlesFn({ data: { limit: 4 } })
             .then((res) => {
               topArticles = res.items.map((a) => ({ slug: a.slug, title: a.title }))
             })
             .catch(() => {})
         : Promise.resolve(),
       messengerTabEnabled
-        ? import('@/lib/server/functions/conversation')
-            .then(({ getMyConversationFn }) => getMyConversationFn())
+        ? import('@/lib/server/functions/widget/conversation')
+            .then(({ widgetGetMyConversationFn }) => widgetGetMyConversationFn())
             .then((res) => {
               queryClient.setQueryData(conversationSummaryKey(INITIAL_SESSION_VERSION), {
                 conversation: res.conversation ?? null,
@@ -212,14 +226,17 @@ export const Route = createFileRoute('/widget/')({
             })
             .catch(() => {})
         : Promise.resolve(),
+      // Independent of every branch above, so it runs in the same batch
+      // rather than adding its own round trip after it.
+      getShowPoweredByFn().then((value) => {
+        showPoweredBy = value
+      }),
     ])
 
     queryClient.setQueryData(
       widgetQueryKeys.votedPosts.bySession(INITIAL_SESSION_VERSION),
       new Set(portalData.votedPostIds)
     )
-
-    const showPoweredBy = await getShowPoweredByFn()
 
     return {
       posts: portalData.posts.items.map((p) => ({
@@ -285,8 +302,6 @@ export const Route = createFileRoute('/widget/')({
               avatarUrl: settings.publicWidgetConfig.messenger.assistant.avatarUrl || null,
             }
           : null,
-      linkPreviews:
-        (settings?.featureFlags as { supportInbox?: boolean } | undefined)?.supportInbox ?? false,
       defaultBoard: settings?.publicWidgetConfig?.defaultBoard,
       portalAccess: {
         isPrivate: settings?.publicPortalConfig?.portalAccess?.isPrivate ?? false,
@@ -306,10 +321,21 @@ export const Route = createFileRoute('/widget/')({
   component: WidgetRoute,
 })
 
+/**
+ * Loads the "dom" animation engine (fades, slides, transforms), not the
+ * larger "dom-max" build's drag/layout/3d support the widget never uses. `m`
+ * components read it from context; `motion` components would ignore it and
+ * bundle their own copy, which is why every framer-motion usage under this
+ * root uses `m`.
+ */
 function WidgetRoute() {
   const { tabs } = Route.useLoaderData()
   if (contentSurfaceCount(tabs) === 0) return null
-  return <WidgetPage />
+  return (
+    <LazyMotion features={domAnimation}>
+      <WidgetPage />
+    </LazyMotion>
+  )
 }
 
 interface SuccessPost {
@@ -360,7 +386,7 @@ function ViewTransition({
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   return (
-    <motion.div
+    <m.div
       key={id}
       ref={ref}
       tabIndex={-1}
@@ -372,7 +398,7 @@ function ViewTransition({
       className="h-full outline-none"
     >
       <Suspense fallback={fallback}>{children}</Suspense>
-    </motion.div>
+    </m.div>
   )
 }
 
@@ -385,7 +411,6 @@ function WidgetPage() {
     orgSlug,
     boardPermissions,
     tabs,
-    linkPreviews,
     defaultBoard,
     portalAccess,
     portalOrigin,
@@ -398,8 +423,8 @@ function WidgetPage() {
     messengerEnabled,
     showPoweredBy,
   } = Route.useLoaderData()
+  const { board: initialBoardSlug } = Route.useSearch()
   const { ensureSession, sessionVersion } = useWidgetAuth()
-  const intl = useIntl()
 
   // The loader seeds boardPermissions for the anonymous SSR baseline (no Bearer
   // at loader time). Refetch it for the REAL actor with the widget's Bearer
@@ -407,20 +432,26 @@ function WidgetPage() {
   // feed gates votes/submission per the actual actor instead of OR-ing in a
   // blanket isIdentified (which advertised CTAs on segments/team boards the
   // actor cannot act on). Seeded with the loader map so SSR + first paint match.
-  const { data: livePermissions } = useQuery({
-    queryKey: ['widget', 'boardPermissions', sessionVersion],
-    queryFn: () => fetchBoardCapabilitiesFn({ headers: getWidgetAuthHeaders() }),
+  const { data: liveCapabilities } = useQuery({
+    queryKey: ['widget', 'boardCapabilities', sessionVersion],
+    queryFn: () => widgetFetchBoardCapabilitiesFn({ headers: getWidgetAuthHeaders() }),
     // Seed ONLY the initial (anonymous, SSR) key from the loader. initialData
     // stamps an entry fresh as of now, so seeding it on every key would also
     // mark the post-identify key fresh and suppress the Bearer refetch within
     // staleTime — leaving an identified viewer stuck on the anonymous baseline.
-    // After identify the key changes, carries no initialData, and refetches with
-    // the Bearer while keepPreviousData shows the prior map meanwhile.
-    initialData: sessionVersion === INITIAL_SESSION_VERSION ? boardPermissions : undefined,
-    placeholderData: keepPreviousData,
+    // After identify the key changes, carries no initialData, and refetches
+    // with the Bearer. Do not keepPreviousData — logout/switch would otherwise
+    // show the prior visitor's members-only boards until the new fetch lands.
+    // Missing data falls back to the anonymous SSR `boards` list.
+    initialData:
+      sessionVersion === INITIAL_SESSION_VERSION
+        ? { permissions: boardPermissions, boards }
+        : undefined,
     staleTime: 30 * 1000,
     enabled: !!tabs.feedback,
   })
+  const livePermissions = liveCapabilities?.permissions
+  const liveBoards = liveCapabilities?.boards ?? boards
 
   const { c: resumeConversationId } = Route.useSearch()
   const { hasTickets } = useTicketStageBadge(!!tabs.tickets)
@@ -465,20 +496,10 @@ function WidgetPage() {
   // panel is always full-screen, so the manual size control is meaningless.
   const [hostIsMobile, setHostIsMobile] = useState(false)
 
-  // Warm the lazy view chunks once the first paint has settled, so tab
-  // clicks resolve from cache instead of hitting the network. Idle-time only:
-  // first paint must never compete with these fetches.
-  useEffect(() => {
-    const prefetch = () => {
-      for (const load of LAZY_VIEW_LOADERS) void load().catch(() => {})
-    }
-    if (typeof window.requestIdleCallback === 'function') {
-      const handle = window.requestIdleCallback(prefetch, { timeout: 3000 })
-      return () => window.cancelIdleCallback(handle)
-    }
-    const timer = window.setTimeout(prefetch, 1500)
-    return () => window.clearTimeout(timer)
-  }, [])
+  // Warm the enabled tabs' lazy view chunks once the widget is shown, so tab
+  // clicks resolve from cache instead of hitting the network.
+  const warmLoaders = useMemo(() => lazyViewLoadersFor(tabs), [tabs])
+  useWarmLazyViews(warmLoaders)
 
   // Where a cross-navigation came from (e.g. Home's "Search for help" jumping
   // to the Help tab). While set, even a ROOT view shows a back chevron that
@@ -504,6 +525,8 @@ function WidgetPage() {
     name: string
     icon: string | null
   } | null>(null)
+  const [composeRequest, setComposeRequest] = useState<WidgetComposeRequest | null>(null)
+  const composeNonceRef = useRef(0)
   const [createdPosts, setCreatedPosts] = useState<typeof posts>([])
 
   const allPosts = useMemo(() => {
@@ -570,41 +593,84 @@ function WidgetPage() {
         setHostIsMobile(!!msg.data)
         return
       }
-      if (msg.type !== 'quackback:open' || !msg.data) return
+      if (msg.type !== 'quackback:open') return
 
-      const opts = msg.data as { view?: string }
+      const opts = (msg.data ?? {}) as {
+        view?: string
+        title?: string
+        body?: string
+        board?: string
+        query?: string
+        entryId?: string
+        postId?: string
+        articleId?: string
+      }
+      const command = resolveOpenCommand(opts, tabs)
+      if (!command) return
+
       // SDK-driven opens are tab-level landings: no back-chevron origin.
       setBackTarget(null)
       lastNavRef.current = 'tab'
-      if (opts.view === 'changelog' && tabs.changelog) {
-        setActiveTab('changelog')
-        setView('changelog')
-      } else if (opts.view === 'help' && tabs.help) {
-        // Same fresh start as navigateToTab('help'): the lifted search
-        // would otherwise resurface an old query on a programmatic open.
-        setSelectedHelpSlug(null)
-        setSelectedCategory(null)
-        setHelpSearch('')
-        setActiveTab('help')
-        setView('help')
-      } else if (
-        (opts.view === 'messages' || opts.view === 'chat' || opts.view === 'live-chat') &&
-        tabs.messages
-      ) {
-        openMessenger()
-      } else if (opts.view === 'tickets') {
-        // The requester's own-tickets list lives on the Tickets tab; on
-        // workspaces without it, ticket threads are listed in Messages.
-        if (tabs.tickets) {
+      switch (command.type) {
+        case 'new-post':
+          composeNonceRef.current += 1
+          setComposeRequest({
+            nonce: composeNonceRef.current,
+            title: command.title,
+            body: command.body,
+            boardSlug: command.boardSlug,
+          })
+          setSelectedPostId(null)
+          setActiveTab('feedback')
+          setView('feedback')
+          break
+        case 'post':
+          setActiveTab('feedback')
+          setSelectedPostId(command.postId)
+          setView('post-detail')
+          break
+        case 'article':
+          // Same as postId: store the ref and let the detail view fetch it
+          // with Bearer + sessionVersion. TypeIDs (`article_` / `kb_article_`)
+          // and slugs both resolve server-side; no client hop.
+          setSelectedCategory(null)
+          setHelpSearch('')
+          setSelectedHelpSlug(command.articleId)
+          setActiveTab('help')
+          setView('help-detail')
+          break
+        case 'changelog':
+          setActiveTab('changelog')
+          if (command.entryId) {
+            setSelectedChangelogId(command.entryId)
+            setView('changelog-detail')
+          } else {
+            setSelectedChangelogId(null)
+            setView('changelog')
+          }
+          break
+        case 'help':
+          setSelectedHelpSlug(null)
+          setSelectedCategory(null)
+          setHelpSearch(command.query ?? '')
+          setActiveTab('help')
+          setView('help')
+          break
+        case 'messenger':
+          openMessenger()
+          break
+        case 'tickets':
           setActiveTab('tickets')
           setView('tickets')
-        } else if (tabs.messages) {
+          break
+        case 'messages':
           setActiveTab('messages')
           setView('messages')
-        }
-      } else if ((opts.view === 'home' || opts.view === 'overview') && homeEnabled(tabs)) {
-        setActiveTab('home')
-        setView('overview')
+          break
+        case 'home':
+          setActiveTab('home')
+          setView('overview')
+          break
       }
     }
     window.addEventListener('message', handleMessage)
@@ -762,6 +828,12 @@ function WidgetPage() {
     setView('help-detail')
   }, [])
 
+  const handleHelpCategoryUnavailable = useCallback(() => {
+    lastNavRef.current = 'move'
+    setSelectedCategory(null)
+    setView('help')
+  }, [])
+
   // The feedback view stays mounted (form state survives a detail round-trip),
   // so it can't take focus via ViewTransition's mount hook; do it when it
   // becomes visible again after a back/cross navigation.
@@ -787,18 +859,6 @@ function WidgetPage() {
   // the assistant identity when enabled — always available, no presence — or
   // the live presence badge for assistant-less workspaces.
   const presence = useConversationPresence(messengerEnabled && !assistant)
-  // When office hours are configured, tell the visitor up front when the team
-  // is back — the thread body only says so once they've typed.
-  const presenceBackAt = useMemo(() => {
-    if (!presence.nextOpenAt) return null
-    const at = new Date(presence.nextOpenAt)
-    if (Number.isNaN(at.getTime())) return null
-    return new Intl.DateTimeFormat(intl.locale, {
-      weekday: 'long',
-      hour: 'numeric',
-      minute: '2-digit',
-    }).format(at)
-  }, [presence.nextOpenAt, intl.locale])
   const messengerHeader =
     view === 'messenger' ? (
       assistant ? (
@@ -820,7 +880,10 @@ function WidgetPage() {
         <div className="min-w-0 ps-1">
           <ConversationPresenceBadge
             available={conversationAvailable(presence.agentsOnline, presence.withinOfficeHours)}
-            backAt={presenceBackAt}
+            // When office hours are configured, the badge tells the visitor up
+            // front when the team is back; the thread body only says so once
+            // they have typed.
+            nextOpenAt={presence.nextOpenAt}
           />
         </div>
       )
@@ -835,7 +898,6 @@ function WidgetPage() {
       enabledTabs={tabs}
       portalAccess={portalAccess}
       portalOrigin={portalOrigin}
-      team={team}
       showPoweredBy={showPoweredBy}
       logoUrl={(home?.showLogo ?? true) ? logoUrl : null}
       headerContent={messengerHeader}
@@ -913,7 +975,6 @@ function WidgetPage() {
             helpEnabled={tabs.help}
             onArticleSelect={handleHelpArticleSelect}
             conversationTarget={conversationTarget === null ? undefined : conversationTarget}
-            linkPreviews={linkPreviews}
             // A fresh thread exists to be typed into; a resumed one to be read.
             // Mobile hosts skip it — the software keyboard would cover the thread.
             autofocusComposer={conversationTarget === 'new' && !hostIsMobile}
@@ -992,6 +1053,7 @@ function WidgetPage() {
             categoryName={selectedCategory.name}
             categoryIcon={selectedCategory.icon}
             onArticleSelect={handleHelpCategoryArticleSelect}
+            onCategoryUnavailable={handleHelpCategoryUnavailable}
           />
         </ViewTransition>
       )}
@@ -1004,7 +1066,7 @@ function WidgetPage() {
           fallback={<WidgetArticleSkeleton />}
         >
           <WidgetHelpDetail
-            articleSlug={selectedHelpSlug}
+            articleRef={selectedHelpSlug}
             onCategorySelect={(id, name) => handleHelpCategorySelect(id, name, null)}
             onAskQuestion={
               messengerEnabled
@@ -1033,7 +1095,7 @@ function WidgetPage() {
       >
         {/* Kept mounted, so it can't use the remount-keyed ViewTransition;
             instead the same root entrance replays whenever it becomes visible. */}
-        <motion.div
+        <m.div
           initial={false}
           animate={view === 'feedback' ? { y: 0, opacity: 1 } : { y: 10, opacity: 0 }}
           transition={{ duration: 0.22, ease: [0.32, 0.72, 0, 1] }}
@@ -1043,13 +1105,16 @@ function WidgetPage() {
             initialPosts={allPosts}
             initialHasMore={postsHasMore}
             statuses={statuses}
-            boards={boards}
+            boards={liveBoards}
             boardPermissions={livePermissions}
             defaultBoard={defaultBoard}
+            initialBoardSlug={initialBoardSlug}
+            confirmedBoardSlugs={liveCapabilities?.boards.map((b) => b.slug) ?? null}
+            composeRequest={composeRequest}
             onPostSelect={handlePostSelect}
             onPostCreated={handlePostCreated}
           />
-        </motion.div>
+        </m.div>
       </div>
 
       {view === 'post-detail' && selectedPostId && (

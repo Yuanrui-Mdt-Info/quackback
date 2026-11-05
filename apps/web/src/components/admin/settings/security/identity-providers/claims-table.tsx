@@ -1,6 +1,14 @@
 /**
- * Required / additional mapping table. Presentation only: the card owns the
- * draft and persists through the operations API.
+ * The Profile table: which provider claim sets each Quackback field.
+ * Presentation only; the card owns the draft and persists through the
+ * operations API.
+ *
+ * One table, not two. Account ID, email, name, username and avatar are the
+ * profile; People attributes are extra mappings the admin added. Role rules
+ * live on the Roles card. Standard rows carry no badge; only an exception is marked, as
+ * "Custom". Each profile row says in one muted line what it expects, and once the provider has a test sign-in a third column shows what
+ * each field takes from it under the current draft, so a claim is chosen by
+ * what the provider actually sent.
  */
 import { PencilIcon, TrashIcon } from '@heroicons/react/24/solid'
 import { ChevronDownIcon, ChevronUpIcon } from '@heroicons/react/24/outline'
@@ -8,162 +16,114 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import { DEFAULT_IDENTITY_SOURCES, type IdentitySource } from '@/lib/shared/oidc-claim-mapping'
-import type { Role } from '@/lib/shared/roles'
+import type { ProfileFieldValues } from '@/lib/shared/sso-mapping-preview'
+import { PictureWithUrl } from './claim-picture'
 import {
+  PROFILE_FIELD_SPECS,
   SOURCE_LABELS,
   type ClaimsPeopleRow,
   type ClaimsProfileRow,
-  type ClaimsRoleRow,
   type ClaimsTableRow,
   type ClaimsUnsupportedRow,
 } from './provider-shared'
 
-const ROLE_LABEL: Record<Role, string> = {
-  admin: 'admin',
-  member: 'member',
-  user: 'user',
-}
-
 export function ClaimsTable({
-  requiredRows,
+  profileRows,
   additionalRows,
-  allowMissingEmail,
-  onAllowMissingEmailChange,
   peopleFlags,
   onPeopleFlagsChange,
   onEdit,
   onRemove,
-  onResetName,
+  providerLabel,
   disabled,
-  autoCreateUsers,
-  autoProvisionRole,
+  testValues,
 }: {
-  requiredRows: ClaimsProfileRow[]
+  profileRows: ClaimsProfileRow[]
   additionalRows: ClaimsTableRow[]
-  allowMissingEmail: boolean
-  onAllowMissingEmailChange: (next: boolean) => void
   peopleFlags: { overrideExisting: boolean; syncOnSignIn: boolean }
   onPeopleFlagsChange: (next: { overrideExisting: boolean; syncOnSignIn: boolean }) => void
   onEdit: (row: ClaimsTableRow) => void
   onRemove: (row: ClaimsTableRow) => void
-  onResetName: () => void
+  /** Names the claim column ("Acme ID claim"), trimmed; "Provider claim" without one. */
+  providerLabel?: string
   disabled?: boolean
-  autoCreateUsers: boolean
-  autoProvisionRole: Role | null
+  /** What each profile field takes from the last test sign-in. Adds the
+   *  "Last test sign-in" column; omitted when there is no test. */
+  testValues?: ProfileFieldValues | null
 }) {
   const hasPeople = additionalRows.some((row) => row.kind === 'people')
-  const hasRole = additionalRows.some((row) => row.kind === 'role')
-  const extraHint = !hasRole && !hasPeople
+  const showTest = testValues != null
 
   return (
-    <div className="space-y-6">
-      <section>
-        <h3 className="text-sm font-medium">Required identity</h3>
-        <MappingTable>
-          {requiredRows.map((row) => (
-            <ProfileRow
-              key={row.field}
-              row={row}
-              disabled={disabled}
-              onEdit={() => onEdit(row)}
-              emailConditional={row.field === 'email' && allowMissingEmail}
-            />
-          ))}
-        </MappingTable>
-        <label className="mt-4 flex items-start gap-2 text-sm">
-          <Checkbox
-            checked={allowMissingEmail}
-            onCheckedChange={(v) => onAllowMissingEmailChange(v === true)}
-            disabled={disabled}
-            aria-label="Allow accounts without an email address"
-            className="mt-0.5"
-          />
-          <span>
-            Allow accounts without an email address
-            <span className="mt-0.5 block text-xs text-muted-foreground">
-              For providers that release no email. Quackback creates a placeholder so people can
-              still sign in, then asks them for a real address afterwards. Placeholders are
-              permanent: turning this off later does not convert accounts that already have one.
-              Off, these people cannot sign in at all.
-            </span>
-          </span>
-        </label>
-      </section>
-
-      <section>
-        <h3 className="text-sm font-medium">Additional attributes</h3>
-        <MappingTable>
-          {additionalRows.map((row) => {
-            if (row.kind === 'profile') {
-              return (
-                <ProfileRow
-                  key={row.field}
-                  row={row}
-                  disabled={disabled}
-                  onEdit={() => onEdit(row)}
-                  onResetName={!row.isDefault ? onResetName : undefined}
-                />
-              )
-            }
-            if (row.kind === 'role') {
-              return (
-                <RoleRowView
-                  key="role"
-                  row={row}
-                  disabled={disabled}
-                  autoCreateUsers={autoCreateUsers}
-                  autoProvisionRole={autoProvisionRole}
-                  onEdit={() => onEdit(row)}
-                  onRemove={() => onRemove(row)}
-                />
-              )
-            }
-            if (row.kind === 'people') {
-              return (
-                <PeopleRowView
-                  key={`people-${row.baselineIndex}`}
-                  row={row}
-                  disabled={disabled}
-                  onEdit={() => onEdit(row)}
-                  onRemove={() => onRemove(row)}
-                />
-              )
-            }
-            return <UnsupportedRowView key={row.id} row={row} />
-          })}
-        </MappingTable>
-        {extraHint && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            Add a Role mapping or map a claim to an attribute defined under People.
-          </p>
-        )}
-      </section>
+    <div className="space-y-4">
+      {/* Scrolls sideways on a narrow screen so the page itself never does. */}
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-border/50 text-left text-muted-foreground">
+              <th scope="col" className="py-2 pr-3 font-medium whitespace-nowrap">
+                Field
+              </th>
+              <th scope="col" className="min-w-0 py-2 pr-3 font-medium">
+                {providerLabel ? `${providerLabel} claim` : 'Provider claim'}
+              </th>
+              {showTest && (
+                <th scope="col" className="py-2 pr-3 font-medium whitespace-nowrap">
+                  Last test sign-in
+                </th>
+              )}
+              <th scope="col" className="w-px py-2 font-medium">
+                <span className="sr-only">Actions</span>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {profileRows.map((row) => (
+              <ProfileRow
+                key={row.field}
+                row={row}
+                testValues={testValues}
+                disabled={disabled}
+                onEdit={() => onEdit(row)}
+              />
+            ))}
+            {additionalRows.map((row) => {
+              if (row.kind === 'people') {
+                return (
+                  <PeopleRowView
+                    key={`people-${row.baselineIndex}`}
+                    row={row}
+                    showTest={showTest}
+                    disabled={disabled}
+                    onEdit={() => onEdit(row)}
+                    onRemove={() => onRemove(row)}
+                  />
+                )
+              }
+              if (row.kind === 'unsupported') {
+                return <UnsupportedRowView key={row.id} row={row} showTest={showTest} />
+              }
+              return null
+            })}
+          </tbody>
+        </table>
+      </div>
 
       {hasPeople && (
-        <section className="space-y-3">
-          <div>
-            <h3 className="text-sm font-medium">People attribute updates</h3>
-            <p className="text-xs text-muted-foreground">Applies to all mapped People attributes</p>
-          </div>
-          <label className="flex items-start gap-2 text-sm">
+        <div className="space-y-2">
+          <div className="flex items-start gap-2 text-sm">
             <Checkbox
               checked={peopleFlags.overrideExisting}
               onCheckedChange={(v) =>
                 onPeopleFlagsChange({ ...peopleFlags, overrideExisting: v === true })
               }
               disabled={disabled}
-              aria-label="Overwrite values that are already set"
+              aria-label="Overwrite attribute values that are already set"
               className="mt-0.5"
             />
-            <span>
-              Overwrite values that are already set
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                Off: a claim only fills an attribute that is empty. On: the IdP value wins on every
-                sign-in.
-              </span>
-            </span>
-          </label>
-          <label className="flex items-start gap-2 text-sm">
+            <span>Overwrite attribute values that are already set</span>
+          </div>
+          <div className="flex items-start gap-2 text-sm">
             <Checkbox
               checked={peopleFlags.syncOnSignIn}
               onCheckedChange={(v) =>
@@ -173,53 +133,24 @@ export function ClaimsTable({
               aria-label="Clear an attribute when its claim is missing"
               className="mt-0.5"
             />
-            <span>
-              Clear an attribute when its claim is missing
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                Clearing on a fresh missing claim is independent of overwrite: a missing value can
-                be removed even with overwrite off.
-              </span>
-            </span>
-          </label>
-        </section>
+            <span>Clear an attribute when its claim is missing</span>
+          </div>
+        </div>
       )}
     </div>
   )
 }
 
-function MappingTable({ children }: { children: React.ReactNode }) {
+function ClaimPath({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mt-2 overflow-x-auto">
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="border-b border-border/50 text-left text-xs text-muted-foreground">
-            <th scope="col" className="py-2 pr-3 font-medium whitespace-nowrap">
-              Quackback attribute
-            </th>
-            <th scope="col" className="min-w-0 py-2 pr-3 font-medium">
-              IdP claim
-            </th>
-            <th scope="col" className="w-px py-2 font-medium">
-              <span className="sr-only">Actions</span>
-            </th>
-          </tr>
-        </thead>
-        <tbody>{children}</tbody>
-      </table>
-    </div>
+    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+      {children}
+    </code>
   )
 }
 
-function StatusBadge({ isDefault }: { isDefault: boolean }) {
-  return (
-    <Badge variant="outline" className="font-normal">
-      {isDefault ? 'Default' : 'Custom'}
-    </Badge>
-  )
-}
-
-function RowActions({ children }: { children: React.ReactNode }) {
-  return <div className="flex items-center justify-end gap-1 shrink-0">{children}</div>
+function CustomBadge() {
+  return <Badge variant="outline">Custom</Badge>
 }
 
 function IconButton({
@@ -255,124 +186,69 @@ function IconButton({
   )
 }
 
-function ProfileRow({
-  row,
-  disabled,
-  onEdit,
-  onResetName,
-  emailConditional,
+/** An empty cell in the test column, for rows that are not profile fields. */
+function NoTestValue({ show }: { show: boolean }) {
+  return show ? <td className="py-2.5 pr-3" /> : null
+}
+
+/**
+ * The value one profile field takes from the test sign-in. The avatar shows
+ * the picture itself. A field that gets nothing says what happens instead.
+ */
+function TestValue({
+  field,
+  values,
 }: {
-  row: ClaimsProfileRow
-  disabled?: boolean
-  onEdit: () => void
-  onResetName?: () => void
-  emailConditional?: boolean
+  field: ClaimsProfileRow['field']
+  values: ProfileFieldValues
 }) {
+  const emptyText = PROFILE_FIELD_SPECS[field].emptyTestText
+  if (field === 'image') {
+    return <PictureWithUrl url={values.image} missingText={emptyText} className="size-8" />
+  }
+  const value = values[field]
+  if (!value) return <span className="text-muted-foreground">{emptyText}</span>
   return (
-    <tr className="border-b border-border/50 last:border-0 align-top">
-      <td className="py-3 pr-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="font-medium">{row.label}</span>
-          <StatusBadge isDefault={row.isDefault} />
-          {emailConditional && (
-            <Badge variant="outline" className="font-normal">
-              Required unless placeholder is allowed
-            </Badge>
-          )}
-        </div>
-        <p className="mt-0.5 text-xs text-muted-foreground">{row.helper}</p>
-      </td>
-      <td className="py-3 pr-3">
-        <code className="text-[11px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded font-mono">
-          {row.path}
-        </code>
-      </td>
-      <td className="py-3">
-        <RowActions>
-          <IconButton label={`Edit ${row.label} mapping`} onClick={onEdit} disabled={disabled}>
-            <PencilIcon className="h-3.5 w-3.5" />
-          </IconButton>
-          {onResetName && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-xs text-muted-foreground"
-              onClick={onResetName}
-              disabled={disabled}
-            >
-              Reset mapping
-            </Button>
-          )}
-        </RowActions>
-      </td>
-    </tr>
+    <span className="block truncate" title={value}>
+      {value}
+    </span>
   )
 }
 
-function RoleRowView({
+function ProfileRow({
   row,
+  testValues,
   disabled,
-  autoCreateUsers,
-  autoProvisionRole,
   onEdit,
-  onRemove,
 }: {
-  row: ClaimsRoleRow
+  row: ClaimsProfileRow
+  testValues?: ProfileFieldValues | null
   disabled?: boolean
-  autoCreateUsers: boolean
-  autoProvisionRole: Role | null
   onEdit: () => void
-  onRemove: () => void
 }) {
-  const fallback = autoProvisionRole ?? 'member'
-  const fallbackLabel =
-    autoProvisionRole == null ? 'Member (runtime default)' : ROLE_LABEL[fallback]
   return (
     <tr className="border-b border-border/50 last:border-0 align-top">
-      <td className="py-3 pr-3">
-        <div className="font-medium">Role</div>
-        <ol className="mt-1 list-decimal space-y-0.5 pl-4 text-xs text-muted-foreground">
-          {row.rules.map((rule, index) => (
-            <li key={index}>
-              {rule.whenContains} {'->'} {ROLE_LABEL[rule.role]}
-            </li>
-          ))}
-        </ol>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Otherwise: {fallbackLabel}, at verified domains
-        </p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          A matching rule assigns this role even outside this provider&apos;s verified domains.
-        </p>
-        {!autoCreateUsers && (
-          <p className="mt-1 text-xs text-muted-foreground">
-            All role application is disabled when auto-create is off.
-          </p>
-        )}
-        {row.syncOnEverySignIn && (
-          <p className="mt-1 text-xs text-muted-foreground">Reapplies on every sign-in.</p>
-        )}
+      <td className="py-2.5 pr-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium">{row.label}</span>
+          {!row.isDefault && <CustomBadge />}
+        </div>
+        <p className="mt-0.5 text-xs whitespace-nowrap text-muted-foreground">{row.hint}</p>
       </td>
-      <td className="py-3 pr-3">
-        <code className="text-[11px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded font-mono">
-          {row.claimPath}
-        </code>
+      <td className="py-2.5 pr-3">
+        <ClaimPath>{row.path}</ClaimPath>
       </td>
-      <td className="py-3">
-        <RowActions>
-          <IconButton label="Edit Role mapping" onClick={onEdit} disabled={disabled}>
-            <PencilIcon className="h-3.5 w-3.5" />
-          </IconButton>
-          <IconButton
-            label="Remove Role mapping"
-            onClick={onRemove}
-            disabled={disabled}
-            destructive
-          >
-            <TrashIcon className="h-3.5 w-3.5" />
-          </IconButton>
-        </RowActions>
+      {testValues && (
+        // max-w-0 with w-full gives this column the remaining width, so long
+        // values truncate instead of widening the table.
+        <td className="w-full max-w-0 py-2.5 pr-3">
+          <TestValue field={row.field} values={testValues} />
+        </td>
+      )}
+      <td className="py-2.5">
+        <IconButton label={`Edit ${row.label} mapping`} onClick={onEdit} disabled={disabled}>
+          <PencilIcon className="h-3.5 w-3.5" />
+        </IconButton>
       </td>
     </tr>
   )
@@ -380,50 +256,41 @@ function RoleRowView({
 
 function PeopleRowView({
   row,
+  showTest,
   disabled,
   onEdit,
   onRemove,
 }: {
   row: ClaimsPeopleRow
+  showTest: boolean
   disabled?: boolean
   onEdit: () => void
   onRemove: () => void
 }) {
   return (
     <tr className="border-b border-border/50 last:border-0 align-top">
-      <td className="py-3 pr-3">
+      <td className="py-2.5 pr-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium">{row.label}</span>
-          {row.typeLabel && (
-            <span className="text-xs text-muted-foreground">
-              {row.attributeKey}, {row.typeLabel}
-            </span>
-          )}
+          {row.typeLabel && <span className="text-muted-foreground">{row.typeLabel}</span>}
           {row.orphaned && (
-            <Badge
-              variant="outline"
-              className="border-amber-500/40 text-amber-700 dark:text-amber-400"
-            >
-              attribute no longer exists
+            <Badge variant="outline" className="border-warning/40 text-warning">
+              Attribute no longer exists
             </Badge>
           )}
           {row.duplicate && (
-            <Badge
-              variant="outline"
-              className="border-amber-500/40 text-amber-700 dark:text-amber-400"
-            >
-              Duplicate mapping
+            <Badge variant="outline" className="border-warning/40 text-warning">
+              Duplicate
             </Badge>
           )}
         </div>
       </td>
-      <td className="py-3 pr-3">
-        <code className="text-[11px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded font-mono">
-          {row.claimPath}
-        </code>
+      <td className="py-2.5 pr-3">
+        <ClaimPath>{row.claimPath}</ClaimPath>
       </td>
-      <td className="py-3">
-        <RowActions>
+      <NoTestValue show={showTest} />
+      <td className="py-2.5">
+        <div className="flex items-center justify-end gap-1">
           <IconButton label={`Edit ${row.label} mapping`} onClick={onEdit} disabled={disabled}>
             <PencilIcon className="h-3.5 w-3.5" />
           </IconButton>
@@ -435,26 +302,34 @@ function PeopleRowView({
           >
             <TrashIcon className="h-3.5 w-3.5" />
           </IconButton>
-        </RowActions>
+        </div>
       </td>
     </tr>
   )
 }
 
-function UnsupportedRowView({ row }: { row: ClaimsUnsupportedRow }) {
+function UnsupportedRowView({ row, showTest }: { row: ClaimsUnsupportedRow; showTest: boolean }) {
   return (
     <tr className="border-b border-border/50 last:border-0 align-top">
-      <td className="py-3 pr-3">
+      <td className="py-2.5 pr-3">
         <div className="font-medium">{row.label}</div>
-        <p className="mt-0.5 text-xs text-muted-foreground">{row.detail}</p>
+        <p className="mt-0.5 text-muted-foreground">{row.detail}</p>
       </td>
-      <td className="py-3 pr-3 text-xs text-muted-foreground">Unsupported</td>
-      <td className="py-3" />
+      <td className="py-2.5 pr-3 text-muted-foreground">Not editable here</td>
+      <NoTestValue show={showTest} />
+      <td className="py-2.5" />
     </tr>
   )
 }
 
-export function AdvancedSourcesEditor({
+/**
+ * Compatibility: where identity claims are read from, and in what order.
+ * Standard OIDC is ID token then UserInfo, and that is what every provider
+ * gets unless someone changes it here. The access token is deliberately off
+ * by default — it can be issued for another API, and Microsoft tells clients
+ * to treat it as opaque — so enabling it is a per-provider choice.
+ */
+export function IdentitySourcesEditor({
   sources,
   onChange,
   disabled,
@@ -493,80 +368,78 @@ export function AdvancedSourcesEditor({
     onChange(next)
   }
 
+  const isDefault = JSON.stringify(sources) === JSON.stringify(DEFAULT_IDENTITY_SOURCES)
+
   return (
-    <div className="rounded-md border border-border/50 bg-muted/10">
-      <details className="group">
-        <summary className="cursor-pointer list-none px-3 py-2 text-sm font-medium">
-          Advanced sources
-        </summary>
-        <div className="space-y-3 border-t border-border/40 px-3 py-3">
-          <p className="text-xs text-muted-foreground">
-            Read identity from enabled sources in this order:
-          </p>
-          <ol className="space-y-2">
-            {ordered.map((source) => {
-              const checked = enabled.has(source)
-              const index = sources.indexOf(source)
-              return (
-                <li key={source} className="flex items-center gap-2 text-sm">
-                  <Checkbox
-                    checked={checked}
-                    onCheckedChange={(v) => toggle(source, v === true)}
-                    disabled={disabled || (checked && sources.length === 1)}
-                    aria-label={SOURCE_LABELS[source]}
-                  />
-                  <span className="flex-1">
-                    {index >= 0 ? `${index + 1}. ` : ''}
-                    {SOURCE_LABELS[source]}
-                  </span>
-                  {checked && (
-                    <>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 px-2"
-                        aria-label={`Move ${SOURCE_LABELS[source]} up`}
-                        disabled={disabled || index <= 0}
-                        onClick={() => move(index, -1)}
-                      >
-                        <ChevronUpIcon className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 px-2"
-                        aria-label={`Move ${SOURCE_LABELS[source]} down`}
-                        disabled={disabled || index < 0 || index >= sources.length - 1}
-                        onClick={() => move(index, 1)}
-                      >
-                        <ChevronDownIcon className="h-3.5 w-3.5" />
-                      </Button>
-                    </>
-                  )}
-                </li>
-              )
-            })}
-          </ol>
-          <p className="text-xs text-muted-foreground">
-            The access token is audience-scoped and its subject may differ from the ID token. Leave
-            this off unless this IdP puts identity only there.
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Changing sources can change account matching and requires a new connection test.
-          </p>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={disabled}
-            onClick={() => onChange([...DEFAULT_IDENTITY_SOURCES])}
-          >
-            Restore default sources
-          </Button>
-        </div>
-      </details>
+    <div className="space-y-3" data-testid="identity-sources-editor">
+      <div>
+        <div className="text-sm font-medium">Identity sources</div>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Standard OpenID Connect reads the ID token, then UserInfo. Change this only for a provider
+          that puts identity somewhere else. Changing it can change which account a person matches
+          and needs a new connection test.
+        </p>
+      </div>
+      <ol className="space-y-2">
+        {ordered.map((source) => {
+          const checked = enabled.has(source)
+          const index = sources.indexOf(source)
+          return (
+            <li key={source} className="flex items-center gap-2 text-sm">
+              <Checkbox
+                checked={checked}
+                onCheckedChange={(v) => toggle(source, v === true)}
+                disabled={disabled || (checked && sources.length === 1)}
+                aria-label={SOURCE_LABELS[source]}
+              />
+              <span className="flex-1">
+                {index >= 0 ? `${index + 1}. ` : ''}
+                {SOURCE_LABELS[source]}
+                {source === 'accessTokenJwt' && (
+                  <span className="text-muted-foreground"> (may be issued for another API)</span>
+                )}
+              </span>
+              {checked && (
+                <>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2"
+                    aria-label={`Move ${SOURCE_LABELS[source]} up`}
+                    disabled={disabled || index <= 0}
+                    onClick={() => move(index, -1)}
+                  >
+                    <ChevronUpIcon className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2"
+                    aria-label={`Move ${SOURCE_LABELS[source]} down`}
+                    disabled={disabled || index < 0 || index >= sources.length - 1}
+                    onClick={() => move(index, 1)}
+                  >
+                    <ChevronDownIcon className="h-3.5 w-3.5" />
+                  </Button>
+                </>
+              )}
+            </li>
+          )
+        })}
+      </ol>
+      {!isDefault && (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={disabled}
+          onClick={() => onChange([...DEFAULT_IDENTITY_SOURCES])}
+        >
+          Use standard sources
+        </Button>
+      )}
     </div>
   )
 }

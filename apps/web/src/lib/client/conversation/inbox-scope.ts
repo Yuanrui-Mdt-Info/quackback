@@ -53,6 +53,32 @@ export type InboxView =
   | 'tickets_back_office'
   | 'tickets_tracker'
 
+/** Every InboxView. A Record so a view added to the union must be listed. */
+const INBOX_VIEWS: Record<InboxView, true> = {
+  mine: true,
+  unassigned: true,
+  all: true,
+  mentions: true,
+  saved: true,
+  quinn: true,
+  spam: true,
+  created_by_me: true,
+  tickets_all: true,
+  tickets_customer: true,
+  tickets_back_office: true,
+  tickets_tracker: true,
+}
+
+/**
+ * URL-safe guard: is `v` one of the canonical inbox views (conversation scopes,
+ * Quinn AI, or a Tickets-section scope)? The inbox route's `?view=` allowlist.
+ * Lives here, not in the nav sidebar, because the route's validateSearch runs
+ * from the route module, which every page loads eagerly.
+ */
+export function isInboxView(v: unknown): v is InboxView {
+  return typeof v === 'string' && Object.hasOwn(INBOX_VIEWS, v)
+}
+
 type TicketInboxView =
   'tickets_all' | 'tickets_customer' | 'tickets_back_office' | 'tickets_tracker'
 type TypedTicketInboxView = Exclude<TicketInboxView, 'tickets_all'>
@@ -100,6 +126,20 @@ export function inboxNavKey(nav: InboxNavItem): string {
   if (nav.kind === 'team') return `team:${nav.teamId}`
   if (nav.kind === 'custom') return `custom:${nav.viewId}`
   return `view:${nav.view}`
+}
+
+/**
+ * Whether the list offers the status, priority and company refinements. A
+ * custom view owns its own rules, and Mentions, Spam and Created by me are
+ * self-contained feeds, so a refinement carried into them would narrow the
+ * list with no control to undo it.
+ */
+export function inboxScopeHasRefinements(nav: InboxNavItem): boolean {
+  if (nav.kind === 'custom') return false
+  return !(
+    nav.kind === 'view' &&
+    (nav.view === 'mentions' || nav.view === 'spam' || nav.view === 'created_by_me')
+  )
 }
 
 /** A real conversation status, or 'all' = no status filter. */

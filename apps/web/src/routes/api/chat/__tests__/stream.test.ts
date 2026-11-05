@@ -113,6 +113,7 @@ vi.mock('@/lib/server/logger', () => ({
 
 import { Route } from '../stream'
 import { SSE_HEARTBEAT_INTERVAL_MS } from '@/lib/server/realtime/stream-heartbeat'
+import { SSE_STREAM_KEEPALIVE_MS } from '@/lib/server/utils/sse'
 
 type RouteOpts = { server: { handlers: { GET: (a: { request: Request }) => Promise<Response> } } }
 const GET = (Route as unknown as { options: RouteOpts }).options.server.handlers.GET
@@ -162,13 +163,13 @@ beforeEach(() => {
   mockReadActivitySnapshot.mockResolvedValue(null)
 })
 
-function tokenPrincipal(role: string, type = 'user') {
-  mockVerifyStreamToken.mockReturnValue('principal_tok')
+function tokenPrincipal(role: string, type = 'user', scope = 'dashboard') {
+  mockVerifyStreamToken.mockReturnValue({ principalId: 'principal_tok', scope })
   mockPrincipalFindFirst.mockResolvedValue({ id: 'principal_tok', role, type })
 }
 
-function sessionPrincipal(role: string, type = 'user') {
-  mockGetSession.mockResolvedValue({ user: { id: 'user_1' } })
+function sessionPrincipal(role: string, type = 'user', scope = 'dashboard') {
+  mockGetSession.mockResolvedValue({ session: { id: 'sess_1', scope }, user: { id: 'user_1' } })
   mockPrincipalFindFirst.mockResolvedValue({ id: 'principal_sess', role, type })
 }
 
@@ -186,7 +187,7 @@ describe('GET /api/chat/stream - principal resolution', () => {
   })
 
   it('401s for a valid-signature token whose principal no longer exists', async () => {
-    mockVerifyStreamToken.mockReturnValue('principal_gone')
+    mockVerifyStreamToken.mockReturnValue({ principalId: 'principal_gone', scope: 'dashboard' })
     mockPrincipalFindFirst.mockResolvedValue(undefined)
     const res = await GET({ request: req('?scope=inbox&token=t') })
     expect(res.status).toBe(401)
@@ -217,6 +218,20 @@ describe('GET /api/chat/stream - inbox scope', () => {
     expect(res.headers.get('Content-Type')).toContain('text/event-stream')
     await settleAndClose(res)
     expect(mockSubscribe).toHaveBeenCalledWith(['conversation:inbox'], expect.any(Function))
+  })
+
+  it('403s a promoted team role carried on a non-dashboard token', async () => {
+    tokenPrincipal('admin', 'user', 'widget')
+    const res = await GET({ request: req('?scope=inbox&token=t') })
+    expect(res.status).toBe(403)
+    expect(mockSubscribe).not.toHaveBeenCalled()
+  })
+
+  it('403s a promoted team role carried on a non-dashboard session', async () => {
+    sessionPrincipal('admin', 'user', 'widget')
+    const res = await GET({ request: req('?scope=inbox') })
+    expect(res.status).toBe(403)
+    expect(mockSubscribe).not.toHaveBeenCalled()
   })
 })
 
@@ -555,8 +570,12 @@ describe('GET /api/chat/stream - abandoned heartbeat timeout', () => {
         if (done) break
         opened += decoder.decode(value)
       }
-      await vi.advanceTimersByTimeAsync(SSE_HEARTBEAT_INTERVAL_MS)
-      await reader.current.read()
+      // A live consumer keeps reading, keepalives included, so the queue is
+      // empty whenever the heartbeat looks at it.
+      for (let t = 0; t < SSE_HEARTBEAT_INTERVAL_MS; t += SSE_STREAM_KEEPALIVE_MS) {
+        await vi.advanceTimersByTimeAsync(SSE_STREAM_KEEPALIVE_MS)
+        await reader.current.read()
+      }
       expect(mockRefreshPresence).toHaveBeenCalled()
       expect(mockClearPresence).not.toHaveBeenCalled()
     } finally {

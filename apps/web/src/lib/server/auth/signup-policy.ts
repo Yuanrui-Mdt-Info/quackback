@@ -157,6 +157,7 @@
  */
 import { logger } from '@/lib/server/logger'
 import { signupOpenFor, type SignupAudience } from '@/lib/shared/signup-open'
+import { oidcCallbackProviderId } from './oidc-callback-path'
 
 const log = logger.child({ component: 'signup-policy' })
 
@@ -250,10 +251,18 @@ export async function isAccountCreationAllowed(
 
   // Last, because it is the only branch that costs two more reads, and it is
   // reached only on the path that is about to refuse.
-  const { findHumanAdmin, isOpenToBootstrapClaim } =
+  // The first-user exemption follows the onboarding promoter exactly: no human
+  // owner, not provisioned, and setup not yet finished. A finished install
+  // whose admins are gone is not waiting for a first user, so its signup
+  // setting stands.
+  const { findHumanAdmin, isOpenToBootstrapClaim, isSetupOpenToClaim } =
     await import('@/lib/server/domains/principals/bootstrap-admin')
-  const [owner, openToClaim] = await Promise.all([findHumanAdmin(db), isOpenToBootstrapClaim(db)])
-  if (!owner && openToClaim) return true
+  const [owner, openToClaim, setupOpen] = await Promise.all([
+    findHumanAdmin(db),
+    isOpenToBootstrapClaim(db),
+    isSetupOpenToClaim(db),
+  ])
+  if (!owner && openToClaim && setupOpen) return true
 
   // Domain only. The address is the thing an operator must never be able to
   // read back out of a log, and the domain is enough to tell a misconfigured
@@ -351,9 +360,8 @@ const PATHS_THAT_DEREFERENCE_THE_ABORT = new Set<string>(['/sign-in/email-otp'])
  * "a provider's token exchange completed" rather than "somebody claimed it
  * did". `ctx.params.providerId` is filled in by the router from the URL it
  * matched, which is why this is the one place the policy may look at a request
- * at all.
+ * at all. Better Auth 1.7 also routes generic OAuth through `/callback/:id`.
  */
-const OIDC_CALLBACK_PATH = '/oauth2/callback/:providerId'
 
 /**
  * Is this account creation the just-in-time provisioning an administrator
@@ -400,9 +408,8 @@ async function isSsoAutoProvisionGrant(
   ctx?: { path?: string; params?: Record<string, unknown> } | null
 ): Promise<boolean> {
   // Path first, so the portal's own doors never pay for the registry read.
-  if (ctx?.path !== OIDC_CALLBACK_PATH) return false
-  const providerId = ctx.params?.providerId
-  if (typeof providerId !== 'string' || providerId === '') return false
+  const providerId = oidcCallbackProviderId(ctx ?? {})
+  if (!providerId) return false
 
   const { listIdentityProviders } =
     await import('@/lib/server/domains/settings/identity-providers.service')

@@ -36,10 +36,13 @@ import {
   formatNamedSendingAddress,
   resolveConversationFrom,
 } from '@/lib/server/domains/channel-accounts/channel-account.service'
+import { randomUUID } from 'node:crypto'
 import { agentReplyDisplayName, assembleOutboundThreading } from '@quackback/email'
+import { withEmailIdempotencyKey } from '@quackback/email/idempotency'
+import type { EmailAttachment } from '@quackback/email'
 import { getChannelDescriptor } from '@/lib/shared/channels'
 import { requireChannelAdapter } from '@/lib/server/domains/channels'
-import type { Conversation } from '@/lib/server/db'
+import type { Conversation, ConversationAttachment } from '@/lib/server/db'
 import type { ConversationId, ConversationMessageId, PrincipalId } from '@quackback/ids'
 import type { JSONContent } from '@tiptap/core'
 import { generateContentHTML } from '@/lib/shared/content-html'
@@ -59,6 +62,11 @@ import {
   recordOutboundEmail,
   recordEmailIdentity,
 } from './conversation.email-store'
+import {
+  appendLinkedAttachmentsHtml,
+  resolveEmailAttachments,
+  type ResolveEmailAttachmentsOptions,
+} from './conversation.email-attachments'
 import { logger } from '@/lib/server/logger'
 
 const log = logger.child({ component: 'conversation-notify' })
@@ -95,6 +103,46 @@ function plaintextBodyHtml(content: string): string {
 function messageBodyHtml(content: string, contentJson?: JSONContent | null): string {
   if (contentJson) return generateContentHTML(withEmailProxyHint(contentJson))
   return plaintextBodyHtml(content)
+}
+
+/**
+ * The message body, plus whatever its attachments resolve to: real MIME parts
+ * for the files that are safe to send inline and fit the per-email budget,
+ * and the rest appended to the body as a plain "Attachments" links list (see
+ * conversation.email-attachments). Attachment-free messages (the overwhelming
+ * majority) pay only the cost of an early-return check.
+ */
+async function resolvedMessageBody(
+  content: string,
+  contentJson: JSONContent | null | undefined,
+  attachments: ConversationAttachment[] | null | undefined,
+  options?: ResolveEmailAttachmentsOptions
+): Promise<{ bodyHtml: string; attachments: EmailAttachment[] }> {
+  const base = messageBodyHtml(content, contentJson)
+  const resolved = await resolveEmailAttachments(attachments, options)
+  return {
+    bodyHtml: appendLinkedAttachmentsHtml(base, resolved.linked),
+    attachments: resolved.attachments,
+  }
+}
+
+/**
+ * Whether the visitor behind THIS conversation's current message is one the
+ * team alert can vouch for: an identified session on our own surface
+ * (messenger covers both the widget and the portal). False for an anonymous
+ * visitor and for any correspondence channel (email, GitHub) — arrival there
+ * says nothing about what the attached bytes actually are, so those files
+ * reach the team alert as links only, never as real MIME (the `trustedSender`
+ * resolveEmailAttachments takes — see conversation.email-attachments).
+ */
+async function isVerifiedVisitorSender(conversation: Conversation): Promise<boolean> {
+  if (getChannelDescriptor(conversation.channel)?.surface === 'theirs') return false
+  const [visitor] = await db
+    .select({ type: principal.type })
+    .from(principal)
+    .where(eq(principal.id, conversation.visitorPrincipalId))
+    .limit(1)
+  return visitor?.type === 'user'
 }
 
 /**
@@ -202,6 +250,8 @@ export async function notifyVisitorMessage(opts: {
   contentJson?: JSONContent | null
   authorName: string
   isFirstMessage: boolean
+  /** The visitor's own attachments, carried on the team alert too. */
+  attachments?: ConversationAttachment[]
 }): Promise<void> {
   try {
     const agentsOnline = await isAnyAgentOnline()
@@ -249,6 +299,12 @@ export async function notifyVisitorMessage(opts: {
       // Both address fields came back with the team query, so the recipient is
       // decided from rows already in hand rather than by a second round trip.
       const { contactRecipientFrom, mailContact } = await import('@/lib/server/email/recipient')
+      const resolvedBody = await resolvedMessageBody(
+        opts.content,
+        opts.contentJson,
+        opts.attachments,
+        { trustedSender: await isVerifiedVisitorSender(opts.conversation) }
+      )
       await Promise.allSettled(
         team
           .flatMap((t) => {
@@ -260,7 +316,8 @@ export async function notifyVisitorMessage(opts: {
               direction: 'visitor_message',
               senderName: opts.authorName,
               messagePreview: body,
-              bodyHtml: messageBodyHtml(opts.content, opts.contentJson),
+              bodyHtml: resolvedBody.bodyHtml,
+              attachments: resolvedBody.attachments,
               ctaUrl,
               workspaceName: ctx.workspaceName,
               logoUrl: ctx.logoUrl ?? undefined,
@@ -373,6 +430,7 @@ export async function sendVisitorConversationEmail(opts: {
   ctaUrl: string
   ctx: { workspaceName: string; logoUrl: string | null }
   channel?: Conversation['channel']
+  attachments?: ConversationAttachment[]
 }): Promise<void> {
   // Only advertise a reply address we can actually receive on, so a visitor's
   // email reply threads back into this conversation (inbound email channel).
@@ -403,28 +461,36 @@ export async function sendVisitorConversationEmail(opts: {
       ? formatNamedSendingAddress(resolvedFrom, fromDisplayName)
       : resolvedFrom
   const { sendConversationMessageEmail } = await import('@quackback/email')
-  const result = await sendWithRetry(opts.conversationId, () =>
-    sendConversationMessageEmail({
-      to: opts.recipient,
-      direction: opts.direction,
-      senderName: opts.senderName,
-      // The truncated preview backs the subject/preheader; the full body is
-      // carried by bodyHtml so the recipient reads the whole reply inline.
-      messagePreview: previewOf(opts.content),
-      bodyHtml: messageBodyHtml(opts.content, opts.contentJson),
-      ctaUrl: opts.ctaUrl,
-      workspaceName: opts.ctx.workspaceName,
-      logoUrl: opts.ctx.logoUrl ?? undefined,
-      replyTo,
-      from,
-      fromDisplayName: from ? undefined : fromDisplayName,
-      channel,
-      conversationSubject: mailCtx.subject,
-      correspondence,
-      quotedPrevious,
-      conversationId: opts.conversationId,
-      ...threading,
-    })
+  const resolvedBody = await resolvedMessageBody(opts.content, opts.contentJson, opts.attachments)
+  // One key for every attempt of this send, opened outside the retry loop for
+  // the same reason the threading is minted there: a provider that accepted an
+  // attempt we saw fail then delivers the retry as the same message, not a
+  // second one.
+  const result = await withEmailIdempotencyKey(`conversation-email:${randomUUID()}`, () =>
+    sendWithRetry(opts.conversationId, () =>
+      sendConversationMessageEmail({
+        to: opts.recipient,
+        direction: opts.direction,
+        senderName: opts.senderName,
+        // The truncated preview backs the subject/preheader; the full body is
+        // carried by bodyHtml so the recipient reads the whole reply inline.
+        messagePreview: previewOf(opts.content),
+        bodyHtml: resolvedBody.bodyHtml,
+        attachments: resolvedBody.attachments,
+        ctaUrl: opts.ctaUrl,
+        workspaceName: opts.ctx.workspaceName,
+        logoUrl: opts.ctx.logoUrl ?? undefined,
+        replyTo,
+        from,
+        fromDisplayName: from ? undefined : fromDisplayName,
+        channel,
+        conversationSubject: mailCtx.subject,
+        correspondence,
+        quotedPrevious,
+        conversationId: opts.conversationId,
+        ...threading,
+      })
+    )
   )
   if (result && result.sent === false) {
     log.warn(
@@ -472,6 +538,7 @@ export async function notifyAgentReply(opts: {
   /** The agent message being delivered; thread-addressed adapters stamp
    *  pending → sent/failed on this row. */
   messageId?: ConversationMessageId
+  attachments?: ConversationAttachment[]
 }): Promise<void> {
   try {
     // Presence gates the MESSENGER surface only. On an email conversation the
@@ -530,6 +597,7 @@ export async function notifyAgentReply(opts: {
         workspaceName: ctx.workspaceName,
         logoUrl: ctx.logoUrl,
         direction: 'agent_reply',
+        attachments: opts.attachments,
       })
     }
 
@@ -559,6 +627,7 @@ export async function notifyAgentReply(opts: {
             workspaceName: ctx.workspaceName,
             logoUrl: ctx.logoUrl,
             direction: 'agent_reply',
+            attachments: opts.attachments,
           })
         } catch (err) {
           log.warn(
@@ -590,6 +659,7 @@ export async function notifyConversationStarted(opts: {
   contentJson?: JSONContent | null
   agentName: string
   messageId?: ConversationMessageId
+  attachments?: ConversationAttachment[]
 }): Promise<void> {
   try {
     const [visitor] = await db
@@ -626,6 +696,7 @@ export async function notifyConversationStarted(opts: {
       workspaceName: ctx.workspaceName,
       logoUrl: ctx.logoUrl,
       direction: 'agent_started',
+      attachments: opts.attachments,
     })
   } catch (err) {
     log.warn({ err }, 'notify conversation started failed')

@@ -6,8 +6,14 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { IntlProvider } from 'react-intl'
 
 vi.mock('@tanstack/react-router', () => ({
+  Link: ({ to, children }: { to: string; children: unknown }) => (
+    <a href={to}>{children as never}</a>
+  ),
   useNavigate: () => vi.fn(),
-  useRouteContext: () => ({ settings: { featureFlags: {}, publicWidgetConfig: {} } }),
+  useRouteContext: (opts?: { select?: (context: never) => unknown }) => {
+    const context = { settings: { featureFlags: {}, publicWidgetConfig: {} } }
+    return opts?.select ? opts.select(context as never) : context
+  },
 }))
 
 vi.mock('@/lib/server/functions/workflows', () => ({

@@ -1,5 +1,5 @@
+import { channelDestination } from '@/lib/server/integrations/destination'
 import type { IntegrationDefinition } from '@/lib/server/integrations/types'
-import { closeGitHubIssue } from '@/integrations/github/server/archive'
 import { fetchGitHubStatuses } from '@/integrations/github/server/statuses'
 import {
   registerGitHubWebhook,
@@ -24,6 +24,7 @@ import { listGitHubRepos } from '@/integrations/github/server/repos'
 
 export const githubIntegration: IntegrationDefinition = {
   id: 'github',
+  destination: channelDestination(['organizationName']),
   catalog: githubCatalog,
   oauth: {
     stateType: 'github_oauth',
@@ -42,7 +43,7 @@ export const githubIntegration: IntegrationDefinition = {
   hook: githubHook,
   inbound: githubInboundHandler,
   issues: githubIssues,
-  archive: closeGitHubIssue,
+  linkedItems: true,
   webhookRegistration: {
     register: async ({ accessToken, config, callbackUrl, secret }) => {
       const ownerRepo = config.channelId as string

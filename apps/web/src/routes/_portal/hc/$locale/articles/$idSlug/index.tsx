@@ -1,7 +1,7 @@
 import { createFileRoute, getRouteApi, notFound, redirect } from '@tanstack/react-router'
 import { formatDistanceToNow } from 'date-fns'
 import { getPublicArticlePageFn } from '@/lib/server/functions/help-center'
-import { RichTextContent, isRichTextContent } from '@/components/ui/rich-text-editor'
+import { RichTextContent, isRichTextContent } from '@/components/ui/rich-text-content'
 import { EmbedHydration } from '@/components/shared/embed-hydration'
 import { HelpCenterBreadcrumbs } from '@/components/help-center/help-center-breadcrumbs'
 import { HelpCenterPrevNext } from '@/components/help-center/help-center-prev-next'
@@ -20,6 +20,7 @@ import { stripMarkdownPreview } from '@/lib/shared/utils'
 import { isPortalSupportSurfaceEnabled } from '@/lib/shared/support-surfaces'
 import { hcArticlePath, hcCollectionPath } from '@/lib/shared/help-center-url'
 import type { JSONContent } from '@tiptap/react'
+import { useBaseUrl, useWorkspaceSettings } from '@/lib/client/hooks/use-root-context'
 
 const helpCenterApi = getRouteApi('/_portal/hc')
 
@@ -88,7 +89,8 @@ function ArticleDetailPage() {
   const { article, related, category, articles, allCategories } = Route.useLoaderData()
   const { locale } = Route.useParams()
   const { helpCenterConfig } = helpCenterApi.useLoaderData()
-  const { baseUrl, settings } = Route.useRouteContext()
+  const baseUrl = useBaseUrl()
+  const settings = useWorkspaceSettings()
   const supportEnabled = isPortalSupportSurfaceEnabled(
     settings?.featureFlags,
     settings?.portalConfig

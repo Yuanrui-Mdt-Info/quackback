@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest'
-const mocks = vi.hoisted(() => ({ enqueue: vi.fn() }))
-vi.mock('@/lib/server/jobs/job-queue', () => ({ enqueueJob: mocks.enqueue }))
+const mocks = vi.hoisted(() => ({ enqueue: vi.fn(), abort: vi.fn() }))
+vi.mock('@/lib/server/integrations/sync/app-hooks', () => ({ queueAppHookSync: mocks.enqueue }))
+vi.mock('@/lib/server/jobs/wake', () => ({ postJobWakeAbort: mocks.abort }))
 vi.mock('@/lib/server/integrations/encryption', () => ({
   encryptSecrets: (value: unknown) => JSON.stringify(value),
 }))
@@ -13,6 +14,7 @@ const events = (event: Record<string, unknown>) =>
 
 beforeEach(() => {
   mocks.enqueue.mockReset().mockResolvedValue(undefined)
+  mocks.abort.mockReset()
 })
 
 it.each([
@@ -25,7 +27,10 @@ it.each([
   const response = await slackAppHooks.handle('events', events({ type }), null, executor)
   expect(response.status).toBe(200)
   expect(mocks.enqueue).toHaveBeenCalledWith(
-    expect.objectContaining({ queue: 'slack-hook', dedupeKey: 'Ev1' })
+    'slack',
+    'Ev1',
+    expect.objectContaining({ kind: 'events', encryptedPayload: expect.any(String) }),
+    executor
   )
 })
 
@@ -44,8 +49,12 @@ it('aborts an in-flight turn when Stop arrives, then still enqueues cleanup', as
   expect(response.status).toBe(200)
   expect(turn.signal.aborted).toBe(true)
   expect(mocks.enqueue).toHaveBeenCalledWith(
-    expect.objectContaining({ queue: 'slack-hook', dedupeKey: 'Ev1' })
+    'slack',
+    'Ev1',
+    expect.objectContaining({ kind: 'events', encryptedPayload: expect.any(String) }),
+    executor
   )
+  expect(mocks.abort).toHaveBeenCalledWith({ team: 'T1', channel: 'C1', thread: '1.2' })
   endSlackTurn('T1', 'C1', '1.2', turn)
 })
 

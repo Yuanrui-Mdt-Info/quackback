@@ -1,14 +1,13 @@
 import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
-import { createFileRoute, useRouteContext } from '@tanstack/react-router'
-import { CreditCardIcon } from '@heroicons/react/24/solid'
+import { createFileRoute } from '@tanstack/react-router'
 import { PERMISSIONS } from '@/lib/shared/permissions'
 import { assertRoutePermission } from '@/lib/shared/route-permission'
-import { BackLink } from '@/components/ui/back-link'
-import { PageHeader } from '@/components/shared/page-header'
+import { SettingsPage } from '@/components/admin/settings/settings-page'
 import { CheckoutBuilder } from '@/components/admin/settings/billing/checkout-builder'
 import { billingQueries } from '@/lib/client/queries/billing'
 import { parseCheckoutSearch, type CheckoutSearch } from '@/lib/shared/billing/checkout-path'
 import type { BillingCatalogue } from '@/lib/server/control-plane/client'
+import { useBillingEnabled } from '@/lib/client/hooks/use-root-context'
 
 // The trailing underscore on "billing_" keeps this a sibling of Plans &
 // billing rather than a child rendered inside it. The URL is still
@@ -27,7 +26,7 @@ export const Route = createFileRoute('/admin/settings/billing_/checkout')({
 })
 
 function CheckoutPage() {
-  const { billingEnabled } = useRouteContext({ from: '__root__' })
+  const billingEnabled = useBillingEnabled()
   const search = Route.useSearch()
   const navigate = Route.useNavigate()
   const { data: overview } = useSuspenseQuery(billingQueries.overview())
@@ -41,18 +40,18 @@ function CheckoutPage() {
   }
 
   return (
-    <div className="max-w-5xl space-y-6">
-      <BackLink
-        to="/admin/settings/billing"
-        search={{ checkout: undefined, billing_error: undefined }}
-      >
-        Plans &amp; billing
-      </BackLink>
-      <PageHeader
-        icon={CreditCardIcon}
-        title="Configure your plan"
-        description="Choose a plan and billing cycle. Payment happens on the next step."
-      />
+    <SettingsPage
+      title="Configure your plan"
+      description="Choose a plan and billing cycle. Payment happens on the next step."
+      width="wide"
+      crumbs={[
+        {
+          label: 'Plan & billing',
+          to: '/admin/settings/billing',
+          search: { checkout: undefined, billing_error: undefined },
+        },
+      ]}
+    >
       {!billingEnabled || !overview ? (
         <p className="text-sm text-muted-foreground">
           Plan and billing is available only in a Quackback Cloud workspace.
@@ -80,6 +79,6 @@ function CheckoutPage() {
           }
         />
       )}
-    </div>
+    </SettingsPage>
   )
 }

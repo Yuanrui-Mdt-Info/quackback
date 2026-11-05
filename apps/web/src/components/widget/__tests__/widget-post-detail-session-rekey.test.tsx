@@ -31,6 +31,7 @@ vi.mock('@/lib/client/widget-auth', () => ({
 vi.mock('@/lib/client/widget-bridge', () => ({ sendToHost: vi.fn() }))
 vi.mock('../use-widget-image-upload', () => ({
   useWidgetImageUpload: () => ({ upload: vi.fn() }),
+  useWidgetMediaUpload: () => ({ upload: vi.fn() }),
 }))
 vi.mock('../widget-vote-button', () => ({ WidgetVoteButton: () => null }))
 vi.mock('../widget-comment-list', () => ({ WidgetCommentList: () => null }))
@@ -48,10 +49,10 @@ vi.mock('@/lib/client/mutations/load-more-comments', () => ({
 type Deferred = { resolve: (v: unknown) => void }
 const pending: Deferred[] = []
 const fetchPublicPostDetail = vi.fn(() => new Promise((resolve) => pending.push({ resolve })))
-vi.mock('@/lib/server/functions/portal', () => ({
-  fetchPublicPostDetail: (...args: unknown[]) => fetchPublicPostDetail(...(args as [])),
+vi.mock('@/lib/server/functions/widget/posts', () => ({
+  widgetFetchPublicPostDetailFn: (...args: unknown[]) => fetchPublicPostDetail(...(args as [])),
 }))
-vi.mock('@/lib/server/functions/comments', () => ({ createCommentFn: vi.fn() }))
+vi.mock('@/lib/server/functions/widget/comments', () => ({ widgetCreateCommentFn: vi.fn() }))
 
 import { WidgetPostDetail } from '../widget-post-detail'
 

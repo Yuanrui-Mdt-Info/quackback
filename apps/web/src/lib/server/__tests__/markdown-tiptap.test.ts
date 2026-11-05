@@ -265,7 +265,7 @@ describe('contentJsonToMarkdown', () => {
           type: 'paragraph',
           content: [
             { type: 'text', text: 'Launch ' },
-            { type: 'emoji', attrs: { name: 'tada' } },
+            { type: 'emoji', attrs: { name: 'tada', emoji: '🎉' } },
           ],
         },
         { type: 'resizableImage', attrs: { src: 'https://cdn.example.com/s.png', alt: 'S' } },
@@ -280,6 +280,24 @@ describe('contentJsonToMarkdown', () => {
     // escapes stripped: what matters is that the embed survives the round trip,
     // not which characters the serializer chose to protect.
     expect(result.replace(/\\/g, '')).toContain('[Embedded post: post_123]')
+  })
+
+  test('projects the persisted Unicode emoji glyph', () => {
+    const doc = {
+      type: 'doc' as const,
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'Luck ' },
+            { type: 'emoji', attrs: { name: 'crossed_fingers', emoji: '🤞' } },
+          ],
+        },
+      ],
+    }
+    const result = projectContentJsonToMarkdown(doc, 'fallback')
+    expect(result).toContain('🤞')
+    expect(result).not.toContain(':crossed_fingers:')
   })
 
   test('projects current text for an image-free structured-only edit', () => {

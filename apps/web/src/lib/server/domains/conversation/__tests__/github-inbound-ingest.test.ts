@@ -46,6 +46,7 @@ vi.mock('../conversation.webhooks', async (orig) => ({
 vi.mock('@/lib/server/realtime/conversation-channels', () => ({
   publishConversationUpdate: vi.fn(),
   publishConversationEvent: vi.fn(),
+  publishConversationMessage: vi.fn(),
   publishAgentConversationEvent: vi.fn(),
 }))
 
@@ -53,13 +54,14 @@ import { ingestGitHubChannelEvent } from '../conversation.github-inbound'
 import { githubThreadKey } from '@/lib/server/domains/channels/github-thread'
 import {
   publishAgentConversationEvent,
-  publishConversationEvent,
+  publishConversationMessage,
 } from '@/lib/server/realtime/conversation-channels'
 
 const fixture = await createDbTestFixture({
   probe: async (db) => {
     await db.select({ id: channelAccounts.id }).from(channelAccounts).limit(0)
     await db.select({ id: conversations.id }).from(conversations).limit(0)
+    await db.select({ editedAt: conversationMessages.editedAt }).from(conversationMessages).limit(0)
   },
 })
 
@@ -351,6 +353,7 @@ describe.skipIf(!fixture.available)('github channel ingest (real DB, rolled back
     const msgs = await testDb.select().from(conversationMessages)
     const edited = msgs.find((m) => m.metadata?.githubCommentId === '555')
     expect(edited?.content).toBe('still broken, edited')
+    expect(edited?.editedAt).toBeInstanceOf(Date)
     expect(publishAgentConversationEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: 'message_updated',
@@ -444,7 +447,7 @@ describe.skipIf(!fixture.available)('github channel ingest (real DB, rolled back
     const msgs = await testDb.select().from(conversationMessages)
     const principalIds = new Set(msgs.map((m) => m.principalId))
     expect(principalIds.size).toBe(3)
-    expect(publishConversationEvent).toHaveBeenCalled()
+    expect(publishConversationMessage).toHaveBeenCalled()
   })
 
   it('stores the GitHub avatar on the principal when a later comment includes it', async () => {

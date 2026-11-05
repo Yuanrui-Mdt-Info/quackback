@@ -7,10 +7,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { localizedHcPath } from '@/lib/shared/help-center-url'
-
-/** Sticky manual override so browser-detect doesn't fight an explicit choice. */
-export const HC_LOCALE_COOKIE = 'hc_locale'
+import { HC_LOCALE_COOKIE, localizedHcPath } from '@/lib/shared/help-center-url'
 
 const LOCALE_LABELS: Record<string, string> = {
   en: 'English',
@@ -22,6 +19,8 @@ const LOCALE_LABELS: Record<string, string> = {
   'pt-br': 'Português (Brasil)',
   'zh-cn': '简体中文',
   'zh-tw': '繁體中文',
+  nl: 'Nederlands',
+  pl: 'Polski',
 }
 
 interface HelpCenterLocaleSwitcherProps {
@@ -59,7 +58,7 @@ export function HelpCenterLocaleSwitcher({
 
   return (
     <Select value={currentLocale} onValueChange={handleChange}>
-      <SelectTrigger size="sm" className="h-8 gap-1.5 rounded-full text-xs" aria-label="Language">
+      <SelectTrigger size="sm" className="h-8 gap-1.5 text-xs" aria-label="Language">
         <GlobeAltIcon className="h-3.5 w-3.5" />
         <SelectValue>{LOCALE_LABELS[currentLocale] ?? currentLocale}</SelectValue>
       </SelectTrigger>

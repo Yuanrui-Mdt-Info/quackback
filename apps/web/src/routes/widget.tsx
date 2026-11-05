@@ -2,15 +2,17 @@ import { createFileRoute, Outlet, redirect, useRouter } from '@tanstack/react-ro
 import { createServerFn } from '@tanstack/react-start'
 import { getRequestHeaders, setResponseHeader } from '@tanstack/react-start/server'
 import { z } from 'zod'
-import { generateThemeCSS, readFontSans } from '@/lib/shared/theme'
+import { generateWorkspaceThemeCSS, readFontSans } from '@/lib/shared/theme'
 import { resolveLocale, loadWidgetMessages } from '@/lib/shared/i18n'
 import { WidgetAuthProvider } from '@/components/widget/widget-auth-provider'
+import { FileViewerProvider } from '@/components/shared/files/file-viewer-context'
 import { extractSessionTokenFromCookie } from '@/lib/server/functions/portal-session-token'
 import { fetchUserAvatar } from '@/lib/server/functions/portal'
 import { redactSettingsForClient } from '@/lib/shared/redact-portal-config'
 import { escapeInlineStyle } from '@/lib/shared/safe-inline-content'
 import { Button } from '@/components/ui/button'
 import { useBrandingFont } from '@/lib/client/hooks/use-branding-font'
+import { isTeamMember } from '@/lib/shared/roles'
 
 const setIframeHeaders = createServerFn({ method: 'GET' }).handler(async () => {
   setResponseHeader('Content-Security-Policy', 'frame-ancestors *')
@@ -55,7 +57,7 @@ export const Route = createFileRoute('/widget')({
     theme: search.theme === 'light' || search.theme === 'dark' ? search.theme : undefined,
   }),
   loader: async ({ context, location }) => {
-    const { settings, session } = context
+    const { settings, session, userRole } = context
 
     const org = settings?.settings
     if (!org) {
@@ -69,8 +71,7 @@ export const Route = createFileRoute('/widget')({
     const customCss = settings.customCss ?? ''
     const themeMode = brandingConfig.themeMode ?? 'user'
 
-    const hasThemeConfig = brandingConfig.light || brandingConfig.dark
-    const themeStyles = hasThemeConfig ? generateThemeCSS(brandingConfig) : ''
+    const themeStyles = generateWorkspaceThemeCSS(brandingConfig)
 
     // If user is logged into the portal (same-origin), extract the signed
     // session cookie so the widget can reuse it directly as a Bearer token.
@@ -122,6 +123,7 @@ export const Route = createFileRoute('/widget')({
       portalUser,
       portalSessionToken,
       hmacRequired: settings?.publicWidgetConfig?.hmacRequired ?? false,
+      canPortalHandoff: !isTeamMember(userRole),
       locale,
       messages,
     }
@@ -159,6 +161,7 @@ function WidgetLayout() {
     portalUser,
     portalSessionToken,
     hmacRequired,
+    canPortalHandoff,
     locale,
     messages,
   } = Route.useLoaderData()
@@ -174,6 +177,7 @@ function WidgetLayout() {
       portalUser={portalUser}
       portalSessionToken={portalSessionToken}
       hmacRequired={hmacRequired}
+      canPortalHandoff={canPortalHandoff}
       initialLocale={locale}
       initialMessages={messages}
     >
@@ -194,7 +198,9 @@ function WidgetLayout() {
           `,
         }}
       />
-      <Outlet />
+      <FileViewerProvider compact>
+        <Outlet />
+      </FileViewerProvider>
     </WidgetAuthProvider>
   )
 }

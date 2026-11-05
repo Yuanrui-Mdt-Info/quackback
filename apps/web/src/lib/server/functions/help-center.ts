@@ -2,7 +2,7 @@
  * Server Functions for Help Center Operations
  */
 
-import { createServerFn } from '@tanstack/react-start'
+import { createServerFn, createServerOnlyFn } from '@tanstack/react-start'
 import type { KbCategoryId, KbArticleId, KbArticleFeedbackId, PrincipalId } from '@quackback/ids'
 import { sanitizeTiptapContent } from '@/lib/server/sanitize-tiptap'
 import { ANONYMOUS_ACTOR, type Actor } from '@/lib/server/policy/types'
@@ -73,18 +73,23 @@ const log = logger.child({ component: 'help-center' })
  * invisible); signed-in requests resolve segment memberships via the
  * standard policy-actor path.
  */
-async function publicViewer(): Promise<Actor> {
-  // Cookie (portal) or Bearer (widget iframe) — anything else is anonymous
-  // without a DB round-trip, and fails closed on gated content.
+export const resolveHelpPublicViewer = createServerOnlyFn(async function resolveHelpPublicViewer(
+  auth?: Awaited<ReturnType<typeof getOptionalAuth>> | undefined
+): Promise<Actor> {
+  if (auth !== undefined) return policyActorFromAuth(auth)
   if (!hasAuthCredentials()) return ANONYMOUS_ACTOR
   return policyActorFromAuth(await getOptionalAuth())
+})
+
+async function publicViewer(): Promise<Actor> {
+  return resolveHelpPublicViewer()
 }
 
 // ============================================================================
 // Helper: serialize article dates
 // ============================================================================
 
-function serializeArticle<
+export const serializeArticle = createServerOnlyFn(function serializeArticle<
   T extends { createdAt: Date; updatedAt: Date; publishedAt: Date | null; deletedAt?: Date | null },
 >(article: T) {
   // embedding (pgvector) and searchVector (tsvector) are not JSON-serializable
@@ -101,18 +106,18 @@ function serializeArticle<
     publishedAt: toIsoStringOrNull(article.publishedAt),
     deletedAt: toIsoStringOrNull(article.deletedAt ?? null),
   }
-}
+})
 
-function serializeCategory<T extends { createdAt: Date; updatedAt: Date; deletedAt?: Date | null }>(
-  cat: T
-) {
+export const serializeCategory = createServerOnlyFn(function serializeCategory<
+  T extends { createdAt: Date; updatedAt: Date; deletedAt?: Date | null },
+>(cat: T) {
   return {
     ...cat,
     createdAt: toIsoString(cat.createdAt),
     updatedAt: toIsoString(cat.updatedAt),
     deletedAt: 'deletedAt' in cat ? toIsoStringOrNull(cat.deletedAt ?? null) : undefined,
   }
-}
+})
 
 // ============================================================================
 // Category Server Functions
@@ -582,4 +587,41 @@ export const searchPublicArticlesFn = createServerFn({ method: 'GET' })
       config.locales.default
     )
     return hybridSearchForLocale(data.query, locale, data.limit ?? 10, await publicViewer())
+  })
+
+/**
+ * Public article by widget `open({ articleId })` ref — same shape as
+ * getPublicArticleBySlugFn. `article_` and `kb_article_` TypeIDs look up by
+ * id (same UUID); anything else is a slug. Missing or gated → null.
+ * Appended so existing help-center handler indices stay put.
+ */
+export const resolvePublicArticleRefFn = createServerFn({ method: 'GET' })
+  .validator(z.object({ ref: z.string().min(1), locale: z.string().optional() }))
+  .handler(async ({ data }) => {
+    const { canonicalArticleTypeId } = await import('@/lib/shared/widget/article-ref')
+    const { getPublicArticleByIdForLocale, getPublicArticleBySlugForLocale } =
+      await import('@/lib/server/domains/help-center/help-center-locale.query')
+    const { DEFAULT_LOCALE } = await import('@/lib/shared/i18n')
+    const { NotFoundError } = await import('@/lib/shared/errors')
+    const { withDefaultLocaleFallback } = await import('@/lib/shared/widget/article-locale')
+    const viewer = await publicViewer()
+    const locale = data.locale ?? DEFAULT_LOCALE
+    try {
+      const kbId = canonicalArticleTypeId(data.ref)
+      const load = (loc: string) =>
+        kbId
+          ? getPublicArticleByIdForLocale(kbId, loc, viewer)
+          : getPublicArticleBySlugForLocale(data.ref, loc, viewer)
+      const { value: article, locale: resolvedLocale } = await withDefaultLocaleFallback(
+        locale,
+        DEFAULT_LOCALE,
+        load,
+        (err) => err instanceof NotFoundError
+      )
+      const { helpfulCount: _h, notHelpfulCount: _n, ...publicArticle } = serializeArticle(article)
+      return { ...publicArticle, resolvedLocale }
+    } catch (err) {
+      if (err instanceof NotFoundError) return null
+      throw err
+    }
   })

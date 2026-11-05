@@ -22,6 +22,8 @@ interface ClaimPlan {
   claimed: number
   /** `prune` flag of every `runMaintenanceTick` call, in order, when provided. */
   maintenance?: boolean[]
+  dispatchCalls?: number
+  startByIdCalls?: number
 }
 
 interface DormancyPlan {
@@ -30,9 +32,18 @@ interface DormancyPlan {
   /** What the standing-work probe finds in the workspace database. */
   pendingJobAt: Date | null
   deadlineAt: Date | null
+  /** Hosted billing configured, and whether queueing last month's usage report inserts a job. */
+  hosted?: boolean
+  reportInserted?: boolean
+  /** Months queued by the dormant usage-report catch-up, per workspace. */
+  reportsQueued?: Array<[string, string]>
 }
 
-async function bootJobWorker(plan: ClaimPlan, dormancy?: DormancyPlan) {
+async function bootJobWorker(
+  plan: ClaimPlan,
+  dormancy?: DormancyPlan,
+  opts?: { hangStop?: Promise<void> }
+) {
   vi.resetModules()
   const savedPoll = process.env.JOB_POLL_INTERVAL_MS
   process.env.JOB_POLL_INTERVAL_MS = String(POLL_MS)
@@ -50,11 +61,11 @@ async function bootJobWorker(plan: ClaimPlan, dormancy?: DormancyPlan) {
       workspaces: dormancy ? dormancy.workspaces : [workspace],
       refused: [],
     }),
+    resolveWorkspaceById: async (id: string) => ({
+      kind: 'ok',
+      workspace: { ...workspace, workspaceKey: id },
+    }),
     getControlSql: () => ({}),
-  }))
-  vi.doMock('@/lib/server/workspaces/fleet', () => ({
-    withWorkspaceScopeById: async (_id: string, _origin: string, body: () => Promise<unknown>) =>
-      body(),
   }))
   vi.doMock('../deadlines', () => ({
     earliestWorkspaceDeadline: async () => dormancy?.deadlineAt ?? null,
@@ -62,6 +73,22 @@ async function bootJobWorker(plan: ClaimPlan, dormancy?: DormancyPlan) {
   vi.doMock('../job-queue', () => ({
     earliestPendingJobAt: async () => dormancy?.pendingJobAt ?? null,
     isMissingJobQueue: () => false,
+  }))
+  vi.doMock('@/lib/server/domains/billing/usage-report', () => ({
+    isHostedBillingConfigured: () => Boolean(dormancy?.hosted),
+    previousUtcMonth: () => '2026-08',
+    enqueueUsageReport: async ({ month }: { month: string }) => ({
+      inserted: Boolean(dormancy?.reportInserted),
+      month,
+    }),
+  }))
+  vi.doMock('@/lib/server/workspaces/fleet', () => ({
+    withWorkspaceScopeById: async (id: string, _origin: string, body: () => Promise<unknown>) => {
+      const out = (await body()) as { month?: string } | undefined
+      if (out && typeof out === 'object' && 'month' in out && out.month)
+        dormancy?.reportsQueued?.push([id, out.month])
+      return out
+    },
   }))
   vi.doMock('@/lib/server/events/event-dispatch-queue', () => ({
     convertRelayOwnedEvents: async () => ({ converted: 0, enqueued: 0 }),
@@ -85,9 +112,18 @@ async function bootJobWorker(plan: ClaimPlan, dormancy?: DormancyPlan) {
       plan.maintenance?.push(opts.prune !== false)
       return { requeued: 0, terminated: 0, pruned: 0 }
     },
-    dispatchPass: async () => ({ claimed: plan.claimed, saturated: true }),
+    dispatchPass: async () => {
+      plan.dispatchCalls = (plan.dispatchCalls ?? 0) + 1
+      return { claimed: plan.claimed, saturated: true }
+    },
+    startJobsById: async () => {
+      plan.startByIdCalls = (plan.startByIdCalls ?? 0) + 1
+      return 0
+    },
     runJob: async () => 'succeeded',
-    awaitPool: async () => {},
+    awaitPool: async () => {
+      if (opts?.hangStop) await opts.hangStop
+    },
   }))
 
   const mod = await import('../worker')
@@ -109,6 +145,9 @@ async function bootJobWorker(plan: ClaimPlan, dormancy?: DormancyPlan) {
     /** Advance past the registry refresh so the loop set is reconciled once. */
     refresh: async () => {
       await vi.advanceTimersByTimeAsync(60_000)
+    },
+    wake: async (workspaceKey: string, jobIds: string[] = []) => {
+      await mod.handleJobWake({ workspaceKey, jobIds })
     },
     stop: async () => {
       await mod.stopJobWorker()
@@ -214,6 +253,46 @@ describe('pooled job worker', () => {
       expect(handle.dormant()).toBe(1)
     })
 
+    it("wakes a parked workspace that has not sent last month's usage report, once", async () => {
+      vi.useFakeTimers()
+      const dormancy: DormancyPlan = {
+        workspaces: [idle('ws_idle')],
+        pendingJobAt: null,
+        deadlineAt: null,
+        hosted: true,
+        reportInserted: true,
+        reportsQueued: [],
+      }
+      handle = await bootJobWorker({ claimed: 0 }, dormancy)
+      // Parked by the refresh, then woken by the catch-up to run the report.
+      expect(dormancy.reportsQueued).toEqual([['ws_idle', '2026-08']])
+      expect(handle.loops()).toEqual(['ws_idle'])
+      expect(handle.dormant()).toBe(0)
+
+      // The report ran; the next refreshes park it and do not ask again.
+      dormancy.reportInserted = false
+      await handle.refresh()
+      await handle.refresh()
+      expect(handle.loops()).toEqual([])
+      expect(dormancy.reportsQueued).toEqual([['ws_idle', '2026-08']])
+    })
+
+    it('leaves a parked workspace parked when last month is already reported', async () => {
+      vi.useFakeTimers()
+      const dormancy: DormancyPlan = {
+        workspaces: [idle('ws_idle')],
+        pendingJobAt: null,
+        deadlineAt: null,
+        hosted: true,
+        reportInserted: false,
+        reportsQueued: [],
+      }
+      handle = await bootJobWorker({ claimed: 0 }, dormancy)
+      expect(dormancy.reportsQueued).toEqual([['ws_idle', '2026-08']])
+      expect(handle.loops()).toEqual([])
+      expect(handle.dormant()).toBe(1)
+    })
+
     it('wakes a parked workspace when a request stamps it', async () => {
       vi.useFakeTimers()
       const dormancy: DormancyPlan = {
@@ -229,6 +308,57 @@ describe('pooled job worker', () => {
       await handle.refresh()
       expect(handle.loops()).toEqual(['ws_idle'])
       expect(handle.dormant()).toBe(0)
+    })
+
+    it('starts a parked workspace from job-wake without waiting for refresh', async () => {
+      vi.useFakeTimers()
+      const dormancy: DormancyPlan = {
+        workspaces: [idle('ws_idle')],
+        pendingJobAt: null,
+        deadlineAt: null,
+      }
+      handle = await bootJobWorker({ claimed: 0 }, dormancy)
+      expect(handle.loops()).toEqual([])
+      await handle.wake('ws_idle', ['job_01h00000000000000000000000'])
+      expect(handle.loops()).toEqual(['ws_idle'])
+      expect(handle.dormant()).toBe(0)
+    })
+
+    it('deactivates a parked loop before a concurrent wake starts a replacement', async () => {
+      vi.useFakeTimers()
+      let releaseStop!: () => void
+      const hangStop = new Promise<void>((resolve) => {
+        releaseStop = resolve
+      })
+      const dormancy: DormancyPlan = {
+        workspaces: [live('ws_idle')],
+        pendingJobAt: null,
+        deadlineAt: null,
+      }
+      const plan: ClaimPlan = { claimed: 0, dispatchCalls: 0, startByIdCalls: 0 }
+      handle = await bootJobWorker(plan, dormancy, { hangStop })
+      expect(handle.loops()).toEqual(['ws_idle'])
+
+      dormancy.workspaces = [idle('ws_idle')]
+      try {
+        vi.advanceTimersByTime(60_000)
+        await vi.advanceTimersByTimeAsync(0)
+        await vi.waitFor(() => {
+          expect(handle!.dormant()).toBe(1)
+        })
+
+        const dispatchesAtPark = plan.dispatchCalls ?? 0
+        vi.advanceTimersByTime(POLL_MS * 4)
+        await Promise.resolve()
+        expect(plan.dispatchCalls).toBe(dispatchesAtPark)
+
+        await handle.wake('ws_idle', ['job_01h00000000000000000000000'])
+        expect(handle.loops()).toEqual(['ws_idle'])
+        expect(handle.dormant()).toBe(0)
+        expect(plan.startByIdCalls).toBe(1)
+      } finally {
+        releaseStop()
+      }
     })
 
     it('forgets a parked workspace that leaves the registry', async () => {

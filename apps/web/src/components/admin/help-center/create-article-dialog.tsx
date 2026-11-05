@@ -10,7 +10,8 @@ import { useCreateArticle } from '@/lib/client/mutations/help-center'
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet'
 import { Button } from '@/components/ui/button'
-import { PlusIcon, Cog6ToothIcon } from '@heroicons/react/24/solid'
+import { NewButton } from '@/components/shared/new-button'
+import { Cog6ToothIcon } from '@heroicons/react/24/solid'
 import { Form } from '@/components/ui/form'
 import { HelpCenterFormFields } from './help-center-form-fields'
 import {
@@ -18,6 +19,7 @@ import {
   HelpCenterMetadataSidebarContent,
 } from './help-center-metadata-sidebar'
 import type { JSONContent } from '@tiptap/react'
+import type { EditorDocument } from '@/components/ui/rich-text-editor'
 
 interface CreateArticleDialogProps {
   /** Controlled open state. When provided, the built-in trigger button is hidden. */
@@ -48,9 +50,9 @@ export function CreateArticleDialog({
   })
 
   const handleContentChange = useCallback(
-    (json: JSONContent, _html: string, markdown: string) => {
-      setContentJson(json)
-      form.setValue('content', markdown, { shouldValidate: true })
+    (document: EditorDocument) => {
+      setContentJson(document.json())
+      form.setValue('content', document.markdown(), { shouldValidate: false, shouldDirty: true })
     },
     [form]
   )
@@ -78,8 +80,8 @@ export function CreateArticleDialog({
           setContentJson(null)
           setCategoryId('')
           void navigate({
-            to: '/admin/help-center/articles/$articleId',
-            params: { articleId: newArticle.id as string },
+            to: '/admin/help-center',
+            search: { article: newArticle.id },
           })
         },
       }
@@ -106,10 +108,7 @@ export function CreateArticleDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       {!isControlled && (
         <DialogTrigger asChild>
-          <Button size="sm">
-            <PlusIcon className="h-4 w-4 mr-1.5" />
-            New Article
-          </Button>
+          <NewButton noun="article" />
         </DialogTrigger>
       )}
       <DialogContent
@@ -143,7 +142,7 @@ export function CreateArticleDialog({
 
             <ModalFooter
               onCancel={() => handleOpenChange(false)}
-              submitLabel={createArticleMutation.isPending ? 'Saving...' : 'Save Draft'}
+              submitLabel={createArticleMutation.isPending ? 'Saving...' : 'Save draft'}
               isPending={createArticleMutation.isPending}
             >
               <Sheet open={mobileSettingsOpen} onOpenChange={setMobileSettingsOpen}>
@@ -155,7 +154,7 @@ export function CreateArticleDialog({
                 </SheetTrigger>
                 <SheetContent side="bottom" className="h-[70vh]">
                   <SheetHeader>
-                    <SheetTitle>Article Settings</SheetTitle>
+                    <SheetTitle>Article settings</SheetTitle>
                   </SheetHeader>
                   <div className="py-4 overflow-y-auto">
                     <HelpCenterMetadataSidebarContent

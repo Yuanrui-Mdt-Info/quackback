@@ -5,8 +5,6 @@
  * Summaries include a prose overview, urgency level, key quotes, and next steps.
  */
 
-import { chat } from '@tanstack/ai'
-import { openaiCompatibleText } from '@tanstack/ai-openai/compatible'
 import { z } from 'zod'
 import {
   db,
@@ -22,12 +20,11 @@ import {
   notInArray,
 } from '@/lib/server/db'
 import { config } from '@/lib/server/config'
-import {
-  isAiClientConfigured,
-  structuredOutputProviderOptions,
-} from '@/lib/server/domains/ai/config'
+import { isAiClientConfigured } from '@/lib/server/domains/ai/config'
+import { structuredChat } from '@/lib/server/domains/ai/structured-chat'
 import { getChatModel } from '@/lib/server/domains/ai/models'
-import { enforceAiTokenBudget } from '@/lib/server/domains/settings/tier-enforce'
+import { TierLimitError } from '@/lib/server/errors/tier-limit-error'
+import { aiBudgetAvailable, enforceAiTokenBudget } from '@/lib/server/domains/settings/tier-enforce'
 import { commentPlainText } from '@/lib/server/markdown-tiptap'
 import { withWorkspaceSweepReentrancyGuard } from '@/lib/server/sweep-lock'
 import type { PostId } from '@quackback/ids'
@@ -179,16 +176,12 @@ export async function generateAndSavePostSummary(postId: PostId): Promise<void> 
 
   let summaryJson: PostSummaryJson
   try {
-    summaryJson = await chat({
-      adapter: openaiCompatibleText(model, {
-        baseURL: config.openaiBaseUrl!,
-        apiKey: config.openaiApiKey!,
-      }),
+    summaryJson = await structuredChat({
+      model,
       systemPrompts: [systemPrompt],
       messages: [{ role: 'user', content: input }],
-      outputSchema: PostSummarySchema,
-      stream: false,
-      modelOptions: { max_tokens: 1000, ...structuredOutputProviderOptions() },
+      schema: PostSummarySchema,
+      maxTokens: 1000,
     })
   } catch (err) {
     if (!isStructuredOutputError(err)) throw err
@@ -238,6 +231,10 @@ export async function refreshStaleSummaries(): Promise<void> {
     log.debug('summary sweep skipped: ai insights not entitled')
     return
   }
+  if (!(await aiBudgetAvailable())) {
+    log.debug('summary sweep skipped: ai budget unavailable')
+    return
+  }
   await withWorkspaceSweepReentrancyGuard('summary_sweep', _doSweep)
 }
 
@@ -260,6 +257,7 @@ async function _doSweep(): Promise<void> {
   let totalProcessed = 0
   let totalFailed = 0
   let consecutiveEmptyBatches = 0
+  let stoppedByBudget = false
 
   while (true) {
     const stalePosts = await db
@@ -293,10 +291,21 @@ async function _doSweep(): Promise<void> {
         totalProcessed++
         batchSucceeded++
       } catch (err) {
+        // The budget ran out mid-run: every remaining post would be refused
+        // the same way, so stop instead of logging an error per post.
+        if (err instanceof TierLimitError) {
+          log.info(
+            { processed: totalProcessed, limit: err.limit },
+            'summary sweep stopped: ai budget exhausted'
+          )
+          stoppedByBudget = true
+          break
+        }
         totalFailed++
         log.error({ post_id: id, err }, 'failed to refresh post summary')
       }
     }
+    if (stoppedByBudget) break
 
     // Two consecutive zero-success batches almost always means a systemic
     // problem (bad model id, revoked key, upstream down). One zero-success
