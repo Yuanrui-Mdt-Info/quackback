@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-// @vitest-environment-options { "settings": { "disableIframePageLoading": true, "handleDisabledFileLoadingAsSuccess": true } }
+// @vitest-environment-options { "settings": { "enableIframePageLoading": false, "handleDisabledFileLoadingAsSuccess": true } }
 /**
  * <WidgetPreview> — admin widget settings live preview.
  *

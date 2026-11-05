@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-// @vitest-environment-options {"settings":{"disableCSSFileLoading":true,"disableJavaScriptFileLoading":true,"disableIframePageLoading":true,"handleDisabledFileLoadingAsSuccess":true}}
+// @vitest-environment-options {"settings":{"enableCSSFileLoading":false,"disableJavaScriptFileLoading":true,"enableIframePageLoading":false,"handleDisabledFileLoadingAsSuccess":true}}
 import './browser-dom'
 import { describe, expect, it, vi } from 'vitest'
 import DOMPurify from 'dompurify'
