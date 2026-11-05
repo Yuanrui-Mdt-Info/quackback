@@ -69,7 +69,7 @@ describe('mintMagicLinkUrl', () => {
     expect(typeof args.identifier).toBe('string')
     expect(args.identifier.length).toBeGreaterThan(16)
     const parsed = JSON.parse(args.value)
-    expect(parsed.email).toBe('a@b.com')
+    expect(parsed).toEqual({ type: 'magic-link', email: 'a@b.com' })
     expect(args.expiresAt).toBeInstanceOf(Date)
   })
 
@@ -95,19 +95,19 @@ describe('mintMagicLinkUrl', () => {
     })
     expect(url).toMatch(/^https:\/\/acme\.test\/verify-magic-link\?token=/)
     expect(url).toContain('callbackURL=')
-    // The returned token is the verification identifier and the one in the URL.
-    expect(token).toBe(mockCreateVerificationValue.mock.calls[0][0].identifier)
+    // Storage is namespaced; URLs and invitation records retain the public token.
+    expect(mockCreateVerificationValue.mock.calls[0][0].identifier).toBe(`magic-link:${token}`)
     expect(url).toContain(`token=${token}`)
   })
 })
 
 describe('revokeMagicLinkToken', () => {
-  it('deletes the verification row whose identifier is the token', async () => {
+  it('deletes only the namespaced magic-link verification row', async () => {
     await revokeMagicLinkToken('tok_abc')
 
     expect(mockDbDelete).toHaveBeenCalledTimes(1)
     expect(mockDbDelete).toHaveBeenCalledWith(mockVerificationTable)
-    expect(mockEq).toHaveBeenCalledWith(mockVerificationTable.identifier, 'tok_abc')
+    expect(mockEq).toHaveBeenCalledWith(mockVerificationTable.identifier, 'magic-link:tok_abc')
     expect(mockDeleteWhere).toHaveBeenCalled()
   })
 
@@ -122,7 +122,11 @@ describe('revokeMagicLinkTokens', () => {
     await revokeMagicLinkTokens(['tok_a', 'tok_b'])
     expect(mockDbDelete).toHaveBeenCalledTimes(1)
     expect(mockDbDelete).toHaveBeenCalledWith(mockVerificationTable)
-    expect(mockDeleteWhere).toHaveBeenCalled()
+    expect(mockDeleteWhere).toHaveBeenCalledWith({
+      op: 'inArray',
+      col: mockVerificationTable.identifier,
+      vals: ['magic-link:tok_a', 'magic-link:tok_b'],
+    })
   })
 
   it('is a no-op for an empty set', async () => {
