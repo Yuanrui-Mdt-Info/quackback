@@ -1,8 +1,8 @@
 /**
  * Unit tests for the widget OTT handoff route loader logic.
  *
- * The loader is tested by exercising its extracted behavior via mocks —
- * the actual TanStack Start route is not instantiated.
+ * Exercise the production loader and handler, mocking framework wrappers
+ * and external dependencies rather than duplicating the handoff algorithm.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
@@ -12,6 +12,25 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const mockSetResponseHeader = vi.fn()
 const mockGetRequestHeaders = vi.fn(() => new Headers())
+
+vi.mock('@tanstack/react-start', () => ({
+  createServerOnlyFn: (fn: unknown) => fn,
+  createServerFn: () => {
+    const chain = {
+      validator() {
+        return chain
+      },
+      handler(fn: unknown) {
+        return fn
+      },
+    }
+    return chain
+  },
+}))
+
+vi.mock('@/lib/server/auth/session', () => ({
+  getSession: () => mockGetSession(),
+}))
 
 vi.mock('@tanstack/react-start/server', () => ({
   setResponseHeader: (...args: unknown[]) => mockSetResponseHeader(...args),
@@ -83,162 +102,31 @@ const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
 
 // ---------------------------------------------------------------------------
-// Re-implement the loader logic directly to test it in isolation.
-// (We can't import a TanStack Start route's loader directly in Vitest without
-// a full router setup, so we extract and test the branching logic.)
+// Invoke the actual loader and normalize its thrown redirect for assertions.
 // ---------------------------------------------------------------------------
 
 async function runHandoffLoader(search: string) {
-  const { setResponseHeader } = await import('@tanstack/react-start/server')
-  const { verifyHandoffToken } = await import('../auth.widget-handoff')
-  const { config } = await import('@/lib/server/config')
-  const { db, widgetOriginSession, session, eq } = await import('@/lib/server/db')
-  const { recordAuditEvent } = await import('@/lib/server/audit/log')
-  const { isSafeCallbackUrl } = await import('@/lib/shared/routing')
-
+  const { Route } = await import('../auth.widget-handoff')
+  const { isRedirect } = await import('@tanstack/react-router')
   const params = new URLSearchParams(search)
-  const ott = params.get('ott')
-  const returnToRaw = params.get('returnTo')
-  const returnTo = isSafeCallbackUrl(returnToRaw) ? returnToRaw : '/'
-
-  if (!ott) {
-    await recordAuditEvent({
-      event: 'portal.widget_handshake.invalid',
-      outcome: 'failure',
-      actor: {},
-      metadata: { reason: 'missing_ott' },
-    })
-    return { status: 'invalid' as const }
-  }
-
-  let verifyResponse: Response
+  const loader = Route.options.loader as (context: {
+    location: { search: { ott?: string; returnTo?: string } }
+  }) => Promise<{ status: 'invalid' | 'expired' | 'error' }>
   try {
-    verifyResponse = await verifyHandoffToken(config.baseUrl, ott)
-  } catch {
-    await recordAuditEvent({
-      event: 'portal.widget_handshake.invalid',
-      outcome: 'failure',
-      actor: {},
-      metadata: { reason: 'fetch_error' },
-    })
-    return { status: 'error' as const }
-  }
-
-  if (!verifyResponse.ok) {
-    await recordAuditEvent({
-      event: 'portal.widget_handshake.invalid',
-      outcome: 'failure',
-      actor: {},
-      metadata: { reason: `ba_status_${verifyResponse.status}` },
-    })
-    const status = verifyResponse.status === 400 ? ('invalid' as const) : ('error' as const)
-    return { status }
-  }
-
-  // Collect the Set-Cookie payload but DO NOT forward it yet — the
-  // provenance check below must succeed first. A generic BA OTT (from
-  // any non-widget flow) can pass the verify step; if we forwarded the
-  // cookie eagerly, that OTT would install the session in the browser
-  // even when the handoff is rejected.
-  const setCookieValues = verifyResponse.headers.getSetCookie?.() ?? []
-  if (setCookieValues.length === 0) {
-    const single = verifyResponse.headers.get('set-cookie')
-    if (single) setCookieValues.push(single)
-  }
-
-  let sessionId: string | null = null
-  let userId: string | null = null
-  try {
-    const body = (await verifyResponse.json()) as {
-      session?: { id?: string; userId?: string }
-      user?: { id?: string }
-    }
-    sessionId = body?.session?.id ?? null
-    userId = body?.user?.id ?? body?.session?.userId ?? null
-  } catch {
-    /* ignore */
-  }
-
-  if (!sessionId || !userId) {
-    await recordAuditEvent({
-      event: 'portal.widget_handshake.invalid',
-      outcome: 'failure',
-      actor: {},
-      metadata: { reason: 'missing_session_info' },
-    })
-    return { status: 'invalid' as const }
-  }
-
-  // Provenance gate — only HMAC-verified widget sessions earn the marker.
-  // Mirrors isWidgetSessionHmacVerified in the production route.
-  const { isWidgetSessionHmacVerified } = await import('../auth.widget-handoff')
-  const provenanceOk = await isWidgetSessionHmacVerified(sessionId)
-  if (!provenanceOk) {
-    await recordAuditEvent({
-      event: 'portal.widget_handshake.invalid',
-      outcome: 'failure',
-      // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-      actor: { userId: userId as any },
-      target: { type: 'session', id: sessionId },
-      metadata: { reason: 'unverified_provenance' },
-    })
-    return { status: 'invalid' as const }
-  }
-
-  const { isHandoffPrincipalTeammate } = await import('../auth.widget-handoff')
-  const existing = await mockGetSession()
-  const existingIsDashboard = !!existing?.user && existing.session.scope === 'dashboard'
-  const isTeammate = await isHandoffPrincipalTeammate(userId)
-  if (isTeammate || existingIsDashboard) {
-    await recordAuditEvent({
-      event: 'portal.widget_handshake.invalid',
-      outcome: 'failure',
-      // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-      actor: { userId: userId as any },
-      target: { type: 'session', id: sessionId },
-      metadata: {
-        reason: isTeammate ? 'teammate_identity' : 'dashboard_session_present',
+    return await loader({
+      location: {
+        search: {
+          ott: params.get('ott') ?? undefined,
+          returnTo: params.get('returnTo') ?? undefined,
+        },
       },
     })
-    if (existingIsDashboard) {
-      return { status: 'redirect' as const, to: returnTo }
+  } catch (err) {
+    if (isRedirect(err)) {
+      return { status: 'redirect' as const, to: err.options.to, search: err.options.search }
     }
-    const { buildSigninRedirect } = await import('@/lib/shared/auth-prompt')
-    const landing = buildSigninRedirect(returnTo)
-    return { status: 'redirect' as const, to: landing.to, search: landing.search }
+    throw err
   }
-
-  // Provenance passed — promote to portal audience, then install the cookie.
-  try {
-    // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-    await (db.update(session) as any).set({ scope: 'portal' }).where(eq(session.id, sessionId))
-  } catch {
-    /* non-fatal */
-  }
-
-  for (const cookie of setCookieValues) {
-    setResponseHeader('Set-Cookie', cookie)
-  }
-
-  try {
-    // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-    await (db.insert(widgetOriginSession) as any)
-      .values({ sessionId, userId })
-      .onConflictDoNothing()
-  } catch {
-    /* non-fatal */
-  }
-
-  await recordAuditEvent({
-    event: 'portal.widget_handshake.consumed',
-    outcome: 'success',
-    // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-    actor: { userId: userId as any },
-    target: { type: 'session', id: sessionId },
-  })
-
-  // In the real route, this throws redirect(). Return a sentinel for testing.
-  return { status: 'redirect' as const, to: returnTo }
 }
 
 // ---------------------------------------------------------------------------
@@ -346,8 +234,53 @@ describe('widget handoff loader — valid OTT', () => {
     await runHandoffLoader('?ott=valid-token')
     expect(mockSetResponseHeader).toHaveBeenCalledWith(
       'Set-Cookie',
-      expect.stringContaining('better-auth.session_token')
+      expect.arrayContaining([expect.stringContaining('better-auth.session_token')])
     )
+  })
+
+  it('signs a returning visitor in without forwarding browser cookies or caller origin', async () => {
+    mockGetRequestHeaders.mockReturnValue(
+      new Headers({
+        cookie: 'better-auth.session_token=old; cf_clearance=x',
+        origin: 'https://untrusted.example',
+      })
+    )
+    mockFetch.mockResolvedValue(makeOkResponse({ id: 'sess_returning', userId: 'user_abc' }))
+
+    expect(await runHandoffLoader('?ott=fresh-token')).toMatchObject({
+      status: 'redirect',
+      to: '/',
+    })
+    expect(mockFetch).toHaveBeenCalledWith('http://localhost:3000/api/auth/one-time-token/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'fresh-token' }),
+    })
+  })
+
+  it('forwards all response cookies together after verification', async () => {
+    const response = makeOkResponse({ id: 'sess_1', userId: 'user_abc' })
+    response.headers.append('set-cookie', 'better-auth.session_data=data; Path=/; HttpOnly')
+    mockFetch.mockResolvedValue(response)
+
+    await runHandoffLoader('?ott=valid-token')
+    expect(mockSetResponseHeader).toHaveBeenCalledExactlyOnceWith('Set-Cookie', [
+      'better-auth.session_token=abc; Path=/; HttpOnly',
+      'better-auth.session_data=data; Path=/; HttpOnly',
+    ])
+  })
+
+  it('does not install cookies or a provenance marker when a consumed token is rejected', async () => {
+    mockFetch
+      .mockResolvedValueOnce(makeOkResponse({ id: 'sess_1', userId: 'user_abc' }))
+      .mockResolvedValueOnce(new Response(null, { status: 400 }))
+    expect(await runHandoffLoader('?ott=single-use-token')).toMatchObject({ status: 'redirect' })
+    mockSetResponseHeader.mockClear()
+    mockDbInsert.mockClear()
+
+    expect(await runHandoffLoader('?ott=single-use-token')).toEqual({ status: 'invalid' })
+    expect(mockSetResponseHeader).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
   })
 
   it('inserts the widget_origin_session marker', async () => {
@@ -454,7 +387,7 @@ describe('widget handoff loader — valid OTT', () => {
 
       expect(mockSetResponseHeader).toHaveBeenCalledWith(
         'Set-Cookie',
-        expect.stringContaining('better-auth.session_token')
+        expect.arrayContaining([expect.stringContaining('better-auth.session_token')])
       )
     })
   })
