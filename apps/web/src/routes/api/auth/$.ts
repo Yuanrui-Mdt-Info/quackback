@@ -47,6 +47,12 @@ export const Route = createFileRoute('/api/auth/$')({
        */
       GET: async ({ request }) => {
         const url = new URL(request.url)
+        if (url.pathname.startsWith('/api/auth/oauth2/')) {
+          const { mcpOAuthUnavailableResponse } =
+            await import('@/lib/server/auth/mcp-oauth-availability')
+          const unavailable = mcpOAuthUnavailableResponse()
+          if (unavailable) return unavailable
+        }
         // Intercept any genericOAuth callback before Better-Auth: a hit on
         // `sso-test:<state>` in the KV store means this is an admin test sign-in;
         // a miss returns null and falls through to the real OAuth handler.
@@ -88,6 +94,12 @@ export const Route = createFileRoute('/api/auth/$')({
        */
       POST: async ({ request }) => {
         const url = new URL(request.url)
+        if (url.pathname.startsWith('/api/auth/oauth2/')) {
+          const { mcpOAuthUnavailableResponse } =
+            await import('@/lib/server/auth/mcp-oauth-availability')
+          const unavailable = mcpOAuthUnavailableResponse()
+          if (unavailable) return unavailable
+        }
         let restoreRedirectUris: string[] | null = null
 
         // Rate-limit OAuth dynamic client registration to prevent spam/phishing

@@ -139,7 +139,7 @@ export async function resolveAuthContext(request: Request): Promise<McpAuthConte
   const token = extractBearerToken(request)
 
   // 1. Try OAuth access token
-  if (token) {
+  if (token && config.mcpOAuthEnabled !== false) {
     const oauthContext = await resolveOAuthContext(request, token)
     if (oauthContext) return oauthContext
   }

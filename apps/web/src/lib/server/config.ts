@@ -174,6 +174,8 @@ const configSchema = z
 
     // Auth
     secretKey: z.string().min(32, 'SECRET_KEY must be at least 32 characters'),
+    // Disable only the MCP OAuth provider on an explicitly configured HTTP test instance.
+    mcpOAuthEnabled: envBoolean.default(true),
     // Rotation grace for OAuth refresh tokens (seconds). 0 disables healing
     // and restores strict single-use rotation. See auth/refresh-grace.ts.
     oauthRefreshGraceSeconds: envInt.default(7 * 24 * 60 * 60),
@@ -382,6 +384,7 @@ function buildConfigFromEnv(): unknown {
 
     // Auth
     secretKey: process.env.SECRET_KEY,
+    mcpOAuthEnabled: env('QUACKBACK_MCP_OAUTH_ENABLED'),
     oauthRefreshGraceSeconds: env('OAUTH_REFRESH_GRACE_SECONDS'),
 
     trustedProxyHops: env('TRUSTED_PROXY_HOPS'),
@@ -585,6 +588,9 @@ export const config = {
   },
   get oauthRefreshGraceSeconds() {
     return loadConfig().oauthRefreshGraceSeconds
+  },
+  get mcpOAuthEnabled() {
+    return loadConfig().mcpOAuthEnabled
   },
 
   get trustedProxyHops() {

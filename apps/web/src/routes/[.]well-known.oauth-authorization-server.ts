@@ -24,6 +24,10 @@ export const Route = createFileRoute('/.well-known/oauth-authorization-server')(
   server: {
     handlers: {
       GET: async ({ request }) => {
+        const { mcpOAuthUnavailableResponse } =
+          await import('@/lib/server/auth/mcp-oauth-availability')
+        const unavailable = mcpOAuthUnavailableResponse()
+        if (unavailable) return unavailable
         const { getAuth } = await import('@/lib/server/auth/index')
         const { oauthProviderAuthServerMetadata } = await import('@better-auth/oauth-provider')
         const auth = await getAuth()

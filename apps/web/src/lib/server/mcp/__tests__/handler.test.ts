@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { config } from '@/lib/server/config'
 import type { ApiKey } from '@/lib/server/domains/api-keys'
 import type { PrincipalId, ApiKeyId, UserId } from '@quackback/ids'
 
@@ -71,7 +72,7 @@ vi.mock('@/lib/server/domains/settings/settings.service', () => ({
 
 // Mock config so baseUrl is available (used in WWW-Authenticate header)
 vi.mock('@/lib/server/config', () => ({
-  config: { baseUrl: 'https://example.com' },
+  config: { baseUrl: 'https://example.com', mcpOAuthEnabled: true },
   getBaseUrl: () => 'https://example.com',
 }))
 
@@ -409,6 +410,7 @@ async function setupValidOAuth(overrides?: { role?: string; scopes?: string[] })
 
 describe('MCP HTTP Handler', () => {
   beforeEach(() => {
+    ;(config as { mcpOAuthEnabled: boolean }).mcpOAuthEnabled = true
     vi.clearAllMocks()
   })
 
@@ -417,6 +419,28 @@ describe('MCP HTTP Handler', () => {
   // ===========================================================================
 
   describe('Authentication', () => {
+    it('rejects OAuth without verifying tokens or advertising discovery when disabled', async () => {
+      ;(config as { mcpOAuthEnabled: boolean }).mcpOAuthEnabled = false
+      const { verifyAccessTokenRequest } = await import('better-auth/oauth2')
+      const { resolveAuthContext } = await import('../handler')
+      const result = await resolveAuthContext(oauthRequest(jsonRpcRequest('initialize')))
+      expect(result).toBeInstanceOf(Response)
+      expect((result as Response).status).toBe(401)
+      expect((result as Response).headers.get('www-authenticate')).not.toContain(
+        'resource_metadata'
+      )
+      expect(verifyAccessTokenRequest).not.toHaveBeenCalled()
+    })
+
+    it('still accepts an authorized API key when MCP OAuth is disabled', async () => {
+      ;(config as { mcpOAuthEnabled: boolean }).mcpOAuthEnabled = false
+      await setupValidAuth()
+      const { resolveAuthContext } = await import('../handler')
+      const result = await resolveAuthContext(mcpRequest(jsonRpcRequest('initialize')))
+      expect(result).not.toBeInstanceOf(Response)
+      expect(result).toMatchObject({ authMethod: 'api-key' })
+    })
+
     it('should return 401 with WWW-Authenticate when no Authorization header is provided', async () => {
       const { handleMcpRequest } = await import('../handler')
 

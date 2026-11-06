@@ -37,6 +37,9 @@ vi.mock('@tanstack/react-router', () => ({
 vi.mock('@/lib/server/auth/index', () => ({
   getAuth: async () => auth,
 }))
+vi.mock('@/lib/server/config', () => ({
+  config: { mcpOAuthEnabled: true, baseUrl: 'https://feedback.example.com' },
+}))
 
 import { mcpProtectedResourceMetadata } from '@/lib/server/mcp/protected-resource-metadata'
 import { Route as PathInsertedRoute } from '../[.]well-known.oauth-authorization-server.api.auth'
