@@ -380,13 +380,15 @@ async function createAuth() {
   // Drizzle-wrapped unique from a concurrent replica cannot abort that init
   // (better-auth/better-auth#11034). Both spellings: e2e rewrites *.localhost
   // on the plugin `resource` only.
-  for (const identifier of new Set([`${baseURL}/api/mcp`, mcpResourceIdentifier])) {
-    await ensureMcpOauthResource({
-      db: db as Parameters<typeof ensureMcpOauthResource>[0]['db'],
-      table: oauthResourceTable,
-      identifier,
-      allowedScopes: API_KEY_SCOPES,
-    })
+  if (config.mcpOAuthEnabled !== false) {
+    for (const identifier of new Set([`${baseURL}/api/mcp`, mcpResourceIdentifier])) {
+      await ensureMcpOauthResource({
+        db: db as Parameters<typeof ensureMcpOauthResource>[0]['db'],
+        table: oauthResourceTable,
+        identifier,
+        allowedScopes: API_KEY_SCOPES,
+      })
+    }
   }
 
   // Origin allowlist. Better Auth rejects an auth POST whose Origin is
@@ -728,57 +730,61 @@ async function createAuth() {
 
       // MCP authorization server (`mcp()` replaces `oauthProvider()` — do not
       // register both). Tokens are audience-bound to `/api/mcp`.
-      mcp({
-        loginPage: '/auth/login',
-        consentPage: '/oauth/consent',
-        resource: mcpResourceIdentifier,
-        allowDynamicClientRegistration:
-          workspaceSettings?.developerConfig?.oauthDynamicClientRegistrationEnabled ?? true,
-        allowUnauthenticatedClientRegistration: true,
-        scopes: [...MCP_AS_SCOPES],
-        // Fallback when DCR omits `scope`. The register interceptor still
-        // persists the full AS allow-list on the client row so step-up works.
-        clientRegistrationDefaultScopes: [
-          'openid',
-          'profile',
-          'email',
-          ...API_KEY_SCOPES.filter((s) => s.startsWith('read:')),
-        ],
-        clientRegistrationAllowedScopes: [...MCP_AS_SCOPES],
-        resources: [
-          {
-            identifier: `${baseURL}/api/mcp`,
-            allowedScopes: [...API_KEY_SCOPES],
-          },
-        ],
-        // DCR clients otherwise get `invalid_target` (1.7 defaults this on).
-        enforcePerClientResources: false,
-        clientRegistrationDefaultResources: [`${baseURL}/api/mcp`],
-        clientRegistrationAllowedResources: [`${baseURL}/api/mcp`],
-        customAccessTokenClaims: async ({ user }) => {
-          if (!user?.id) return {}
-          const p = await db.query.principal.findFirst({
-            where: eq(principalTable.userId, user.id as ReturnType<typeof generateId<'user'>>),
-            columns: { id: true, role: true },
-          })
-          return {
-            principalId: p?.id,
-            role: p?.role ?? 'user',
-            name: user.name,
-            email: user.email,
-          }
-        },
-      }),
-
-      // RFC 8628 device authorization grant on the same OAuth server: a
-      // headless client asks `/device/code`, the person approves the code at
-      // `/device` in a browser, and the client polls `/oauth2/token` with the
-      // device_code grant. Must follow `mcp()`, which supplies the provider.
-      oauthDeviceAuthorization({
-        verificationUri: '/device',
-        expiresIn: '10m',
-        interval: '5s',
-      }),
+      ...(config.mcpOAuthEnabled !== false
+        ? [
+            mcp({
+              loginPage: '/auth/login',
+              consentPage: '/oauth/consent',
+              resource: mcpResourceIdentifier,
+              allowDynamicClientRegistration:
+                workspaceSettings?.developerConfig?.oauthDynamicClientRegistrationEnabled ?? true,
+              allowUnauthenticatedClientRegistration: true,
+              scopes: [...MCP_AS_SCOPES],
+              // Fallback when DCR omits `scope`. The register interceptor still
+              // persists the full AS allow-list on the client row so step-up works.
+              clientRegistrationDefaultScopes: [
+                'openid',
+                'profile',
+                'email',
+                ...API_KEY_SCOPES.filter((s) => s.startsWith('read:')),
+              ],
+              clientRegistrationAllowedScopes: [...MCP_AS_SCOPES],
+              resources: [
+                {
+                  identifier: `${baseURL}/api/mcp`,
+                  allowedScopes: [...API_KEY_SCOPES],
+                },
+              ],
+              // DCR clients otherwise get `invalid_target` (1.7 defaults this on).
+              enforcePerClientResources: false,
+              clientRegistrationDefaultResources: [`${baseURL}/api/mcp`],
+              clientRegistrationAllowedResources: [`${baseURL}/api/mcp`],
+              customAccessTokenClaims: async ({ user }) => {
+                if (!user?.id) return {}
+                const p = await db.query.principal.findFirst({
+                  where: eq(
+                    principalTable.userId,
+                    user.id as ReturnType<typeof generateId<'user'>>
+                  ),
+                  columns: { id: true, role: true },
+                })
+                return {
+                  principalId: p?.id,
+                  role: p?.role ?? 'user',
+                  name: user.name,
+                  email: user.email,
+                }
+              },
+            }),
+            // Device authorization depends on the MCP OAuth provider. Keep both
+            // disabled for the explicitly opted-out HTTP test instance.
+            oauthDeviceAuthorization({
+              verificationUri: '/device',
+              expiresIn: '10m',
+              interval: '5s',
+            }),
+          ]
+        : []),
 
       // Generic OAuth plugin for custom OIDC providers (Okta, Auth0, Keycloak, etc.)
       ...(genericOAuthConfigs.length > 0 ? [genericOAuth({ config: genericOAuthConfigs })] : []),

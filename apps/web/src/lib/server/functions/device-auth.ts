@@ -24,6 +24,7 @@ import {
   type RecentSignInRefusal,
 } from '@/lib/shared/recent-sign-in'
 import { logger } from '@/lib/server/logger'
+import { config } from '@/lib/server/config'
 import {
   deviceGrantHasCapability,
   deviceGrantScope,
@@ -31,6 +32,11 @@ import {
 } from '@/lib/shared/device-grant-scopes'
 
 const log = logger.child({ component: 'device-auth' })
+
+// Read on the server so the deployment switch is not baked into the client bundle.
+export const isDeviceAuthorizationEnabledFn = createServerFn({ method: 'GET' }).handler(
+  async () => config.mcpOAuthEnabled !== false
+)
 
 const LOOKUPS_PER_MINUTE = 20
 
@@ -122,6 +128,7 @@ async function clientDetails(clientId: string) {
 export const lookupDeviceCodeFn = createServerFn({ method: 'POST' })
   .validator(codeSchema)
   .handler(async ({ data }): Promise<DeviceCodeLookup> => {
+    if (config.mcpOAuthEnabled === false) return { state: 'unavailable' }
     const ctx = await requireAuth()
     if (await overLookupLimit(ctx.user.id)) return { state: 'rate_limited' }
 
@@ -142,6 +149,7 @@ export const lookupDeviceCodeFn = createServerFn({ method: 'POST' })
 export const decideDeviceCodeFn = createServerFn({ method: 'POST' })
   .validator(decisionSchema)
   .handler(async ({ data }): Promise<DeviceDecision> => {
+    if (config.mcpOAuthEnabled === false) return { ok: false, reason: 'unavailable' }
     const ctx = await requireAuth()
     // Approving hands a client long-lived access as this person, so it needs a
     // sign-in from the last few minutes. Denying never does. Returned as a
