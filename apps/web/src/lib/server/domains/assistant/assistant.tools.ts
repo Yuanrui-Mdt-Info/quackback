@@ -1,3 +1,5 @@
+import { RETRIEVED_CONTENT_NOTE } from './injection-guard'
+import { isHomeTurn, isWorkspaceToolAllowed, workspaceProposalMode } from './workspace-safety'
 import { toolPermissions } from './tool-permissions'
 /**
  * Quinn's tool-execution pipeline: assembles the tool catalogue
@@ -16,8 +18,10 @@ import { toolPermissions } from './tool-permissions'
  * instead.
  */
 import { createHash } from 'node:crypto'
+import { toolDefinition } from '@tanstack/ai'
 import { can } from '@/lib/server/policy/authorize'
 import { logger } from '@/lib/server/logger'
+import { assistantAttribution, runWithAuditAttribution } from '@/lib/server/audit/attribution'
 import type { ConversationId, TicketId } from '@quackback/ids'
 import type { AssistantToolContext, AssistantToolSpec } from './assistant.toolspec'
 import { resolveToolSpecs, isNoParentResult, NO_CONVERSATION_NOTE } from './assistant.toolspec'
@@ -28,6 +32,7 @@ import {
   type AssistantToolCall,
 } from './tool-audit'
 import { proposePendingAction, type AssistantPendingAction } from './pending-actions.service'
+import type { PendingActionRequester } from './pending-action-decisions'
 import { describeEnabledKnowledgeSources } from './retrieval-sources'
 
 const log = logger.child({ component: 'assistant-tools' })
@@ -46,17 +51,45 @@ function withDynamicPromptGuidance(
   specs: AssistantToolSpec[],
   ctx: AssistantToolContext
 ): AssistantToolSpec[] {
-  const enumeration = describeEnabledKnowledgeSources(ctx.knowledge.sources)
-  if (!enumeration) return specs
-  return specs.map((spec) =>
-    spec.name === 'search'
+  const home = isHomeTurn(ctx)
+  const enumeration = describeEnabledKnowledgeSources(ctx.knowledge.sources, home)
+  return specs.map((spec) => {
+    if (home && spec.risk === 'write')
+      return {
+        ...spec,
+        promptGuidance: `${spec.description} Calling this tool files a proposal. Nothing changes until the teammate clicks Apply.`,
+      }
+    if (home && spec.connector)
+      return {
+        ...spec,
+        promptGuidance: `${spec.promptGuidance} Each call waits for the teammate to Allow or Skip it.`,
+      }
+    const knowledgeSearch = spec.name === knowledgeSearchToolName(ctx)
+    return knowledgeSearch && enumeration
       ? { ...spec, promptGuidance: `${spec.promptGuidance} ${enumeration}` }
       : spec
-  )
+  })
+}
+
+const HOME_KNOWLEDGE_SEARCH = 'search_knowledge'
+const HOME_KNOWLEDGE_DESCRIPTION =
+  'Search the enabled workspace knowledge sources the current viewer can see.'
+const HOME_KNOWLEDGE_GUIDANCE =
+  'Call before answering anything factual or product-related; refine the query once more if the first search misses, then answer with what you have. Cite only the source types and ids it returns.'
+
+/** The knowledge retrieval tool's name for this turn's role and surface. */
+export function knowledgeSearchToolName(ctx: Pick<AssistantToolContext, 'role' | 'agentKind'>) {
+  return isHomeTurn(ctx) ? HOME_KNOWLEDGE_SEARCH : 'search'
 }
 
 const PENDING_APPROVAL_NOTE =
   'A teammate must approve this action; tell the customer it has been requested.'
+// A customer conversation is handed to the team once the turn ends with a
+// filed proposal (see assistant.orchestrator.ts), so Quinn says who picks it up.
+const PENDING_HANDOFF_NOTE =
+  'A teammate must confirm this action, and this conversation is being passed to the team. Tell the customer it has been requested and a teammate will pick it up.'
+const CONNECTOR_ALLOW_NOTE =
+  'The teammate sees an Allow or Skip card for this call. Say what you want to look up and stop; nothing was fetched yet.'
 const DENIED_NOTE = 'This action is not permitted for the assistant.'
 const DUPLICATE_NOTE = 'This action was already performed for this message.'
 const FAILED_NOTE = 'This action could not be completed.'
@@ -91,6 +124,7 @@ export function resolveEffectiveToolMode(
   spec: AssistantToolSpec,
   ctx: AssistantToolContext
 ): ToolExecutionMode {
+  if (workspaceProposalMode({ ...ctx, name: spec.name, risk: spec.risk })) return 'propose'
   if (spec.risk === 'control') return 'autonomous'
   if (spec.approvalPolicy === 'always') return 'autonomous'
   if (spec.approvalPolicy === 'approval') return 'propose'
@@ -165,6 +199,24 @@ function resolveIdempotencyKey(
 }
 
 /**
+ * Who files a proposal from an assistant turn: the assistant itself, for the
+ * teammate it works for when there is one. The assistant can never decide its
+ * own request; the teammate, like any qualified person, can.
+ */
+function assistantRequester(ctx: AssistantToolContext): PendingActionRequester {
+  const person = ctx.actor.principalType === 'user' ? ctx.actor.principalId : null
+  return {
+    // A turn whose assistant identity is the person themselves has no agent
+    // principal of its own to record.
+    requestedById:
+      ctx.assistantPrincipalId && ctx.assistantPrincipalId !== person
+        ? ctx.assistantPrincipalId
+        : null,
+    onBehalfOfPrincipalId: person,
+  }
+}
+
+/**
  * Run one tool call through the execution pipeline. `mode` arrives already
  * fully resolved (see `resolveEffectiveToolMode`); this function does no
  * further gating of its own, it only carries out what the mode says.
@@ -212,6 +264,7 @@ async function runWithPipeline(
       args: args as Record<string, unknown>,
       summary,
       originRole: ctx.role,
+      requester: assistantRequester(ctx),
       // Same-shaped key as the autonomous branch's claim below: a synthesis
       // retry that re-runs this exact write-tool call for the same turn
       // dedupes onto the first proposal row instead of inserting a duplicate
@@ -232,6 +285,8 @@ async function runWithPipeline(
       toolName: spec.name,
       summary,
       label: spec.label,
+      // What a decision on it must name, for a surface that posts its own card.
+      ...(pending.argsDigest ? { contentHash: pending.argsDigest } : {}),
       ...(spec.connector
         ? {
             connector: spec.connector,
@@ -240,7 +295,15 @@ async function runWithPipeline(
         : {}),
     })
     ctx.ledger.toolOutcomes.push({ name: spec.name, outcome: 'proposed' })
-    return { status: 'pending_approval', note: PENDING_APPROVAL_NOTE }
+    return {
+      status: 'pending_approval',
+      note:
+        spec.connector && isHomeTurn(ctx)
+          ? CONNECTOR_ALLOW_NOTE
+          : ctx.role === 'customer_support' && 'conversationId' in parent
+            ? PENDING_HANDOFF_NOTE
+            : PENDING_APPROVAL_NOTE,
+    }
   }
 
   // mode === 'autonomous' from here: simulate and propose both returned above.
@@ -283,6 +346,19 @@ async function runWithPipeline(
     name: spec.name,
     outcome: settled.ok ? (spec.risk === 'read' ? 'read' : 'executed') : 'failed',
   })
+  if (settled.ok && isHomeTurn(ctx) && (spec.risk === 'read' || spec.name === 'use_skill')) {
+    const data =
+      settled.result && typeof settled.result === 'object' && !Array.isArray(settled.result)
+        ? (settled.result as Record<string, unknown>)
+        : { data: settled.result }
+    const existingNote = typeof data.note === 'string' ? data.note : ''
+    return {
+      ...data,
+      note: existingNote.includes(RETRIEVED_CONTENT_NOTE)
+        ? existingNote
+        : [existingNote, RETRIEVED_CONTENT_NOTE].filter(Boolean).join(' '),
+    }
+  }
   return settled.ok ? settled.result : { status: 'failed', note: FAILED_NOTE }
 }
 
@@ -299,7 +375,12 @@ async function executeAndFinalize(
 ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
   const startedAt = Date.now()
   try {
-    const result = await spec.execute(args, ctx)
+    // Whatever the tool changes is the assistant's change, made for the
+    // teammate it is acting for, if any.
+    const result = await runWithAuditAttribution(
+      assistantAttribution({ assistantName: ctx.assistantName, actor: ctx.actor }),
+      () => spec.execute(args, ctx)
+    )
     // Defense in depth alongside the `parents` catalogue gate (assembleAssistantToolset):
     // a tool that reports it found no parent to act on (see `NO_CONVERSATION_NOTE`)
     // is never a successful execution, even if it somehow ran — most notably
@@ -405,9 +486,19 @@ export async function assembleAssistantToolset(
   // must not reach mode resolution, proposal, or the model at all on a
   // ticket-scoped turn. See `parents`'s own doc on AssistantToolSpec.
   const parentKind = turnParentKind(ctx)
-  const workspaceKeepBuiltins = new Set(['get_status', 'report_inability', 'use_skill'])
+  const home = isHomeTurn(ctx)
+  // Knowledge search (help center, internal notes, past conversations) is for
+  // the Home chat only; the workspace assistant elsewhere keeps its catalogue.
+  const workspaceKeepBuiltins = new Set([
+    ...(home ? ['search'] : []),
+    'get_status',
+    'report_inability',
+    'use_skill',
+  ])
   const fitsParent = (spec: AssistantToolSpec) =>
-    spec.parents.includes(parentKind) && (spec.availableWhen?.(ctx) ?? true)
+    spec.parents.includes(parentKind) &&
+    (spec.availableWhen?.(ctx) ?? true) &&
+    (!home || isWorkspaceToolAllowed(spec.name, spec.risk))
   const availableBuiltin = (spec: AssistantToolSpec) =>
     fitsParent(spec) && (ctx.role !== 'workspace_assistant' || workspaceKeepBuiltins.has(spec.name))
 
@@ -422,7 +513,23 @@ export async function assembleAssistantToolset(
   )
   const connectorActiveSpecs = connectorActive.map((entry) => entry.spec)
 
-  const resolvedSpecs = (specs ?? resolveToolSpecs()).filter(availableBuiltin)
+  const resolvedSpecs = (specs ?? resolveToolSpecs()).filter(availableBuiltin).map((spec) => {
+    if (!home || spec.name !== 'search') return spec
+    // On Home, `search` is the entity search; knowledge retrieval keeps its
+    // schema and pipeline under its own name and describes every source.
+    return {
+      ...spec,
+      name: HOME_KNOWLEDGE_SEARCH,
+      description: HOME_KNOWLEDGE_DESCRIPTION,
+      promptGuidance: HOME_KNOWLEDGE_GUIDANCE,
+      definition: toolDefinition({
+        name: HOME_KNOWLEDGE_SEARCH,
+        description: HOME_KNOWLEDGE_DESCRIPTION,
+        inputSchema: spec.definition.inputSchema,
+        outputSchema: spec.definition.outputSchema,
+      }),
+    }
+  })
   const builtInTools = resolvedSpecs.map((spec) => {
     const mode = resolveEffectiveToolMode(spec, ctx)
     return spec.definition.server<AssistantToolContext>((args) =>

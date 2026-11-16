@@ -11,6 +11,7 @@ import {
   twoFactor,
 } from 'better-auth/plugins'
 import { mcp } from '@better-auth/mcp'
+import { oauthDeviceAuthorization } from '@better-auth/oauth-provider'
 import { betterAuthMcpResource } from './mcp-plugin-resource'
 import { tanstackStartCookies } from 'better-auth/tanstack-start'
 import { generateId, type PrincipalId, type UserId } from '@quackback/ids'
@@ -24,6 +25,7 @@ import type { GenericOAuthConfig } from './build-oauth-configs'
 import { guardBetterAuthUserCreation } from './signup-policy'
 import { assignSessionScope } from './session-audience'
 import { isSignInMethodEnabled } from '@/lib/shared/signin-methods'
+import { accountDisplayName } from '@/lib/shared/greeting-name'
 import { workspaceAuthTrustedOrigins } from './trusted-origins'
 import { ensureMcpOauthResource } from './ensure-mcp-oauth-resource'
 import { HTTP_DISABLED_AUTH_PATHS } from './http-disabled-paths'
@@ -188,6 +190,7 @@ async function createAuth() {
     oauthResource: oauthResourceTable,
     oauthClientResource: oauthClientResourceTable,
     oauthClientAssertion: oauthClientAssertionTable,
+    deviceCode: deviceCodeTable,
     twoFactor: twoFactorTable,
     eq,
   } = await import('@/lib/server/db')
@@ -413,7 +416,15 @@ async function createAuth() {
     // takes precedence over that map entirely. Entry expiry lives in the
     // library's own window arithmetic (`lastRequest` vs the rule's window), so
     // this only has to hold and bound; the cache evicts oldest-first.
-    rateLimit: { customStorage: workspaceRateLimitStorage },
+    rateLimit: {
+      customStorage: workspaceRateLimitStorage,
+      // Requesting a device code is unauthenticated and mints a row, so it gets
+      // its own small budget per address. The rest of the device endpoints are
+      // closed to HTTP (see http-disabled-paths.ts); polling uses /oauth2/token.
+      customRules: {
+        '/device/code': { window: 60, max: 10 },
+      },
+    },
     // Route the library's internal logging through pino, redacted. Without it
     // those lines bypass the app logger entirely — unstructured, uncorrelated,
     // and on a resolution failure carrying the whole user-info payload
@@ -447,6 +458,8 @@ async function createAuth() {
         oauthResource: oauthResourceTable,
         oauthClientResource: oauthClientResourceTable,
         oauthClientAssertion: oauthClientAssertionTable,
+        // RFC 8628 device authorization (headless MCP / CLI sign-in)
+        deviceCode: deviceCodeTable,
         // The twoFactor plugin uses model name "twoFactor"; our Drizzle
         // table is `two_factor` (snake-case). The column→field mapping
         // (camelCase plugin field → snake_case column) is handled by
@@ -602,7 +615,7 @@ async function createAuth() {
                   const { generateAnonymousName } = await import('@/lib/shared/anonymous-names')
                   return generateAnonymousName(user.id)
                 })()
-              : user.name
+              : (accountDisplayName(user.name, user.email) ?? user.name)
             // Race-safe lazy create (the factory's onConflictDoNothing subsumes
             // the prior explicit findFirst guard). Always 'user' — team access is
             // via invitations only.
@@ -763,6 +776,13 @@ async function createAuth() {
                 }
               },
             }),
+            // Device authorization depends on the MCP OAuth provider. Keep both
+            // disabled for the explicitly opted-out HTTP test instance.
+            oauthDeviceAuthorization({
+              verificationUri: '/device',
+              expiresIn: '10m',
+              interval: '5s',
+            }),
           ]
         : []),
 
@@ -818,7 +838,11 @@ async function createAuth() {
               name: newUser.user.name,
               email: newUser.user.email,
               image: newImage,
-              displayName: newUser.user.name || anonymousUser.user.name,
+              // A sign-in by email alone gives no name: show one from the
+              // address before the visitor's generated name, never "Anonymous".
+              displayName:
+                accountDisplayName(newUser.user.name, newUser.user.email) ??
+                (anonPrincipal?.displayName || anonymousUser.user.name),
             })
 
             // The principal's `type` flipped from 'anonymous' → 'user'; drop

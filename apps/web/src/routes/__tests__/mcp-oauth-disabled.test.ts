@@ -7,7 +7,7 @@ vi.mock('@/lib/server/config', () => ({
   config: { mcpOAuthEnabled: false, baseUrl: 'http://192.168.50.33:3001' },
 }))
 const { handler, getAuth } = vi.hoisted(() => ({
-  handler: vi.fn(async () => new Response(null, { status: 204 })),
+  handler: vi.fn(async (_request: Request) => new Response(null, { status: 204 })),
   getAuth: vi.fn(() => {
     throw new Error('disabled discovery must not initialize OAuth')
   }),
@@ -33,7 +33,22 @@ function request(route: unknown, path: string, method = 'GET') {
   })
 }
 
+vi.mock('@/lib/server/auth/sso-test-callback', () => ({
+  handleSsoTestCallback: vi.fn(async () => null),
+  renderSsoTestCallbackHtml: vi.fn(),
+}))
+
 describe('disabled MCP OAuth routes', () => {
+  it.each(['GET', 'POST'])('preserves legacy external OIDC callbacks (%s)', async (method) => {
+    handler.mockClear()
+    const path = '/api/auth/oauth2/callback/keycloak?code=test&state=external'
+    expect((await request(Auth, path, method)).status).toBe(204)
+    expect(handler).toHaveBeenCalledOnce()
+    const forwarded = handler.mock.calls[0][0]
+    expect(new URL(forwarded.url).pathname).toBe('/api/auth/callback/keycloak')
+    expect(new URL(forwarded.url).searchParams.get('state')).toBe('external')
+    expect(forwarded.method).toBe(method)
+  })
   it.each([
     ProtectedRoot,
     ProtectedPath,
@@ -51,6 +66,10 @@ describe('disabled MCP OAuth routes', () => {
     ['/api/auth/oauth2/authorize', 'GET'],
     ['/api/auth/oauth2/register', 'POST'],
     ['/api/auth/oauth2/token', 'POST'],
+    ['/api/auth/device/code', 'POST'],
+    ['/api/auth/device/verify', 'GET'],
+    ['/api/auth/device/approve', 'POST'],
+    ['/api/auth/device/deny', 'POST'],
   ])('does not dispatch disabled provider endpoint %s', async (path, method) => {
     handler.mockClear()
     expect((await request(Auth, path, method)).status).toBe(404)
@@ -61,6 +80,7 @@ describe('disabled MCP OAuth routes', () => {
     ['/api/auth/one-time-token/generate', 'GET'],
     ['/api/auth/sign-in/email', 'POST'],
     ['/api/auth/sign-in/social', 'POST'],
+    ['/api/auth/callback/keycloak?code=test', 'GET'],
   ])('still dispatches ordinary authentication endpoint %s', async (path, method) => {
     handler.mockClear()
     expect((await request(Auth, path, method)).status).toBe(204)

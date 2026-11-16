@@ -95,7 +95,7 @@ const mockListPublicBoardsWithStats = vi.fn()
 const mockListPublicPostsWithVotesAndAvatars = vi.fn()
 const mockListPublicStatuses = vi.fn()
 const mockListPublicTags = vi.fn()
-const mockGetVotedPostIdsByUserId = vi.fn()
+const mockGetAllUserVotedPostIds = vi.fn()
 const mockGetPublicBoardBySlug = vi.fn()
 const mockGetPublicPostDetail = vi.fn()
 const mockListPublicPosts = vi.fn()
@@ -110,12 +110,21 @@ vi.mock('@/lib/server/domains/boards/board.public', () => ({
   getPublicBoardBySlug: (...a: unknown[]) => mockGetPublicBoardBySlug(...a),
 }))
 
+// The portal feed's first page also counts the filter panel; not under test here.
+vi.mock('@/lib/server/domains/posts/post.public.facets', () => ({
+  countPublicPostFacetsOrNull: vi
+    .fn()
+    .mockResolvedValue({ statuses: {}, boards: {}, tags: {}, total: 0, views: null }),
+}))
+// Settles a search's word mode with a probe query; a pass-through here.
+vi.mock('@/lib/server/domains/posts/post.public.search', () => ({
+  withPublicSearchMode: async <T>(params: T) => ({ ...params, searchMode: 'all' }),
+}))
 vi.mock('@/lib/server/domains/posts/post.public', () => ({
   listPublicPosts: (...a: unknown[]) => mockListPublicPosts(...a),
   listPublicPostsWithVotesAndAvatars: (...a: unknown[]) =>
     mockListPublicPostsWithVotesAndAvatars(...a),
-  getVotedPostIdsByUserId: (...a: unknown[]) => mockGetVotedPostIdsByUserId(...a),
-  getAllUserVotedPostIds: vi.fn(),
+  getAllUserVotedPostIds: (...a: unknown[]) => mockGetAllUserVotedPostIds(...a),
 }))
 
 vi.mock('@/lib/server/domains/posts/post.public.detail', () => ({
@@ -130,6 +139,14 @@ vi.mock('@/lib/server/domains/posts/post.merge', () => ({
 vi.mock('@/lib/server/domains/statuses/status.service', () => ({
   listPublicStatuses: (...a: unknown[]) => mockListPublicStatuses(...a),
   getDefaultStatus: vi.fn(),
+}))
+
+// getCommentsSectionDataFn proves view, then loads the post's author and board
+// access for the per-post comment capability.
+const mockLoadCommentContextForPost = vi.fn()
+vi.mock('@/lib/server/domains/posts/post.access', () => ({
+  assertPostViewable: vi.fn().mockResolvedValue(undefined),
+  loadCommentContextForPost: (...args: unknown[]) => mockLoadCommentContextForPost(...args),
 }))
 
 vi.mock('@/lib/server/domains/post-tags/post-tag.service', () => ({
@@ -320,7 +337,7 @@ describe('portal.ts fetchPortalData — portal-visibility gate', () => {
     mockListPublicPostsWithVotesAndAvatars.mockResolvedValue({ items: [], hasMore: false })
     mockListPublicStatuses.mockResolvedValue([])
     mockListPublicTags.mockResolvedValue([])
-    mockGetVotedPostIdsByUserId.mockResolvedValue(new Set())
+    mockGetAllUserVotedPostIds.mockResolvedValue(new Set())
 
     const h = await loadModule(PORTAL)
     const result = (await h[FETCH_PORTAL_DATA]({ data: { sort: 'top' } })) as Record<
@@ -337,7 +354,7 @@ describe('portal.ts fetchPortalData — portal-visibility gate', () => {
     mockListPublicPostsWithVotesAndAvatars.mockResolvedValue({ items: [], hasMore: false })
     mockListPublicStatuses.mockResolvedValue([])
     mockListPublicTags.mockResolvedValue([])
-    mockGetVotedPostIdsByUserId.mockResolvedValue(new Set())
+    mockGetAllUserVotedPostIds.mockResolvedValue(new Set())
 
     const h = await loadModule(PORTAL)
     await h[FETCH_PORTAL_DATA]({ data: { sort: 'top' } })
@@ -350,7 +367,7 @@ describe('portal.ts fetchPortalData — portal-visibility gate', () => {
     mockListPublicPostsWithVotesAndAvatars.mockResolvedValue({ items: [], hasMore: false })
     mockListPublicStatuses.mockResolvedValue([])
     mockListPublicTags.mockResolvedValue([])
-    mockGetVotedPostIdsByUserId.mockResolvedValue(new Set())
+    mockGetAllUserVotedPostIds.mockResolvedValue(new Set())
     const actor = { principalId: null, role: null, principalType: 'anonymous' }
     vi.mocked(policyActorFromAuth).mockResolvedValueOnce(actor as never)
 
@@ -520,6 +537,91 @@ describe('portal.ts fetchPublicPostDetail — portal-visibility gate', () => {
     expect(result?.canVote).toBe(true)
     expect(result?.canComment).toBe(true)
     expect(result?.boardAccess).toBeUndefined()
+  })
+
+  it('decides canComment per post on an author-only board and reports the rule', async () => {
+    mockResolvePortalAccess.mockResolvedValue({ granted: true, reason: 'public' })
+    mockGetPublicPostDetail.mockResolvedValue({
+      id: 'post_1',
+      title: 'Hello',
+      content: 'body',
+      contentJson: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      comments: [],
+      statusId: null,
+      voteCount: 0,
+      boardId: 'board_1',
+      principalId: 'principal_author',
+      boardAccess: {
+        view: 'anonymous',
+        vote: 'authenticated',
+        comment: 'authenticated',
+        submit: 'authenticated',
+        segments: { view: [], vote: [], comment: [], submit: [] },
+        moderation: { anonPosts: 'inherit', signedPosts: 'inherit', comments: 'inherit' },
+        replyPolicy: 'author-only',
+      },
+    })
+    mockGetPostMergeInfo.mockResolvedValue(null)
+    mockGetMergedPosts.mockResolvedValue([])
+    const viewer = (principalId: string) => ({
+      principalId,
+      role: 'user',
+      principalType: 'user',
+      segmentIds: new Set(),
+    })
+    const h = await loadModule(PORTAL)
+    type Detail = { canVote?: boolean; canComment?: boolean; replyPolicy?: string } | null
+
+    vi.mocked(policyActorFromAuth).mockResolvedValueOnce(viewer('principal_other') as never)
+    const other = (await h[FETCH_PUBLIC_POST_DETAIL]({ data: { postId: 'post_1' } })) as Detail
+    expect(other?.canVote).toBe(true)
+    expect(other?.canComment).toBe(false)
+    expect(other?.replyPolicy).toBe('author-only')
+
+    vi.mocked(policyActorFromAuth).mockResolvedValueOnce(viewer('principal_author') as never)
+    const author = (await h[FETCH_PUBLIC_POST_DETAIL]({ data: { postId: 'post_1' } })) as Detail
+    expect(author?.canComment).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// portal.ts — getCommentsSectionDataFn
+// ---------------------------------------------------------------------------
+
+describe('portal.ts getCommentsSectionDataFn — per-post comment capability', () => {
+  it('opens the composer only for the post author on an author-only board', async () => {
+    mockResolvePortalAccess.mockResolvedValue({ granted: true, reason: 'public' })
+    mockLoadCommentContextForPost.mockResolvedValue({
+      moderationState: 'published',
+      principalId: 'principal_author',
+      access: {
+        view: 'anonymous',
+        vote: 'authenticated',
+        comment: 'authenticated',
+        submit: 'authenticated',
+        segments: { view: [], vote: [], comment: [], submit: [] },
+        moderation: { anonPosts: 'inherit', signedPosts: 'inherit', comments: 'inherit' },
+        replyPolicy: 'author-only',
+      },
+    })
+    const viewer = (principalId: string) => ({
+      principalId,
+      role: 'user',
+      principalType: 'user',
+      segmentIds: new Set(),
+    })
+    const handler = await loadExportedHandler(PORTAL, 'getCommentsSectionDataFn')
+    type Section = { canComment: boolean; replyPolicy: string }
+
+    vi.mocked(policyActorFromAuth).mockResolvedValueOnce(viewer('principal_other') as never)
+    const other = (await handler({ data: { postId: 'post_1' } })) as Section
+    expect(other.canComment).toBe(false)
+    expect(other.replyPolicy).toBe('author-only')
+
+    vi.mocked(policyActorFromAuth).mockResolvedValueOnce(viewer('principal_author') as never)
+    const author = (await handler({ data: { postId: 'post_1' } })) as Section
+    expect(author.canComment).toBe(true)
   })
 })
 

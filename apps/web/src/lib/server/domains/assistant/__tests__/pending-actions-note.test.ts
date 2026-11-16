@@ -197,7 +197,7 @@ describe.skipIf(!fixture.available)('proposePendingAction: propose-time note', (
     expect(proposed.conversationId).toBeNull()
     expect(mockAddTicketNote).toHaveBeenCalledWith(
       expect.objectContaining({ principalId: 'principal_quinn' }),
-      { ticketId, content: 'Requested approval: Create a customer ticket: "x"' }
+      { ticketId, content: 'Waiting for a teammate to confirm: Create a customer ticket: "x"' }
     )
     expect(mockAppendNote).not.toHaveBeenCalled()
   })
@@ -301,7 +301,9 @@ describe.skipIf(!fixture.available)('sweepAndNotifyExpiredPendingActions', () =>
       args: {},
       summary: 'Already decided.',
     })
-    await decidePendingAction(decided.id, 'approved', agentId)
+    await decidePendingAction(decided.id, 'approved', agentId, testDb, {
+      contentHash: decided.argsDigest!,
+    })
     await testDb
       .update(assistantPendingActions)
       .set({ expiresAt: new Date(Date.now() - 1000) })

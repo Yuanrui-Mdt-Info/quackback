@@ -28,9 +28,18 @@ import { requiredScopesForMcpRpc } from './required-scope'
 import { DomainException, RateLimitError } from '@/lib/shared/errors'
 import { EntitlementRequiredError } from '@/lib/server/errors/entitlement-error'
 import { getDeveloperConfig } from '@/lib/server/domains/settings/settings.service'
-import { db, principal, eq } from '@/lib/server/db'
+import { permissionsForPrincipal } from '@/lib/server/policy/permissions'
+import type { PermissionKey } from '@/lib/shared/permissions'
 import { config } from '@/lib/server/config'
+import {
+  apiKeyAttribution,
+  MCP_ATTRIBUTION,
+  oauthClientAttribution,
+  runWithAuditAttribution,
+  setAuditAttribution,
+} from '@/lib/server/audit/attribution'
 import { createMcpServer } from './server'
+import { readOAuthPrincipal } from './oauth-principal'
 import type { PrincipalId } from '@quackback/ids'
 import type { McpAuthContext, McpScope } from './types'
 
@@ -103,13 +112,19 @@ async function resolveOAuthContext(
     // Re-read the principal's current role from the database so that
     // role changes made after token issuance take effect immediately.
     // If the principal no longer exists (deleted/revoked), reject the token.
-    const principalRecord = await db.query.principal.findFirst({
-      where: eq(principal.id, principalId as PrincipalId),
-      columns: { role: true },
-    })
+    // The same read names the OAuth client for audit attribution.
+    const clientId = oauthClientIdOf(payload)
+    const principalRecord = await readOAuthPrincipal(principalId as PrincipalId, clientId)
     if (!principalRecord) return null
 
     const role = principalRecord.role
+    // The caller's current assignment-derived permissions, resolved as a
+    // signed-in session resolves them, gate every tool. Portal users hold no
+    // workspace assignments, so they skip the read.
+    const permissions =
+      role === 'user'
+        ? new Set<PermissionKey>()
+        : await permissionsForPrincipal(principalId as PrincipalId, role as Role)
 
     // Parse granted scopes from space-separated string
     const scopeStr = (payload.scope as string) ?? ''
@@ -123,12 +138,25 @@ async function resolveOAuthContext(
       name: (payload.name as string) ?? 'Unknown',
       email: payload.email as string | undefined,
       role: role as Role,
+      permissions,
       authMethod: 'oauth',
+      ...(typeof payload.azp === 'string' && payload.azp ? { credentialId: payload.azp } : {}),
       scopes,
+      auditAttribution: oauthClientAttribution({
+        clientId,
+        clientName: principalRecord.clientName,
+        principalId: principalId as PrincipalId,
+      }),
     }
   } catch {
     return null
   }
+}
+
+/** The client a JWT access token was issued to (`client_id`, or `azp`). */
+function oauthClientIdOf(payload: Record<string, unknown>): string | null {
+  const clientId = payload.client_id ?? payload.azp
+  return typeof clientId === 'string' && clientId.length > 0 ? clientId : null
 }
 
 /**
@@ -180,14 +208,26 @@ export async function resolveAuthContext(request: Request): Promise<McpAuthConte
     // back-compat — the same rule the REST permission gates apply).
     const keyScopes = effectiveScopes(authResult.apiKey.scopes)
 
-    // Service principals (API keys) use displayName; human principals use user.name
+    // Changes made over MCP with a key are attributed to the key and to the
+    // teammate who created it.
+    const auditAttribution = apiKeyAttribution(authResult.apiKey, 'mcp')
+
+    // Role and permissions are the key's authority exactly as the REST API
+    // resolves it, capped at its creator's current access; the permission set
+    // is the ceiling every MCP actor built from this context carries.
+    // Service principals (API keys) use displayName; human principals use user.name.
     if (principalRecord.type === 'service') {
       return {
         principalId: authResult.principalId,
         name: principalRecord.displayName ?? authResult.apiKey.name,
         role: authResult.role as Role,
+        permissions: authResult.permissions,
+        ...(authResult.scopePrincipalId ? { scopePrincipalId: authResult.scopePrincipalId } : {}),
         authMethod: 'api-key',
+        credentialId: authResult.apiKey.id,
+        clientName: authResult.apiKey.name,
         scopes: keyScopes,
+        auditAttribution,
       }
     }
 
@@ -198,8 +238,13 @@ export async function resolveAuthContext(request: Request): Promise<McpAuthConte
       name: principalRecord.displayName ?? principalRecord.user?.name ?? 'Unknown',
       email: principalRecord.user?.email ?? undefined,
       role: authResult.role as Role,
+      permissions: authResult.permissions,
+      ...(authResult.scopePrincipalId ? { scopePrincipalId: authResult.scopePrincipalId } : {}),
       authMethod: 'api-key',
+      credentialId: authResult.apiKey.id,
+      clientName: authResult.apiKey.name,
       scopes: keyScopes,
+      auditAttribution,
     }
   }
 
@@ -227,8 +272,18 @@ async function oauthScopeStepUp(request: Request, auth: McpAuthContext): Promise
   return insufficientScopeChallenge(missing)
 }
 
-/** Create a stateless transport + server, handle the request, clean up */
-export async function handleMcpRequest(request: Request): Promise<Response> {
+/**
+ * Create a stateless transport + server, handle the request, clean up.
+ *
+ * The request is its own audit boundary from the first line, labelled MCP
+ * before any auth runs: key auth fills this boundary with the key and keeps
+ * the label, so nothing in an MCP request reads as the REST API.
+ */
+export function handleMcpRequest(request: Request): Promise<Response> {
+  return runWithAuditAttribution(MCP_ATTRIBUTION, () => handleMcpRequestInBoundary(request))
+}
+
+async function handleMcpRequestInBoundary(request: Request): Promise<Response> {
   const devConfig = await getDeveloperConfig()
   if (!devConfig.mcpEnabled) {
     return jsonRpcError(
@@ -242,6 +297,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
   // API key auth paths, and the API key path converts failures to Response
   // objects internally rather than throwing.
   if (auth instanceof Response) return auth
+
+  // From here on, everything in this request runs as the credential that
+  // made it.
+  if (auth.auditAttribution) setAuditAttribution(auth.auditAttribution)
 
   if (auth.authMethod === 'oauth') {
     const denied = await oauthScopeStepUp(request, auth)
@@ -267,6 +326,10 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
     }
   }
 
+  return serveMcpRequest(request, auth)
+}
+
+async function serveMcpRequest(request: Request, auth: McpAuthContext): Promise<Response> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

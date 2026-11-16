@@ -18,6 +18,7 @@ const useCaseSchema = z.enum([
   'product_feedback',
   'customer_support',
   'help_center',
+  'status_page',
   'internal',
   // Legacy values still accepted in config files
   'saas',
@@ -75,6 +76,7 @@ const tierFeatureFlagsSchema = z
     customColors: z.boolean().optional(),
     customCss: z.boolean().optional(),
     integrations: z.boolean().optional(),
+    visitorAnalytics: z.boolean().optional(),
   })
   .strict()
   .optional()
@@ -87,6 +89,9 @@ const tierLimitsSchema = z
     maxSendingDomains: tierLimitNumberSchema.optional(),
     aiTokensPerMonth: tierLimitNumberSchema.optional(),
     emailsPerMonth: tierLimitNumberSchema.optional(),
+    maxInboundEmailAddresses: tierLimitNumberSchema.optional(),
+    maxHelpCenterLocales: tierLimitNumberSchema.optional(),
+    maxStatusSubscribers: tierLimitNumberSchema.optional(),
     apiRequestsPerMonth: tierLimitNumberSchema.optional(),
     apiRequestsPerMinute: tierLimitNumberSchema.optional(),
     features: tierFeatureFlagsSchema,

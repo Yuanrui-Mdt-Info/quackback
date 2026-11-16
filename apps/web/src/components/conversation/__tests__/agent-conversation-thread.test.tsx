@@ -510,7 +510,7 @@ function makeConversation(overrides: Partial<ConversationDTO> = {}): Conversatio
 
 function renderThread(
   item: { kind: 'conversation' | 'ticket'; id: string },
-  extra: { detailPanelShown?: boolean } = {}
+  extra: { detailPanelShown?: boolean; replyFirst?: boolean } = {}
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
@@ -631,6 +631,23 @@ describe('AgentConversationThread — conversation kind unaffected', () => {
     expect(await screen.findByRole('menuitemradio', { name: 'Note' })).toBeInTheDocument()
     expect(screen.getByTestId('inbox-detail-panel')).toBeInTheDocument()
     expect(screen.getByTestId('composer-ai-actions')).toHaveAttribute('data-active-mode', 'reply')
+  })
+})
+
+describe('AgentConversationThread: reply first (the Try Messenger sheet)', () => {
+  it('keeps Close filled and the send button an icon in the inbox', async () => {
+    renderThread({ kind: 'conversation', id: 'conversation_1' })
+    expect((await screen.findByRole('button', { name: 'Close' })).className).toContain('bg-primary')
+    expect(screen.getByRole('button', { name: 'Send reply' }).textContent).toBe('')
+  })
+
+  it('makes the reply the primary action and quiets Close', async () => {
+    renderThread({ kind: 'conversation', id: 'conversation_1' }, { replyFirst: true })
+    const close = await screen.findByRole('button', { name: 'Close' })
+    expect(close.className).not.toContain('bg-primary')
+    const send = screen.getByRole('button', { name: 'Send reply' })
+    expect(send.textContent).toBe('Send')
+    expect(send.className).toContain('bg-primary')
   })
 })
 
@@ -862,6 +879,23 @@ describe('AgentConversationThread — composer focus handle', () => {
     // The marker follows the note composer too — the modes share one box.
     act(() => composerRef.current?.focusComposer('note'))
     expect(screen.getByTestId('editor').closest('[data-inbox-composer]')).not.toBeNull()
+  })
+
+  // The editor inside is borderless, so the box is the only place focus shows.
+  // Both modes keep a cue, and it is neutral: never the brand or note amber.
+  it('shows a neutral focus cue on the composer box in reply and note mode', async () => {
+    const composerRef = renderWithHandle({ kind: 'conversation', id: 'conversation_1' })
+    const focusClasses = () =>
+      (screen.getByTestId('editor').closest('[data-inbox-composer]') as HTMLElement).className
+        .split(/\s+/)
+        .filter((c) => c.startsWith('focus-within:'))
+
+    await screen.findByTestId('editor')
+    expect(focusClasses().some((c) => c.includes('-ring'))).toBe(true)
+
+    act(() => composerRef.current?.focusComposer('note'))
+    expect(focusClasses().some((c) => c.includes('-ring'))).toBe(true)
+    expect(focusClasses().some((c) => /amber|primary/.test(c))).toBe(false)
   })
 
   it('pasting an image on the composer stages the attachment tray, not an inline node', async () => {
@@ -1109,17 +1143,20 @@ describe('AgentConversationThread: reads that ride with the thread', () => {
 
 describe('AgentConversationThread: inbox translation past the AI allowance', () => {
   it('shows the notice above the composer, and nothing when there is none', async () => {
-    threadProbe.overAllowanceNotice = 'Your AI allowance is used up. Translation keeps working.'
+    threadProbe.overAllowanceNotice =
+      'AI usage for this period is used up. Translation keeps working. Upgrade your plan for more.'
     renderThread({ kind: 'conversation', id: 'conversation_over_allowance' })
     expect(
-      await screen.findByText('Your AI allowance is used up. Translation keeps working.')
+      await screen.findByText(
+        'AI usage for this period is used up. Translation keeps working. Upgrade your plan for more.'
+      )
     ).toBeTruthy()
     cleanup()
 
     threadProbe.overAllowanceNotice = null
     renderThread({ kind: 'conversation', id: 'conversation_within_allowance' })
     await screen.findByTestId('editor')
-    expect(screen.queryByText(/AI allowance/)).toBeNull()
+    expect(screen.queryByText(/AI usage/)).toBeNull()
   })
 })
 

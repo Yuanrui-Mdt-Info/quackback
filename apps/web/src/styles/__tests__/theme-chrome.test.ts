@@ -6,7 +6,10 @@ import { railControlClass } from '@/components/admin/rail-item'
 
 const dir = dirname(fileURLToPath(import.meta.url))
 const css = readFileSync(join(dir, '../../globals.css'), 'utf8')
-const adminSource = readFileSync(join(dir, '../../routes/admin.tsx'), 'utf8')
+const adminSource = readFileSync(
+  join(dir, '../../components/admin/admin-workspace-frame.tsx'),
+  'utf8'
+)
 
 /** The declaration block that follows the first occurrence of a selector. */
 function block(selector: string): string {
@@ -37,7 +40,7 @@ describe('theme chrome tokens', () => {
     ['--chrome-active-text', '#09090b', '#fafafa'],
     ['--chrome-active-icon', '#9a6c00', '#ffcf20'],
     ['--chrome-pane-active-background', '#f4f4f5', '#1f1f23'],
-    ['--chrome-focus', '#9a6c00', '#ffcf20'],
+    ['--chrome-focus', 'var(--chrome-label)', 'var(--chrome-label)'],
   ])('%s is %s in light and %s in dark', (name, light, dark) => {
     expect(lightTokens).toContain(`${name}: ${light};`)
     expect(darkTokens).toContain(`${name}: ${dark};`)

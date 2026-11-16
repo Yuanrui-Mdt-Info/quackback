@@ -1,3 +1,4 @@
+import { agentKindForTurn } from '../workspace-safety'
 /**
  * Shared fixtures for the assistant tool pipeline tests: one tool-context
  * builder and one pending-action row, so a context or schema field change
@@ -5,6 +6,7 @@
  */
 import { makeAssistantToolContext, type AssistantToolContext } from '../assistant.toolspec'
 import type { AssistantPendingAction } from '../pending-actions.service'
+import { digestOf } from '@/lib/server/utils/canonical-json'
 
 /** A tool context with test defaults; overrides win (including `actor`). */
 export function makeToolTestContext(
@@ -17,7 +19,13 @@ export function makeToolTestContext(
     conversationId: null,
     simulate: false,
   })
-  return { ...base, ...overrides }
+  return {
+    ...base,
+    ...overrides,
+    agentKind:
+      overrides.agentKind ??
+      agentKindForTurn(overrides.role ?? base.role, overrides.workspaceThreadKey),
+  }
 }
 
 /** A pending-action row in its `proposed` state; override `status` etc. as needed. */
@@ -41,5 +49,10 @@ export function fakePendingActionRow(
     executedAt: null,
     result: null,
     ...overrides,
+    // The digest of the content the row carries, as a filed request stores it.
+    argsDigest:
+      'argsDigest' in overrides
+        ? overrides.argsDigest
+        : digestOf(overrides.args ?? { reason: 'resolved' }),
   } as unknown as AssistantPendingAction
 }

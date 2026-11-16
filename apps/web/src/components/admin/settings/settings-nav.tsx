@@ -3,7 +3,6 @@ import { Link, useRouterState } from '@tanstack/react-router'
 import { cn } from '@/lib/shared/utils'
 import { NAV_ICON_CLASS, NAV_ITEM_CLASS } from '@/components/shared/nav-tokens'
 import { FilterSection } from '@/components/shared/filter-section'
-import { usePermissions } from '@/lib/client/use-permissions'
 import { AUTOMATION_PAGE_ICONS, SETTINGS_PAGE_ICONS } from './settings-page-icons'
 import {
   buildNavSections,
@@ -16,8 +15,8 @@ import {
 import { SettingsNavContext } from './settings-page'
 import {
   useBillingEnabled,
-  useCloudEnabled,
   useFeatureFlags,
+  usePermissions,
 } from '@/lib/client/hooks/use-root-context'
 
 type IconComponent = ComponentType<{ className?: string }>
@@ -47,12 +46,11 @@ function settingsRowClass(active: boolean) {
 export function SettingsNavProvider({ children }: { children: ReactNode }) {
   const flags = useFeatureFlags()
   const billingEnabled = useBillingEnabled()
-  const cloudEnabled = useCloudEnabled()
   const permissions = usePermissions()
 
   const navSections = useMemo(
-    () => navSectionsFor(buildNavSections(flags, billingEnabled, cloudEnabled), permissions),
-    [flags, billingEnabled, cloudEnabled, permissions]
+    () => navSectionsFor(buildNavSections(flags, billingEnabled), permissions),
+    [flags, billingEnabled, permissions]
   )
 
   return <SettingsNavContext.Provider value={navSections}>{children}</SettingsNavContext.Provider>

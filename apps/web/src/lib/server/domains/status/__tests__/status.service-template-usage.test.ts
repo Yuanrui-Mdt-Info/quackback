@@ -18,9 +18,10 @@ const mockDispatchStatusEvent = vi.fn().mockResolvedValue(undefined)
 const mockEnqueueMaintenanceJobs = vi.fn()
 const mockCancelMaintenanceJobs = vi.fn()
 
-vi.mock('@/lib/server/db', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/lib/server/db')>()),
-  db: {
+vi.mock('@/lib/server/db', async (importOriginal) => {
+  // Lifecycle writes run in a transaction; the mock hands the same stubs in
+  // as the transaction handle.
+  const db = {
     query: {
       statusIncidents: { findFirst: (...args: unknown[]) => mockIncidentFindFirst(...args) },
       statusIncidentComponents: {
@@ -44,16 +45,31 @@ vi.mock('@/lib/server/db', async (importOriginal) => ({
       const chain: Record<string, unknown> = {}
       chain.from = () => chain
       chain.innerJoin = () => chain
-      chain.where = () => Promise.resolve([])
+      // A lifecycle write locks and re-reads the incident row first.
+      chain.where = () =>
+        Object.assign(Promise.resolve([]), {
+          for: async () => {
+            const row = await mockIncidentFindFirst()
+            return row ? [row] : []
+          },
+        })
       return chain
     },
-  },
-}))
+    // A distinct handle, so a test can tell the transaction from the connection.
+    transaction: (fn: (tx: unknown) => unknown) =>
+      fn(Object.assign(Object.create(db), { isTransaction: true })),
+  }
+  return { ...(await importOriginal<typeof import('@/lib/server/db')>()), db }
+})
 
 vi.mock('../status.components', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../status.components')>()),
   reconcileComponentStatus: (...args: unknown[]) => mockReconcileComponentStatus(...args),
-  dispatchStatusEvent: (...args: unknown[]) => mockDispatchStatusEvent(...args),
+  writeStatusEvent: (...args: unknown[]) => {
+    // Status events are written on the change's own transaction.
+    expect((args[3] as { isTransaction?: boolean }).isTransaction).toBe(true)
+    return mockDispatchStatusEvent(...args)
+  },
 }))
 
 vi.mock('../status.maintenance', async (importOriginal) => ({

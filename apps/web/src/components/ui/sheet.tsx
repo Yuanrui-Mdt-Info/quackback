@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { useOptionalIntl } from './use-optional-intl'
 import { Dialog as SheetPrimitive } from '@base-ui/react/dialog'
 import { XMarkIcon } from '@heroicons/react/24/solid'
 
@@ -70,6 +71,7 @@ function SheetContent({
 }) {
   // Nothing to portal until the sheet first opens.
   const opened = useOverlayOpened()
+  const intl = useOptionalIntl()
   if (!opened) return null
   return (
     <SheetPrimitive.Portal data-slot="sheet-portal">
@@ -77,7 +79,7 @@ function SheetContent({
       <SheetPrimitive.Popup
         data-slot="sheet-content"
         className={cn(
-          'fixed z-50 flex flex-col gap-4 rounded-panel border-border bg-background shadow-md',
+          'fixed z-50 flex max-h-dvh flex-col gap-4 overflow-y-auto overscroll-contain rounded-panel border-border bg-background shadow-md',
           'transition-transform ease-out data-closed:duration-200 data-open:duration-300',
           'data-open:animate-in data-closed:animate-out',
           side === 'right' &&
@@ -95,14 +97,16 @@ function SheetContent({
         {children}
         <SheetPrimitive.Close
           className={cn(
-            'absolute top-4 right-4 rounded-xs',
+            'absolute top-4 end-4 rounded-xs',
             'opacity-70 transition-opacity hover:opacity-100',
             'ring-offset-background focus:ring-ring focus:ring-2 focus:ring-offset-2 focus:outline-hidden',
             'data-open:bg-secondary disabled:pointer-events-none'
           )}
         >
           <XMarkIcon className="size-4" />
-          <span className="sr-only">Close</span>
+          <span className="sr-only">
+            {intl.formatMessage({ id: 'ui.close', defaultMessage: 'Close' })}
+          </span>
         </SheetPrimitive.Close>
       </SheetPrimitive.Popup>
     </SheetPrimitive.Portal>

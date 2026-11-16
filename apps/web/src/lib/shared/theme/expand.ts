@@ -88,7 +88,7 @@ export function unbrandedTheme(mode: 'light' | 'dark'): MinimalThemeVariables {
 }
 
 /** Every variable a theme may carry. Anything else on the object is derived. */
-const MINIMAL_KEYS = [
+export const MINIMAL_THEME_VARIABLE_KEYS = [
   'primary',
   'background',
   'foreground',
@@ -120,7 +120,7 @@ function resolveMinimal(
   mode: 'light' | 'dark'
 ): MinimalThemeVariables {
   const resolved: MinimalThemeVariables = { ...basePalette(mode) }
-  for (const key of MINIMAL_KEYS) {
+  for (const key of MINIMAL_THEME_VARIABLE_KEYS) {
     const value = minimal[key]
     if (typeof value === 'string' && value.trim() !== '') resolved[key] = value
   }
@@ -236,7 +236,9 @@ export function expandTheme(
     destructive: minimal.destructive,
     success: minimal.success,
     primaryForeground,
-    ring: minimal.ring ?? minimal.primary,
+    // Focus stays neutral. A ring that only repeats the brand colour is the
+    // default this replaced, not a choice, so it reads as unset.
+    ring: minimal.ring && minimal.ring !== minimal.primary ? minimal.ring : minimal.mutedForeground,
     cardForeground: minimal.foreground,
     popover: minimal.card,
     popoverForeground: minimal.foreground,
@@ -274,7 +276,7 @@ export function extractMinimal(vars: ThemeVariables): Partial<MinimalThemeVariab
     border: vars.border,
     destructive: vars.destructive,
     success: vars.success,
-    ring: vars.ring !== vars.primary ? vars.ring : undefined,
+    ring: vars.ring !== vars.mutedForeground ? vars.ring : undefined,
     fontSans: vars.fontSans,
     radius: vars.radius,
     // Only include secondary/accent if they differ from muted

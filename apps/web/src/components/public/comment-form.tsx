@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { useIntl } from 'react-intl'
+import { FormattedMessage, useIntl } from 'react-intl'
 import { useForm } from 'react-hook-form'
 import { useQueryClient, type UseMutationResult } from '@tanstack/react-query'
 import { standardSchemaResolver } from '@hookform/resolvers/standard-schema'
@@ -28,6 +28,7 @@ import { COMMENT_EDITOR_FEATURES } from './comment-editor-features'
 import type { TiptapContent } from '@/lib/shared/db-types'
 import type { PostId, PostCommentId } from '@quackback/ids'
 import { useSessionContext } from '@/lib/client/hooks/use-root-context'
+import { shownName } from '@/lib/shared/greeting-name'
 
 export type CreateCommentMutation = UseMutationResult<
   unknown,
@@ -90,7 +91,11 @@ export function CommentForm({
   // Get user from session
   // Note: principalId is only available from the server-provided `user` prop, not from client session
   const effectiveUser = session?.user
-    ? { name: session.user.name, email: session.user.email, principalId: user?.principalId }
+    ? {
+        name: shownName(session.user.name, session.user.email),
+        email: session.user.email,
+        principalId: user?.principalId,
+      }
     : user
 
   // Listen for auth success to refetch session (no page reload)
@@ -360,7 +365,12 @@ export function CommentForm({
                         />
                         <span className="flex-1 text-start">{status.name}</span>
                         {isCurrent && !isSelected && (
-                          <span className="text-muted-foreground text-xs">current</span>
+                          <span className="text-muted-foreground text-xs">
+                            <FormattedMessage
+                              id="portal.commentForm.currentStatus"
+                              defaultMessage="current"
+                            />
+                          </span>
                         )}
                         {isSelected && <CheckIcon className="size-3.5 text-primary shrink-0" />}
                       </button>
@@ -530,7 +540,7 @@ export function CommentForm({
                   {
                     name: (
                       <span className="font-medium text-foreground">
-                        {effectiveUser?.name || effectiveUser?.email}
+                        {shownName(effectiveUser?.name, effectiveUser?.email)}
                       </span>
                     ),
                   }

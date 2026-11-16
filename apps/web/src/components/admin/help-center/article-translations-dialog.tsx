@@ -42,6 +42,8 @@ const LOCALE_LABELS: Record<string, string> = {
   'zh-tw': '繁體中文',
   nl: 'Nederlands',
   pl: 'Polski',
+  th: 'ภาษาไทย',
+  uk: 'Українська',
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -89,7 +91,7 @@ export function ArticleTranslationsDialog({
             <DialogTitle>Translations</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground">
-            No additional locales are enabled yet. Enable one under Help Center settings &gt;
+            No additional locales are enabled yet. Enable one under Help center settings &gt;
             Domains &amp; languages.
           </p>
         </DialogContent>
@@ -130,7 +132,7 @@ export function ArticleTranslationsDialog({
             <span className="text-xs text-muted-foreground">
               <FormattedMessage
                 id="admin.helpCenter.autoTranslatePaused"
-                defaultMessage="Paused: AI allowance used up"
+                defaultMessage="Paused: AI usage for this period is used up. Upgrade your plan for more."
               />
             </span>
           )}

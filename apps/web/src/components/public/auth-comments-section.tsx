@@ -7,15 +7,22 @@ import { useAuthBroadcast } from '@/lib/client/hooks/use-auth-broadcast'
 import { useEnsureAnonSession } from '@/lib/client/hooks/use-ensure-anon-session'
 import { useCreateComment } from '@/lib/client/mutations/portal-comments'
 import type { PublicCommentView } from '@/lib/client/queries/portal-detail'
+import type { ReplyPolicy } from '@/lib/shared/db-types'
 import type { PostCommentId, PostId, PrincipalId } from '@quackback/ids'
 import { resolveCommentingState } from '@/components/public/comment-permission'
 import { useSessionContext, useWorkspaceSettings } from '@/lib/client/hooks/use-root-context'
+import { shownName } from '@/lib/shared/greeting-name'
 
 interface AuthCommentsSectionProps {
   postId: PostId
   comments: PublicCommentView[]
   /** Server-determined: user is authenticated member who can comment */
   allowCommenting?: boolean
+  /**
+   * Server-reported board reply rule. Only used to explain a denial; the
+   * decision itself already lives in `allowCommenting`. Undefined = 'anyone'.
+   */
+  replyPolicy?: ReplyPolicy
   user?: { name: string | null; email: string; principalId?: PrincipalId }
   /** Message to show when comments are locked (overrides "Sign in to comment") */
   lockedMessage?: string
@@ -66,6 +73,7 @@ export function AuthCommentsSection({
   postId,
   comments,
   allowCommenting: serverAllowCommenting = false,
+  replyPolicy,
   user: serverUser,
   lockedMessage,
   pinnedCommentId,
@@ -115,7 +123,11 @@ export function AuthCommentsSection({
 
   // User info from session, falling back to server-provided user
   const userData = user
-    ? { name: user.name ?? null, email: user.email ?? '', principalId: serverUser?.principalId }
+    ? {
+        name: shownName(user.name, user.email),
+        email: user.email ?? '',
+        principalId: serverUser?.principalId,
+      }
     : serverUser
 
   const ensureAnonSession = useEnsureAnonSession()
@@ -158,6 +170,7 @@ export function AuthCommentsSection({
       comments={comments}
       allowCommenting={allowCommenting}
       noAccess={noAccess}
+      replyPolicy={replyPolicy}
       user={userData}
       teamBadgeLogoUrl={settings?.brandingData?.logoUrl ?? undefined}
       teamBadgeLabel={settings?.brandingData?.name ?? settings?.name ?? undefined}

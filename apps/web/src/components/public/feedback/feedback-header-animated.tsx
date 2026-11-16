@@ -31,6 +31,8 @@ import { resolveSubmitState } from '@/components/public/feedback/submit-permissi
 import { PUBLIC_FEEDBACK_EDITOR_FEATURES } from '@/components/public/feedback/feedback-editor-features'
 import type { EditorDocument } from '@/components/ui/rich-text-editor'
 import { useSessionContext } from '@/lib/client/hooks/use-root-context'
+import { shownName } from '@/lib/shared/greeting-name'
+import { TITLE_MAX_LENGTH } from './feedback-header'
 
 interface BoardOption {
   id: string
@@ -57,7 +59,15 @@ export interface FeedbackHeaderProps {
    * board switcher.
    */
   boardLocked?: boolean
+  /**
+   * Opens the composer with this title, for example from a search that found
+   * nothing. A new `key` opens it again with the same title.
+   */
+  draft?: { title: string; key: number }
 }
+
+/** The server's limits for a new post's title and details (createPublicPostSchema). */
+const DETAILS_MAX_LENGTH = 10_000
 
 export function FeedbackHeaderAnimated({
   boards,
@@ -65,6 +75,7 @@ export function FeedbackHeaderAnimated({
   user,
   boardPermissions,
   onPostCreated,
+  draft,
   boardLocked = false,
 }: FeedbackHeaderProps) {
   const intl = useIntl()
@@ -81,9 +92,10 @@ export function FeedbackHeaderAnimated({
 
   // Identified users post as themselves; anonymous posting is handled separately.
   const isAnonymousSession = session?.user?.principalType === 'anonymous'
+  const anonymousName = isAnonymousSession ? session?.user?.displayName?.trim() || null : null
   const effectiveUser =
     session?.user && !isAnonymousSession
-      ? { name: session.user.name, email: session.user.email }
+      ? { name: shownName(session.user.name, session.user.email), email: session.user.email }
       : user
   const { upload: uploadMedia } = usePortalMediaUpload()
   const uploadMediaWithSession = useCallback(
@@ -128,6 +140,16 @@ export function FeedbackHeaderAnimated({
   // these client-side (same rules the server enforces on write).
   const selectedBoard = boards.find((b) => b.id === selectedBoardId)
   const boardCustomFields = selectedBoard?.settings?.customFields ?? []
+
+  // A draft handed in (a search that found nothing) opens the composer with
+  // that title, in view.
+  useEffect(() => {
+    if (!draft) return
+    title.set(draft.title.slice(0, TITLE_MAX_LENGTH))
+    setExpanded(true)
+    titleInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    titleInputRef.current?.focus({ preventScroll: true })
+  }, [draft, title])
 
   // Focus title input when form expands
   useEffect(() => {
@@ -197,6 +219,20 @@ export function FeedbackHeaderAnimated({
       }
     }
 
+    // The server refuses longer details, and retrying would not change that.
+    if ((detailsRef.current?.markdown().length ?? 0) > DETAILS_MAX_LENGTH) {
+      setError(
+        intl.formatMessage(
+          {
+            id: 'portal.feedback.header.errorDetailsTooLong',
+            defaultMessage: 'Keep the details under {max} characters.',
+          },
+          { max: intl.formatNumber(DETAILS_MAX_LENGTH) }
+        )
+      )
+      return
+    }
+
     try {
       if (!effectiveUser && canPostAnonymously) {
         const ok = await ensureAnonSession()
@@ -211,12 +247,14 @@ export function FeedbackHeaderAnimated({
         }
       }
 
+      // No details written (or the editor not mounted yet) means no document:
+      // the post carries its title alone.
       const details = detailsRef.current
       const result = await createPost.mutateAsync({
         boardId: selectedBoardId as BoardId,
         title: typedTitle.trim(),
         content: details?.markdown() ?? '',
-        contentJson: details?.json() ?? null,
+        ...(details ? { contentJson: details.json() } : {}),
         ...(boardCustomFields.length > 0 ? { customFields: customFieldValues } : {}),
       })
 
@@ -239,14 +277,14 @@ export function FeedbackHeaderAnimated({
           },
         }
       )
-    } catch (err) {
+    } catch {
+      // The server logs why it refused the post; its message is not written
+      // for the visitor.
       setError(
-        err instanceof Error
-          ? err.message
-          : intl.formatMessage({
-              id: 'portal.feedback.header.errorSubmit',
-              defaultMessage: 'Failed to submit feedback',
-            })
+        intl.formatMessage({
+          id: 'portal.feedback.header.errorSubmit',
+          defaultMessage: 'Could not submit your feedback. Please try again.',
+        })
       )
     }
   }
@@ -421,6 +459,25 @@ export function FeedbackHeaderAnimated({
                     defaultMessage="You don't have access to post on this board"
                   />
                 </p>
+              ) : isAnonymousSession && canPostAnonymously ? (
+                // A visitor who never signed in posts under their generated
+                // name, and has nothing to sign out of.
+                <p className="text-xs text-muted-foreground">
+                  {anonymousName ? (
+                    <>
+                      <FormattedMessage
+                        id="portal.feedback.header.postingAs"
+                        defaultMessage="Posting as"
+                      />{' '}
+                      <span className="font-medium text-foreground">{anonymousName}</span>
+                    </>
+                  ) : (
+                    <FormattedMessage
+                      id="portal.feedback.header.postingAnonymously"
+                      defaultMessage="Posting anonymously"
+                    />
+                  )}
+                </p>
               ) : effectiveUser ? (
                 <p className="text-xs text-muted-foreground">
                   <FormattedMessage
@@ -428,7 +485,7 @@ export function FeedbackHeaderAnimated({
                     defaultMessage="Posting as"
                   />{' '}
                   <span className="font-medium text-foreground">
-                    {effectiveUser.name || effectiveUser.email}
+                    {shownName(effectiveUser.name, effectiveUser.email)}
                   </span>
                   {' ('}
                   <button
@@ -498,10 +555,10 @@ export function FeedbackHeaderAnimated({
                   {createPost.isPending ? (
                     <FormattedMessage
                       id="portal.feedback.header.submitting"
-                      defaultMessage="Submitting..."
+                      defaultMessage="Posting..."
                     />
                   ) : (
-                    <FormattedMessage id="portal.feedback.header.submit" defaultMessage="Submit" />
+                    <FormattedMessage id="portal.feedback.header.submit" defaultMessage="Post" />
                   )}
                 </Button>
               </div>
@@ -539,9 +596,10 @@ function TitleInput({
     <motion.input
       ref={inputRef}
       type="text"
+      maxLength={TITLE_MAX_LENGTH}
       placeholder={intl.formatMessage({
         id: 'portal.feedback.header.titlePlaceholder',
-        defaultMessage: "What's your idea?",
+        defaultMessage: "What's on your mind?",
       })}
       value={value}
       aria-label={intl.formatMessage({
@@ -553,7 +611,7 @@ function TitleInput({
         if (!expanded) onExpand()
       }}
       onFocus={() => !expanded && onExpand()}
-      className="flex-1 bg-transparent border-0 outline-none text-foreground font-semibold placeholder:text-muted-foreground/60 placeholder:font-normal caret-primary focus-visible:ring-2 focus-visible:ring-ring/50"
+      className="flex-1 bg-transparent border-0 outline-none text-foreground font-semibold placeholder:text-muted-foreground/60 placeholder:font-normal caret-primary"
       initial={false}
       animate={{
         fontSize: expanded ? '1.25rem' : '1rem',

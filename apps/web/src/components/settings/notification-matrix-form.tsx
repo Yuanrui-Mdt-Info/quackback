@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useIntl, type IntlShape } from 'react-intl'
 import { ArrowPathIcon } from '@heroicons/react/24/solid'
 import { Switch } from '@/components/ui/switch'
 import { useMutation } from '@tanstack/react-query'
@@ -19,18 +20,125 @@ import {
   type NotificationPreferences,
 } from '@/lib/server/functions/user'
 import type { NotificationMatrix } from '@/lib/server/domains/subscriptions/notification-matrix'
+import { ONBOARDING_TIPS_KEY } from '@/lib/shared/onboarding-tips'
 
-const GROUP_LABELS: Record<NotificationGroup, string> = {
-  feedback: 'Feedback',
-  support: 'Support',
-  changelog: 'Changelog',
+type Message = { id: string; defaultMessage: string }
+
+/** Groups the portal shows are worded in the app's language; an admin-only
+ *  group keeps its English label, like its rows. */
+const GROUP_LABELS: Record<NotificationGroup, Message | string> = {
+  feedback: { id: 'portal.settings.notifications.group.feedback', defaultMessage: 'Feedback' },
+  support: { id: 'portal.settings.notifications.group.support', defaultMessage: 'Support' },
+  changelog: { id: 'portal.settings.notifications.group.changelog', defaultMessage: 'Changelog' },
+}
+
+function groupLabel(group: NotificationGroup, intl: IntlShape): string {
+  const label = GROUP_LABELS[group]
+  return typeof label === 'string' ? label : intl.formatMessage(label)
 }
 
 // Push is not offered until it is delivered.
 const CHANNEL_LABELS = {
-  inApp: 'In-app',
-  email: 'Email',
-} as const satisfies Partial<Record<NotificationChannel, string>>
+  inApp: { id: 'portal.settings.notifications.channel.inApp', defaultMessage: 'In-app' },
+  email: { id: 'portal.settings.notifications.channel.email', defaultMessage: 'Email' },
+} as const satisfies Partial<Record<NotificationChannel, Message>>
+
+/** The rows the portal shows, in the app's language. Admin-only rows keep the
+ *  catalog's English label and description. */
+export const TYPE_LABELS: Partial<
+  Record<NotificationTypeMeta['type'], { label: Message; description: Message }>
+> = {
+  post_status_changed: {
+    label: {
+      id: 'portal.settings.notifications.type.statusChanged.label',
+      defaultMessage: 'Status changed',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.statusChanged.description',
+      defaultMessage: 'A post you follow changes status',
+    },
+  },
+  comment_created: {
+    label: {
+      id: 'portal.settings.notifications.type.newComment.label',
+      defaultMessage: 'New comment',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.newComment.description',
+      defaultMessage: 'Someone comments on a post you follow',
+    },
+  },
+  post_mentioned: {
+    label: {
+      id: 'portal.settings.notifications.type.postMention.label',
+      defaultMessage: 'Mentioned in a post',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.postMention.description',
+      defaultMessage: 'Someone @-mentions you in a post',
+    },
+  },
+  comment_mentioned: {
+    label: {
+      id: 'portal.settings.notifications.type.commentMention.label',
+      defaultMessage: 'Mentioned in a comment',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.commentMention.description',
+      defaultMessage: 'Someone @-mentions you in a comment',
+    },
+  },
+  ticket_status_changed: {
+    label: {
+      id: 'portal.settings.notifications.type.ticketStatusChanged.label',
+      defaultMessage: 'Ticket status changed',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.ticketStatusChanged.description',
+      defaultMessage: 'A ticket you own changes status',
+    },
+  },
+  ticket_replied: {
+    label: {
+      id: 'portal.settings.notifications.type.ticketReplied.label',
+      defaultMessage: 'Ticket replies',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.ticketReplied.description',
+      defaultMessage: 'A ticket you follow receives a reply',
+    },
+  },
+  ticket_created: {
+    label: {
+      id: 'portal.settings.notifications.type.ticketCreated.label',
+      defaultMessage: 'Ticket received',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.ticketCreated.description',
+      defaultMessage: 'Confirmation when we receive your ticket',
+    },
+  },
+  changelog_published: {
+    label: {
+      id: 'portal.settings.notifications.type.changelogPublished.label',
+      defaultMessage: 'Changelog published',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.changelogPublished.description',
+      defaultMessage: 'A new changelog entry is published',
+    },
+  },
+  status_incident: {
+    label: {
+      id: 'portal.settings.notifications.type.statusIncident.label',
+      defaultMessage: 'Status incident',
+    },
+    description: {
+      id: 'portal.settings.notifications.type.statusIncident.description',
+      defaultMessage: 'A status incident or maintenance window is posted',
+    },
+  },
+}
 
 /**
  * One notification-type x channel matrix, grouped into per-group tabs.
@@ -49,6 +157,7 @@ export function NotificationMatrixForm({
   surface: 'admin' | 'portal'
   initialPreferences?: NotificationPreferences | null
 }) {
+  const intl = useIntl()
   const [preferences, setPreferences] = useState<NotificationPreferences | null>(
     initialPreferences ?? null
   )
@@ -64,7 +173,14 @@ export function NotificationMatrixForm({
         if (!cancelled) setPreferences(result)
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to load preferences')
+          setError(
+            err instanceof Error
+              ? err.message
+              : intl.formatMessage({
+                  id: 'portal.settings.notifications.loadFailed',
+                  defaultMessage: 'Failed to load preferences',
+                })
+          )
         }
       } finally {
         if (!cancelled) setLoading(false)
@@ -86,6 +202,15 @@ export function NotificationMatrixForm({
       .map((group) => ({ group, items: grouped[group] }))
       .filter((entry) => entry.items.length > 0)
   }, [surface])
+
+  // Setup tips have no row of their own while they are on (quiet normal
+  // state). After "Stop setup tips" the row appears so they can be turned back
+  // on, and stays for the rest of the visit once it has appeared.
+  const tipsOff = preferences?.matrix?.[ONBOARDING_TIPS_KEY]?.email === false
+  const [showTips, setShowTips] = useState(tipsOff)
+  useEffect(() => {
+    if (tipsOff) setShowTips(true)
+  }, [tipsOff])
 
   const [activeGroup, setActiveGroup] = useState<NotificationGroup | undefined>(
     () => groups[0]?.group
@@ -161,17 +286,34 @@ export function NotificationMatrixForm({
       {/* Master email kill switch - overrides every "email" cell below. */}
       <Panel surface={surface} divided>
         <SettingRow
-          label="Pause all email"
-          description="Turn off email delivery for every notification type below. In-app notifications keep working."
+          label={intl.formatMessage({
+            id: 'portal.settings.notifications.pauseAll.label',
+            defaultMessage: 'Pause all email',
+          })}
+          description={intl.formatMessage({
+            id: 'portal.settings.notifications.pauseAll.description',
+            defaultMessage:
+              'Turn off email delivery for every notification type below. In-app notifications keep working.',
+          })}
           control={
             <>
               {surface === 'portal' && savingEmailMuted && (
-                <span role="status" aria-label="Saving" className="inline-flex">
+                <span
+                  role="status"
+                  aria-label={intl.formatMessage({
+                    id: 'portal.settings.notifications.saving',
+                    defaultMessage: 'Saving',
+                  })}
+                  className="inline-flex"
+                >
                   <ArrowPathIcon className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
                 </span>
               )}
               <Switch
-                aria-label="Pause all email notifications"
+                aria-label={intl.formatMessage({
+                  id: 'portal.settings.notifications.pauseAll.ariaLabel',
+                  defaultMessage: 'Pause all email notifications',
+                })}
                 checked={preferences.emailMuted}
                 onCheckedChange={setEmailMuted}
                 disabled={busy}
@@ -180,6 +322,21 @@ export function NotificationMatrixForm({
           }
           className="py-0"
         />
+        {showTips ? (
+          <SettingRow
+            label="Setup tips"
+            description="Emails with the next step while you set up this workspace."
+            control={
+              <Switch
+                aria-label="Setup tips by email"
+                checked={!tipsOff}
+                onCheckedChange={(checked) => setCell(ONBOARDING_TIPS_KEY, 'email', checked)}
+                disabled={busy}
+              />
+            }
+            className="pt-4 pb-0"
+          />
+        ) : null}
       </Panel>
 
       <Tabs
@@ -191,7 +348,7 @@ export function NotificationMatrixForm({
         <TabsList>
           {groups.map(({ group }) => (
             <TabsTrigger key={group} value={group}>
-              {GROUP_LABELS[group]}
+              {groupLabel(group, intl)}
             </TabsTrigger>
           ))}
         </TabsList>
@@ -235,14 +392,15 @@ function Panel({
 const MATRIX_GRID_COLS = 'grid-cols-[1fr_64px_64px]'
 
 function MatrixHeaderRow() {
+  const intl = useIntl()
   return (
     <div className={`grid ${MATRIX_GRID_COLS} items-center gap-3 pb-2`}>
       <span />
       <span className="text-center text-xs font-medium text-muted-foreground">
-        {CHANNEL_LABELS.inApp}
+        {intl.formatMessage(CHANNEL_LABELS.inApp)}
       </span>
       <span className="text-center text-xs font-medium text-muted-foreground">
-        {CHANNEL_LABELS.email}
+        {intl.formatMessage(CHANNEL_LABELS.email)}
       </span>
     </div>
   )
@@ -259,20 +417,22 @@ function MatrixRow({
   busy: boolean
   onToggle: (type: string, channel: NotificationChannel, checked: boolean) => void
 }) {
+  const intl = useIntl()
   const inAppChecked = matrix?.[meta.type]?.inApp ?? true
   const emailChecked = matrix?.[meta.type]?.email ?? true
+  const translated = TYPE_LABELS[meta.type]
+  const label = translated ? intl.formatMessage(translated.label) : meta.label
+  const description = translated ? intl.formatMessage(translated.description) : meta.description
 
   return (
     <div className={`grid ${MATRIX_GRID_COLS} items-center gap-3 py-3`}>
       <div className="min-w-0 pr-2">
-        <p className="text-sm font-medium">{meta.label}</p>
-        {meta.description && (
-          <p className="mt-0.5 text-xs text-muted-foreground">{meta.description}</p>
-        )}
+        <p className="text-sm font-medium">{label}</p>
+        {description && <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>}
       </div>
       <div className="flex justify-center">
         <Switch
-          aria-label={`${meta.label} - ${CHANNEL_LABELS.inApp}`}
+          aria-label={`${label} - ${intl.formatMessage(CHANNEL_LABELS.inApp)}`}
           checked={inAppChecked}
           onCheckedChange={(checked) => onToggle(meta.type, 'inApp', checked)}
           disabled={busy}
@@ -280,7 +440,7 @@ function MatrixRow({
       </div>
       <div className="flex justify-center">
         <Switch
-          aria-label={`${meta.label} - ${CHANNEL_LABELS.email}`}
+          aria-label={`${label} - ${intl.formatMessage(CHANNEL_LABELS.email)}`}
           checked={emailChecked}
           onCheckedChange={(checked) => onToggle(meta.type, 'email', checked)}
           disabled={busy}

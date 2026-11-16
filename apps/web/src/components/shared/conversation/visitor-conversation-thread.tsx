@@ -30,7 +30,9 @@ import { Avatar } from '@/components/ui/avatar'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { TypingDots } from '@/components/shared/typing-dots'
 import { personalizeMessage, firstNameOf } from '@/lib/shared/conversation/personalize'
+import { shownGreeting } from '@/lib/shared/conversation/default-greeting'
 import { useConversationStream } from '@/lib/client/hooks/use-conversation-stream'
+import { useHostVisibleCount } from '@/lib/client/hooks/use-host-visible'
 import { useConversationTyping } from '@/lib/client/hooks/use-conversation-typing'
 import { useAssistantTurn } from '@/lib/client/hooks/use-assistant-turn'
 import {
@@ -175,6 +177,8 @@ export interface VisitorConversationThreadProps {
    *  rows there. The portal Support tab is wide and leaves this at its
    *  default. */
   compact?: boolean
+  /** Text the composer starts with on its first mount; a send clears it as usual. */
+  initialDraft?: string
 }
 
 /**
@@ -204,6 +208,7 @@ export function VisitorConversationThread({
   onConversationStarted,
   autofocusComposer = false,
   compact = false,
+  initialDraft,
 }: VisitorConversationThreadProps) {
   const intl = useIntl()
   const formatDate = useLocalDateFormatter()
@@ -246,6 +251,16 @@ export function VisitorConversationThread({
   // doc persists as contentJson; the reset signal clears the editor on send).
   // Typing writes the store without re-rendering this thread.
   const composer = useComposerDoc()
+  const [initialDraftDoc] = useState<JSONContent | undefined>(() => {
+    const text = initialDraft?.trim()
+    if (!text) return undefined
+    const doc: JSONContent = {
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text }] }],
+    }
+    composer.draft.set(text, doc)
+    return doc
+  })
   const [sending, setSending] = useState(false)
   // Phase C conversational block layer: the block message currently awaiting
   // its structured-send response — the optimistic tap-disable (contract
@@ -310,7 +325,7 @@ export function VisitorConversationThread({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const composerPlaceholder = intl.formatMessage({
     id: 'widget.messenger.placeholder',
-    defaultMessage: 'Type your message…',
+    defaultMessage: 'Message...',
   })
 
   // Only the JSON is read: the send gate needs its text on every edit (see
@@ -804,11 +819,18 @@ export function VisitorConversationThread({
   // Clear unread on the visitor side only when the newest message is from an
   // agent — skip the visitor's own outbound sends (avoids a write + 'read'
   // broadcast on every send).
+  // A host that hid this frame says when it shows it again: catch up on any
+  // reply the live stream missed meanwhile, and read the newest one.
+  const shownAgain = useHostVisibleCount()
+  useEffect(() => {
+    if (shownAgain > 0) void refreshMessages()
+  }, [shownAgain, refreshMessages])
   useMarkReadOnIncoming({
     conversationId,
     messages,
     whenLastFrom: 'agent',
     getHeaders: getAuthHeaders,
+    recheck: shownAgain,
   })
 
   const send = useCallback(async () => {
@@ -941,7 +963,7 @@ export function VisitorConversationThread({
             side="peer"
             authorName={assistant?.name ?? teamName ?? undefined}
             isAssistant={!!assistant}
-            content={personalizeMessage(welcomeMessage ?? '', firstName)}
+            content={personalizeMessage(shownGreeting(welcomeMessage, intl) ?? '', firstName)}
             embedOpenMode={embedOpenMode}
           />
         )
@@ -1126,7 +1148,7 @@ export function VisitorConversationThread({
                     id: 'widget.messenger.csat.commentPlaceholder',
                     defaultMessage: 'Add a comment (optional)',
                   })}
-                  className="w-full resize-none rounded-md border border-border bg-background px-2.5 py-1.5 text-sm outline-none focus:ring-2 focus:ring-primary/20"
+                  className="w-full resize-none rounded-md border border-border bg-background px-2.5 py-1.5 text-sm outline-none focus:ring-2 focus:ring-ring/20"
                 />
                 <button
                   type="button"
@@ -1309,7 +1331,7 @@ export function VisitorConversationThread({
               external picker button. The editor is lazy-loaded (defers the
               lowlight syntax-highlighting bundle) behind a quiet placeholder. */}
         <div
-          className="rounded-2xl border border-border bg-background px-3 py-2.5 shadow-sm transition-shadow focus-within:border-foreground/30 focus-within:ring-2 focus-within:ring-primary/25"
+          className="rounded-2xl border border-border bg-background px-3 py-2.5 shadow-sm transition-shadow focus-within:border-foreground/30 focus-within:ring-2 focus-within:ring-ring/25"
           onPaste={handleComposerPaste}
           onDrop={handleComposerDrop}
         >
@@ -1366,6 +1388,7 @@ export function VisitorConversationThread({
                   placeholder={composerPlaceholder}
                   features={VISITOR_CONVERSATION_FEATURES}
                   autofocus={composer.resetSignal > 0 || autofocusComposer ? 'end' : false}
+                  value={composer.resetSignal === 0 ? initialDraftDoc : undefined}
                   onDocumentChange={handleEditorChange}
                   onSubmit={onComposerSubmit}
                 />

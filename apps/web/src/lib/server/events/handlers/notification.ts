@@ -13,6 +13,7 @@ import type { CreateNotificationInput, NotificationType } from '@/lib/server/dom
 import type { PrincipalId, PostId, PostCommentId, ConversationMessageId } from '@quackback/ids'
 import { truncate, isRetryableError } from '../hook-utils'
 import { logger } from '@/lib/server/logger'
+import { HANDOFF_REASON_LABELS } from '@/lib/shared/conversation/types'
 import {
   batchGetNotificationPreferences,
   type NotificationPreferencesData,
@@ -292,8 +293,9 @@ function buildNotifications(
     return principalIds.map((principalId) => ({
       principalId,
       type: 'assistant_handed_off' as NotificationType,
-      title: 'Quinn handed off a conversation',
-      body: truncate(reason ?? '', 150),
+      title: 'The AI agent handed off a conversation',
+      // A reason is usually a fixed id; show its label when it has one.
+      body: truncate(reason ? (HANDOFF_REASON_LABELS[reason] ?? reason) : '', 150),
       metadata: { conversationId },
     }))
   }
@@ -331,13 +333,17 @@ function buildNotifications(
       // an agent watcher's row opens the admin inbox. A config with no
       // requesterPrincipalId at all is a pre-watchers outbox row being
       // redrained — omit audience so the client's portal default preserves its
-      // requester-only behavior.
+      // requester-only behavior. The title and stage labels let the bell word
+      // the row in the reader's language.
       metadata:
         requesterPrincipalId === undefined
-          ? { ticketId, conversationId }
+          ? { ticketId, conversationId, ticketTitle: title, stageLabel, previousStageLabel }
           : {
               ticketId,
               conversationId,
+              ticketTitle: title,
+              stageLabel,
+              previousStageLabel,
               audience:
                 requesterPrincipalId && principalId === requesterPrincipalId ? 'portal' : 'admin',
             },
@@ -354,6 +360,7 @@ function buildNotifications(
       metadata: {
         ticketId,
         conversationId,
+        ticketTitle: title,
         actorName: authorName,
         audience: requesterPrincipalId && principalId === requesterPrincipalId ? 'portal' : 'admin',
       },

@@ -11,11 +11,13 @@
 import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { IntlProvider } from 'react-intl'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ConversationId } from '@quackback/ids'
 import type { FeatureFlags } from '@/lib/shared/types/settings'
 import { installInMemoryLocalStorage } from '@/test/local-storage'
 import { aguiRun, structuredDeltas, mockStreamingResponse } from '@/test/agui'
+import en from '@/locales/en.json'
 
 // Radix Popover/DropdownMenu rely on pointer/layout APIs happy-dom lacks.
 beforeAll(() => {
@@ -86,13 +88,15 @@ function renderPanel(
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const onInsert = props.onInsert ?? vi.fn()
   render(
-    <QueryClientProvider client={client}>
-      <CopilotPanel
-        item={{ kind: 'conversation', id: CONVERSATION_ID }}
-        flags={props.flags ?? ALL_FLAGS_ON}
-        onInsert={onInsert}
-      />
-    </QueryClientProvider>
+    <IntlProvider locale="en" messages={en}>
+      <QueryClientProvider client={client}>
+        <CopilotPanel
+          item={{ kind: 'conversation', id: CONVERSATION_ID }}
+          flags={props.flags ?? ALL_FLAGS_ON}
+          onInsert={onInsert}
+        />
+      </QueryClientProvider>
+    </IntlProvider>
   )
   return { onInsert }
 }
@@ -161,6 +165,8 @@ function proposedActionRow(overrides: Record<string, unknown> = {}) {
     decidedAt: null,
     executedAt: null,
     result: null,
+    argsDigest: 'digest-1',
+    risk: 'medium',
     ...overrides,
   }
 }
@@ -1010,7 +1016,7 @@ describe('<CopilotPanel> proposed actions (P2-C.4)', () => {
 
     await waitFor(() =>
       expect(hoisted.approveAssistantActionFn).toHaveBeenCalledWith({
-        data: { pendingActionId: 'assistant_action_1' },
+        data: { pendingActionId: 'assistant_action_1', contentHash: 'digest-1' },
       })
     )
     expect(await screen.findByText('Closed as resolved.')).toBeInTheDocument()
@@ -1038,7 +1044,7 @@ describe('<CopilotPanel> proposed actions (P2-C.4)', () => {
 
     await waitFor(() =>
       expect(hoisted.rejectAssistantActionFn).toHaveBeenCalledWith({
-        data: { pendingActionId: 'assistant_action_1' },
+        data: { pendingActionId: 'assistant_action_1', contentHash: 'digest-1' },
       })
     )
     expect(await screen.findByText('Rejected')).toBeInTheDocument()

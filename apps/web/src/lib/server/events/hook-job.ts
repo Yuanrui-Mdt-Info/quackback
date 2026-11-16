@@ -44,6 +44,7 @@ import type { HookResult } from './hook-types'
 import type { EventData } from './types'
 import type { ChangelogId, PostId, PrincipalId, StatusIncidentId, WebhookId } from '@quackback/ids'
 import { logger } from '@/lib/server/logger'
+import { isTestEvent } from './test-event'
 
 const log = logger.child({ component: 'event-hook-job' })
 
@@ -91,6 +92,10 @@ export async function runHookJob(job: ClaimedJob): Promise<void> {
     await handleStatusMaintenanceJob(hookConfig, 'complete')
     return
   }
+
+  // Only a relayed event carries one to check. The scheduler's sentinel jobs
+  // above are queued with `event: null` and read their payload from config.
+  if (await isTestEvent({ payload: event.data, actorId: event.actor.principalId })) return
 
   const hook = await getHook(hookType)
   if (!hook) throw new TerminalJobError(`Unknown hook: ${hookType}`)

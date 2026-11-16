@@ -34,7 +34,7 @@ const SOURCE_META = {
     labelId: 'automation.knowledge.source.helpCenter.label',
     label: 'Help center',
     descriptionId: 'automation.knowledge.source.helpCenter.description',
-    description: 'Published Help Center articles.',
+    description: 'Published help center articles.',
     readiness: 'ready',
   },
   posts: {
@@ -126,14 +126,16 @@ function KnowledgeCard({
   rows,
   busy,
   onToggle,
+  description,
 }: {
   rows: KnowledgeRow[]
   busy: boolean
   onToggle: (source: string, next: boolean) => void
+  description?: string
 }) {
   const intl = useIntl()
   return (
-    <SettingsCard>
+    <SettingsCard description={description}>
       <SettingRows>
         {rows.map((row) => {
           const meta = SOURCE_META[row.source as keyof typeof SOURCE_META]
@@ -190,7 +192,7 @@ function KnowledgeLoading() {
       <p role="status" className="text-sm text-muted-foreground">
         {intl.formatMessage({
           id: 'automation.agent.loading',
-          defaultMessage: 'Loading AI agent settings…',
+          defaultMessage: 'Loading AI agent settings...',
         })}
       </p>
     </SettingsCard>

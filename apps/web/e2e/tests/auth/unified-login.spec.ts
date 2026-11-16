@@ -4,13 +4,13 @@
  * Covers the new unified auth surface that replaced the old /auth/login page:
  *
  *  1. Public portal, unauth /admin → /?auth=signin&callbackUrl=%2Fadmin; dialog
- *     auto-opens ("Welcome back"); admin magic-link sign-in lands on /admin.
+ *     auto-opens with team sign-in copy; admin magic-link sign-in lands on /admin.
  *  2. Public portal, portal user reaching /admin → error toast (not_team_member);
  *     dialog remains open; user stays out of /admin.
  *  3. Private portal, unauth /admin → gate shows the inline auth form; admin
  *     completes sign-in in the gate; loader re-evaluates and lands on /admin
  *     (proves #270 ① gate→sign-in→callbackUrl path end-to-end).
- *  4. /?auth=signin escape hatch: shows the dialog with any seeded OIDC button +
+ *  4. Failed sole-IdP sign-in: shows the dialog with the seeded OIDC button +
  *     the break-glass recovery-code link. (The anonymous-/ → IdP redirect is
  *     deferred: it requires an OIDC discovery document at a live URL.)
  *  5. Recovery break-glass: /auth/recovery renders the standalone form directly.
@@ -82,9 +82,11 @@ test('(1a) unauth /admin → /?auth=signin with callbackUrl=/admin and dialog vi
   expect(url.searchParams.get('callbackUrl')).toMatch(/^\/admin/)
 
   // useAutoOpenAuthDialog fires on mount when auth=signin; the dialog heading is
-  // "Welcome back" for mode='login'.
+  // the team sign-in title for an admin callback.
   await expect(page.getByRole('dialog')).toBeVisible({ timeout: 10000 })
-  await expect(page.getByRole('heading', { name: /welcome back/i })).toBeVisible({ timeout: 10000 })
+  await expect(
+    page.getByRole('heading', { name: 'Sign in to Acme Corp admin', exact: true })
+  ).toBeVisible({ timeout: 10000 })
 })
 
 test('(1b) signed-in admin navigating to /admin lands there (not on the dialog)', async ({
@@ -212,18 +214,15 @@ test('(3) private portal gate: sign-in in the gate lands on /admin', async ({ pa
 })
 
 // ── Journey 4 ────────────────────────────────────────────────────────────────
-// /?auth=signin escape hatch: the dialog opens with the seeded OIDC button and
+// Failed sole-IdP callback: the dialog opens with the seeded OIDC button and
 // the break-glass recovery-code link (callbackUrl=/admin satisfies isTeamCallback).
 //
-// DEFERRED — anonymous `/` → IdP redirect: requires a live OIDC discovery
-// document. The instant-SSO resolver calls auth.api.signInSocial which
-// fetches the provider's discovery URL; with a synthetic URL this returns null
-// and no redirect fires. Tracking: run this sub-case against the CI environment
-// where a mock-OIDC container is available.
+// DEFERRED — initial sole-IdP sign-in redirect: requires a live OIDC discovery
+// document. This synthetic URL has no usable provider endpoints; this suite
+// covers the sign-in UI and routing, not a successful external OIDC exchange.
+// Run the initial redirect and callback against a mock or real IdP separately.
 
-test('(4) /?auth=signin shows the dialog with OIDC button and recovery-code link', async ({
-  page,
-}) => {
+test('(4) failed sole-IdP sign-in shows OIDC retry and recovery-code link', async ({ page }) => {
   seedIdentityProvider({
     registrationId: BTN_RID,
     label: BTN_LABEL,
@@ -236,9 +235,10 @@ test('(4) /?auth=signin shows the dialog with OIDC button and recovery-code link
   // renders only in the SSO views, not in the generic email-entry Stage 1.
   setPortalAuthMethods('disable')
   try {
-    // ?auth=signin opens the dialog; ?callbackUrl=/admin makes isTeamCallback true
-    // so the recovery-code link renders inside the SSO-only Stage 1.
-    await page.goto('/?auth=signin&callbackUrl=%2Fadmin')
+    // v0.15 redirects an initial sole-IdP sign-in straight to the provider.
+    // A failed callback must instead show retry + break-glass without looping.
+    // The synthetic provider is only for rendering/routing, not a live OIDC exchange.
+    await page.goto('/?auth=signin&callbackUrl=%2Fadmin&error=access_denied')
     await page.waitForLoadState('networkidle')
 
     // Dialog must open (?auth=signin triggers useAutoOpenAuthDialog).

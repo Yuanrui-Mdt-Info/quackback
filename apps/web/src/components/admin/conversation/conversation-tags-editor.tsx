@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { PlusIcon, CheckIcon, PencilIcon, TrashIcon } from '@heroicons/react/24/solid'
@@ -36,7 +36,7 @@ type ThreadCache = { conversation: ConversationDTO; messages: unknown[]; hasMore
  * row chips and per-tag badges stay in sync. Reused by the thread header and the
  * detail panel.
  */
-export function ConversationTagsEditor({
+export const ConversationTagsEditor = memo(function ConversationTagsEditor({
   conversationId,
   tags,
 }: {
@@ -167,7 +167,7 @@ export function ConversationTagsEditor({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search or create…"
-            className="mb-1.5 w-full rounded-md border border-border bg-background px-2 py-1 text-[13px] outline-none focus:ring-2 focus:ring-primary/20"
+            className="mb-1.5 w-full rounded-md border border-border bg-background px-2 py-1 text-[13px] outline-none focus:ring-2 focus:ring-ring/20"
           />
           <ScrollArea className="max-h-56">
             <div className="flex flex-col gap-0.5">
@@ -185,7 +185,7 @@ export function ConversationTagsEditor({
                             updateMut.mutate({ id: t.id, name: editName.trim(), color: editColor })
                           if (e.key === 'Escape') setEditingId(null)
                         }}
-                        className="mb-1.5 w-full rounded border border-border bg-background px-1.5 py-1 text-xs outline-none focus:ring-2 focus:ring-primary/20"
+                        className="mb-1.5 w-full rounded border border-border bg-background px-1.5 py-1 text-xs outline-none focus:ring-2 focus:ring-ring/20"
                       />
                       <div className="mb-1.5">
                         <ColorSwatches value={editColor} onChange={setEditColor} />
@@ -315,4 +315,4 @@ export function ConversationTagsEditor({
       </Popover>
     </div>
   )
-}
+})

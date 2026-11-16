@@ -21,6 +21,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { assistantQueries } from '@/lib/client/queries/assistant'
 import { PERMISSIONS } from '@/lib/shared/permissions'
 import { assertRoutePermission } from '@/lib/shared/route-permission'
+import { adminPageHead } from '@/lib/client/admin-head'
 
 const COPILOT_TABS = ['knowledge', 'guidance'] as const
 type CopilotTab = (typeof COPILOT_TABS)[number]
@@ -30,12 +31,13 @@ const searchSchema = z.object({
 })
 
 export const Route = createFileRoute('/admin/settings/copilot')({
+  head: adminPageHead('Copilot settings'),
   validateSearch: searchSchema,
   beforeLoad: ({ context, search }) => {
     if (search.tab === 'actions') {
       throw redirect({ to: '/admin/settings/connectors' })
     }
-    assertRoutePermission(context.permissions, PERMISSIONS.ASSISTANT_MANAGE)
+    assertRoutePermission(context.permissions, PERMISSIONS.AI_TEAMMATE_MANAGE)
   },
   loader: async ({ context }) => {
     await context.queryClient.ensureQueryData(assistantQueries.settings())
@@ -92,7 +94,7 @@ function AssistantCopilotSettings() {
             <p className="text-sm text-muted-foreground">
               {intl.formatMessage({
                 id: 'automation.agent.loading',
-                defaultMessage: 'Loading AI agent settings…',
+                defaultMessage: 'Loading AI agent settings...',
               })}
             </p>
           </div>

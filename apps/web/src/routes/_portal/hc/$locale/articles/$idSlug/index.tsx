@@ -1,5 +1,5 @@
 import { createFileRoute, getRouteApi, notFound, redirect } from '@tanstack/react-router'
-import { formatDistanceToNow } from 'date-fns'
+import { FormattedMessage, useIntl } from 'react-intl'
 import { getPublicArticlePageFn } from '@/lib/server/functions/help-center'
 import { RichTextContent, isRichTextContent } from '@/components/ui/rich-text-content'
 import { EmbedHydration } from '@/components/shared/embed-hydration'
@@ -14,11 +14,16 @@ import {
   computePrevNext,
 } from '@/components/help-center/help-center-article-utils'
 import { Avatar } from '@/components/ui/avatar'
+import { TimeAgo } from '@/components/ui/time-ago'
 import { JsonLd } from '@/components/json-ld'
 import { buildArticleJsonLd, buildBreadcrumbJsonLd } from '@/lib/shared/json-ld'
 import { stripMarkdownPreview } from '@/lib/shared/utils'
 import { isPortalSupportSurfaceEnabled } from '@/lib/shared/support-surfaces'
 import { hcArticlePath, hcCollectionPath } from '@/lib/shared/help-center-url'
+import {
+  helpCenterAbsoluteUrl,
+  helpCenterHeadPortal,
+} from '@/components/help-center/help-center-head'
 import type { JSONContent } from '@tiptap/react'
 import { useBaseUrl, useWorkspaceSettings } from '@/lib/client/hooks/use-root-context'
 
@@ -49,22 +54,19 @@ export const Route = createFileRoute('/_portal/hc/$locale/articles/$idSlug/')({
   head: ({ loaderData, params, matches }) => {
     if (!loaderData) return {}
     const { article } = loaderData
-    const portalMatch = matches.find((m) => (m.routeId as string) === '/_portal')
-    // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-    const parentLoaderData = portalMatch?.loaderData as Record<string, any> | undefined
-    const workspaceName =
-      (parentLoaderData?.org as Record<string, string> | undefined)?.name ?? 'Help Center'
+    const { workspaceName, baseUrl } = helpCenterHeadPortal(matches)
     const description =
       article.description ||
       (article.content ? stripMarkdownPreview(article.content, 160) : undefined)
     const pageTitle = `${article.title} - ${workspaceName}`
-    const baseUrl =
-      ((portalMatch?.context as Record<string, unknown> | undefined)?.baseUrl as string) ?? ''
-    const canonicalUrl = `${baseUrl}${hcArticlePath({
-      locale: params.locale,
-      urlId: article.urlId,
-      slug: article.slug,
-    })}`
+    const canonicalUrl = helpCenterAbsoluteUrl(
+      baseUrl,
+      hcArticlePath({
+        locale: params.locale,
+        urlId: article.urlId,
+        slug: article.slug,
+      })
+    )
 
     return {
       meta: [
@@ -73,19 +75,20 @@ export const Route = createFileRoute('/_portal/hc/$locale/articles/$idSlug/')({
         { property: 'og:title', content: pageTitle },
         ...(description ? [{ property: 'og:description', content: description }] : []),
         { property: 'og:type', content: 'article' },
-        { property: 'og:url', content: canonicalUrl },
+        ...(canonicalUrl ? [{ property: 'og:url', content: canonicalUrl }] : []),
         { property: 'og:site_name', content: workspaceName },
         { name: 'twitter:card', content: 'summary' },
         { name: 'twitter:title', content: pageTitle },
         ...(description ? [{ name: 'twitter:description', content: description }] : []),
       ],
-      links: [{ rel: 'canonical', href: canonicalUrl }],
+      links: canonicalUrl ? [{ rel: 'canonical', href: canonicalUrl }] : [],
     }
   },
   component: ArticleDetailPage,
 })
 
 function ArticleDetailPage() {
+  const intl = useIntl()
   const { article, related, category, articles, allCategories } = Route.useLoaderData()
   const { locale } = Route.useParams()
   const { helpCenterConfig } = helpCenterApi.useLoaderData()
@@ -101,6 +104,10 @@ function ArticleDetailPage() {
     categoryId: category.id,
     articleTitle: article.title,
     locale,
+    rootLabel: intl.formatMessage({
+      id: 'portal.hc.breadcrumbs.root',
+      defaultMessage: 'Help Center',
+    }),
   })
 
   const headings = extractHeadings(article.contentJson)
@@ -176,16 +183,33 @@ function ArticleDetailPage() {
                 <div className="flex flex-col gap-0.5">
                   {article.author && (
                     <span className="text-sm text-muted-foreground">
-                      Written By{' '}
-                      <span className="font-semibold text-foreground">{article.author.name}</span>
+                      <FormattedMessage
+                        id="portal.hc.article.writtenBy"
+                        defaultMessage="Written By {name}"
+                        values={{
+                          name: (
+                            <span className="font-semibold text-foreground">
+                              {article.author.name}
+                            </span>
+                          ),
+                        }}
+                      />
                     </span>
                   )}
                   {article.updatedAt && (
                     <span className="text-sm text-muted-foreground">
-                      Last updated{' '}
-                      <span className="font-semibold text-foreground">
-                        {formatDistanceToNow(new Date(article.updatedAt), { addSuffix: true })}
-                      </span>
+                      <FormattedMessage
+                        id="portal.hc.article.lastUpdated"
+                        defaultMessage="Last updated {time}"
+                        values={{
+                          time: (
+                            <TimeAgo
+                              date={article.updatedAt}
+                              className="font-semibold text-foreground"
+                            />
+                          ),
+                        }}
+                      />
                     </span>
                   )}
                 </div>

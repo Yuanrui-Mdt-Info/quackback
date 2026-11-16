@@ -1,8 +1,8 @@
 /**
  * Shared plumbing for the MCP tool modules: result wrappers, cursor codecs,
  * authorization guards, annotations, and the `registerTool` helper that owns
- * guard placement so individual tools declare `{ scope, teamOnly, feature }`
- * metadata instead of hand-copying guard calls.
+ * guard placement so individual tools declare `{ scope, teamOnly, feature,
+ * permissions }` metadata instead of hand-copying guard calls.
  */
 
 import { z } from 'zod'
@@ -17,7 +17,21 @@ import { contentJsonToMarkdown } from '@/lib/server/markdown-tiptap'
 import type { ConversationAttachment, TiptapContent } from '@/lib/server/db'
 import type { Actor } from '@/lib/server/policy/types'
 import { hasApiScope } from '@/lib/server/domains/api-keys/api-key-scopes'
+import { resolveActorPermissions } from '@/lib/server/policy/permissions'
+import type { PermissionKey } from '@/lib/shared/permissions'
+import { principalIdsOnTeam } from '@/lib/server/domains/principals/principal-standing'
+import { logger } from '@/lib/server/logger'
 import type { McpAuthContext, McpScope } from '../types'
+import {
+  UNTRUSTED_TOOL_FIELDS,
+  markUntrusted,
+  withItemFacts,
+  type McpToolName,
+  type UntrustedSpec,
+} from '../untrusted'
+import { recordMcpToolCall, type McpToolErrorCode } from '../tool-call-audit'
+
+const log = logger.child({ component: 'mcp-tools' })
 
 // ============================================================================
 // Result wrappers
@@ -127,6 +141,42 @@ export function requireTeamRole(auth: McpAuthContext): CallToolResult | null {
   }
 }
 
+/**
+ * The caller's resolved permission set: an API key's role preset intersected
+ * with its creator's current permissions, or an OAuth or in-app caller's own
+ * assignment-derived set. A context built without one (a synthetic actor)
+ * falls back to its role's preset, as the policy layer's can() does.
+ */
+export function heldPermissions(auth: McpAuthContext): ReadonlySet<PermissionKey> {
+  return auth.permissions ?? resolveActorPermissions(auth.role)
+}
+
+/** Return an error if the caller does not hold every permission in the list. */
+export function requirePermissions(
+  auth: McpAuthContext,
+  required: readonly PermissionKey[]
+): CallToolResult | null {
+  const held = heldPermissions(auth)
+  const missing = required.find((permission) => !held.has(permission))
+  if (!missing) return null
+  return {
+    isError: true,
+    content: [
+      {
+        type: 'text',
+        text: `Error: This operation requires the '${missing}' permission. Ask a workspace owner or an admin to grant it.`,
+      },
+    ],
+  }
+}
+
+/** Feature flags a tool can require before its scope/role guards run. */
+type ToolFeature = 'helpCenter'
+
+const FEATURE_DENIALS: Record<ToolFeature, string> = {
+  helpCenter: 'Error: Help center is not enabled. Enable it in Settings → General.',
+}
+
 /** Return an error if the help center feature is disabled. */
 export async function requireHelpCenter(): Promise<CallToolResult | null> {
   if (await isFeatureEnabled('helpCenter')) return null
@@ -135,7 +185,7 @@ export async function requireHelpCenter(): Promise<CallToolResult | null> {
     content: [
       {
         type: 'text',
-        text: 'Error: Help center is not enabled. Enable it in Settings → General.',
+        text: FEATURE_DENIALS.helpCenter,
       },
     ],
   }
@@ -145,11 +195,14 @@ export async function requireHelpCenter(): Promise<CallToolResult | null> {
 // Tool registration
 // ============================================================================
 
-/** Feature flags a tool can require before its scope/role guards run. */
-type ToolFeature = 'helpCenter'
+async function requireFeature(feature: ToolFeature): Promise<CallToolResult | null> {
+  if (await isFeatureEnabled(feature)) return null
+  return { isError: true, content: [{ type: 'text', text: FEATURE_DENIALS[feature] }] }
+}
 
 export interface ToolDef<TArgs> {
-  name: string
+  /** Must be declared in UNTRUSTED_TOOL_FIELDS (../untrusted). */
+  name: McpToolName
   description: string
   schema: z.ZodRawShape
   annotations: ToolAnnotations
@@ -162,46 +215,101 @@ export interface ToolDef<TArgs> {
   teamOnly?: boolean
   /** Feature flag that must be enabled, checked before the scope/role guards. */
   feature?: ToolFeature
+  /**
+   * Permissions the caller's resolved set must hold before the handler runs:
+   * every key listed, or every key a function derives from the arguments
+   * (a field-by-field update, a per-area or per-destination tool). `'none'`
+   * marks a tool any caller the scope admits may run, portal users included,
+   * whose domain policy gates the effect (voting, commenting as yourself).
+   * Required, so a tool cannot be gated on scope and team role alone.
+   */
+  permissions: ToolPermissions<TArgs>
   handler: (args: TArgs) => Promise<CallToolResult>
+}
+
+export type ToolPermissions<TArgs> =
+  | readonly [PermissionKey, ...PermissionKey[]]
+  | ((args: TArgs, auth: McpAuthContext) => readonly PermissionKey[])
+  | 'none'
+
+function requiredPermissions<TArgs>(
+  declared: ToolPermissions<TArgs>,
+  args: TArgs,
+  auth: McpAuthContext
+): readonly PermissionKey[] {
+  if (declared === 'none') return []
+  return typeof declared === 'function' ? declared(args, auth) : declared
 }
 
 /**
  * Register a tool with its authorization contract applied declaratively.
  * Guard order is feature flag, then scope, then team role — the same order the
- * hand-written guards used, so denial messages are unchanged.
+ * hand-written guards used, so denial messages are unchanged — then the
+ * tool's declared permissions against the caller's resolved set, the same
+ * intersection the REST API gates on.
  *
  * Error ownership also lives here: any error the handler throws becomes the
  * standard errorResult, so handlers only add try/catch when a branch needs a
  * more specific mapping (e.g. get_details' invalid-TypeID message).
+ *
+ * So does untrusted marking: every successful result passes through
+ * markUntrusted with the tool's UNTRUSTED_TOOL_FIELDS declaration, which adds
+ * the `untrusted` descriptor when the result holds text from outside the team.
  */
 export function registerTool<TArgs>(
   server: McpServer,
   auth: McpAuthContext,
   def: ToolDef<TArgs>
 ): void {
-  const wrapped = (async (args: TArgs): Promise<CallToolResult> => {
-    if (def.feature) {
-      // Single-value ToolFeature union today; every flagged tool is helpCenter.
-      const denied = await requireHelpCenter()
-      if (denied) return denied
+  const untrusted: UntrustedSpec | undefined = UNTRUSTED_TOOL_FIELDS[def.name]
+  if (!untrusted) {
+    throw new Error(`MCP tool "${def.name}" has no UNTRUSTED_TOOL_FIELDS declaration`)
+  }
+  const audited = def.annotations.readOnlyHint !== true
+  const wrapped = (async (args: TArgs, extra?: unknown): Promise<CallToolResult> => {
+    const { result, errorCode } = await runGuardedTool(auth, def, args, untrusted)
+    // Every call that can change something is audited, refused ones included,
+    // on the result the caller receives.
+    if (audited) {
+      await recordMcpToolCall({ auth, tool: def.name, args, result, errorCode, extra })
     }
-    if (def.scope) {
-      const denied = requireScope(auth, def.scope)
-      if (denied) return denied
-    }
-    if (def.teamOnly) {
-      const denied = requireTeamRole(auth)
-      if (denied) return denied
-    }
-    try {
-      return await def.handler(args)
-    } catch (err) {
-      return errorResult(err)
-    }
+    return result
   }) as unknown as ToolCallback<never>
 
   // MCP SDK still types against an older Zod shape; the runtime schema is ours.
   server.tool(def.name, def.description, def.schema as never, def.annotations, wrapped)
+}
+
+/** Run a tool behind its guards, naming the outcome for the audit. */
+async function runGuardedTool<TArgs>(
+  auth: McpAuthContext,
+  def: ToolDef<TArgs>,
+  args: TArgs,
+  untrusted: UntrustedSpec
+): Promise<{ result: CallToolResult; errorCode: McpToolErrorCode | null }> {
+  if (def.feature) {
+    const denied = await requireFeature(def.feature)
+    if (denied) return { result: denied, errorCode: 'FEATURE_DISABLED' }
+  }
+  if (def.scope) {
+    const denied = requireScope(auth, def.scope)
+    if (denied) return { result: denied, errorCode: 'INSUFFICIENT_SCOPE' }
+  }
+  if (def.teamOnly) {
+    const denied = requireTeamRole(auth)
+    if (denied) return { result: denied, errorCode: 'FORBIDDEN' }
+  }
+  try {
+    const denied = requirePermissions(auth, requiredPermissions(def.permissions, args, auth))
+    if (denied) return { result: denied, errorCode: 'MISSING_PERMISSION' }
+    const result = markUntrusted(await def.handler(args), untrusted)
+    return { result, errorCode: result.isError ? 'TOOL_ERROR' : null }
+  } catch (err) {
+    return {
+      result: errorResult(err),
+      errorCode: err instanceof DomainException ? err.code : 'INTERNAL_ERROR',
+    }
+  }
 }
 
 // ============================================================================
@@ -240,7 +348,9 @@ export function principalTypeOf(auth: McpAuthContext): 'user' | 'service' {
 /**
  * Policy actor for the agent-side conversation tools. The conversation gates
  * (canViewConversation / canActAsAgent) short-circuit on the team role, so
- * segment memberships are never consulted and stay empty.
+ * segment memberships are never consulted and stay empty. A permission ceiling
+ * on the context (an API key's resolved authority) rides along, and so does a
+ * personal key's creator, whose row scope the actor follows.
  */
 export function mcpAgentActor(auth: McpAuthContext): Actor {
   return {
@@ -248,6 +358,8 @@ export function mcpAgentActor(auth: McpAuthContext): Actor {
     role: auth.role,
     principalType: principalTypeOf(auth),
     segmentIds: new Set<SegmentId>(),
+    permissions: auth.permissions,
+    ...(auth.scopePrincipalId ? { scopePrincipalId: auth.scopePrincipalId } : {}),
   }
 }
 
@@ -263,11 +375,46 @@ export async function mcpMemberActor(auth: McpAuthContext): Promise<Actor> {
     role: auth.role,
     principalType: principalTypeOf(auth),
     segmentIds: await segmentIdsForPrincipal(auth.principalId),
+    permissions: auth.permissions,
+    ...(auth.scopePrincipalId ? { scopePrincipalId: auth.scopePrincipalId } : {}),
   }
 }
 
-/** Format a help center article as a tool result. */
-export function articleResult(article: {
+/** An object in a result that shows someone's name: its path there, and whose name it is. */
+export type AuthorAt = readonly [path: string, principalId: string | null | undefined]
+
+/**
+ * Attach whether each listed object's author is on the team today, as
+ * `authorOnTeam` facts at the object's path (see withItemFacts). Names are
+ * read live, so only a current teammate's or service principal's name is the
+ * team's. One principal read covers the whole result, and none happens when no
+ * object names an author. If the read fails, no author counts as on the team,
+ * so every name is marked rather than the call failing.
+ */
+export async function withAuthorFacts(
+  result: CallToolResult,
+  authors: ReadonlyArray<AuthorAt>
+): Promise<CallToolResult> {
+  let onTeam: Set<string>
+  try {
+    onTeam = await principalIdsOnTeam(authors.map(([, principalId]) => principalId))
+  } catch (err) {
+    log.warn({ err }, 'author standing lookup failed, marking every author name')
+    onTeam = new Set()
+  }
+  return withItemFacts(
+    result,
+    Object.fromEntries(
+      authors.map(([path, principalId]) => [
+        path,
+        { authorOnTeam: !!principalId && onTeam.has(principalId) },
+      ])
+    )
+  )
+}
+
+/** Format a help center article as a tool result, with its author's standing attached. */
+export async function articleResult(article: {
   id: string
   slug: string
   title: string
@@ -283,23 +430,26 @@ export function articleResult(article: {
   notHelpfulCount: number
   createdAt: Date
   updatedAt: Date
-}): CallToolResult {
-  return jsonResult({
-    id: article.id,
-    slug: article.slug,
-    title: article.title,
-    content: contentJsonToMarkdown(article.contentJson, article.content),
-    description: article.description,
-    position: article.position,
-    category: article.category,
-    author: article.author,
-    publishedAt: article.publishedAt,
-    viewCount: article.viewCount,
-    helpfulCount: article.helpfulCount,
-    notHelpfulCount: article.notHelpfulCount,
-    createdAt: article.createdAt,
-    updatedAt: article.updatedAt,
-  })
+}): Promise<CallToolResult> {
+  return withAuthorFacts(
+    jsonResult({
+      id: article.id,
+      slug: article.slug,
+      title: article.title,
+      content: contentJsonToMarkdown(article.contentJson, article.content),
+      description: article.description,
+      position: article.position,
+      category: article.category,
+      author: article.author,
+      publishedAt: article.publishedAt,
+      viewCount: article.viewCount,
+      helpfulCount: article.helpfulCount,
+      notHelpfulCount: article.notHelpfulCount,
+      createdAt: article.createdAt,
+      updatedAt: article.updatedAt,
+    }),
+    [['author', article.author?.id]]
+  )
 }
 
 /** Format a help center category as a tool result. */

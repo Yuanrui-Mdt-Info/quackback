@@ -12,6 +12,9 @@ import {
   type UserId,
 } from '@quackback/ids'
 import type { BoardSettings, BoardAccess } from '@/lib/server/db'
+// Pure helper + its type, imported through the client-safe re-export so suites
+// that mock '@/lib/server/db' don't have to stub them.
+import { resolveReplyPolicy, type ReplyPolicy } from '@/lib/shared/db-types'
 import type { Actor } from '@/lib/server/policy'
 import {
   getOptionalAuth,
@@ -21,8 +24,6 @@ import {
 } from './auth-helpers'
 import { NotFoundError } from '@/lib/shared/errors'
 import { isTeamMember } from '@/lib/shared/roles'
-import { can } from '@/lib/server/policy/authorize'
-import { PERMISSIONS } from '@/lib/shared/permissions'
 import { PageLimitMinOneSchema } from '@/lib/shared/schemas/taxonomy'
 import {
   fetchPublicPostDetailSchema,
@@ -39,9 +40,11 @@ import {
 import {
   listPublicPosts,
   listPublicPostsWithVotesAndAvatars,
-  getVotedPostIdsByUserId,
+  getAllUserVotedPostIds,
 } from '@/lib/server/domains/posts/post.public'
 import { getPublicPostDetail } from '@/lib/server/domains/posts/post.public.detail'
+import { countPublicPostFacetsOrNull } from '@/lib/server/domains/posts/post.public.facets'
+import { withPublicSearchMode } from '@/lib/server/domains/posts/post.public.search'
 import { getPostMergeInfo, getMergedPosts } from '@/lib/server/domains/posts/post.merge'
 import { listPublicStatuses } from '@/lib/server/domains/statuses/status.service'
 import { listPublicPostTags } from '@/lib/server/domains/post-tags/post-tag.service'
@@ -59,13 +62,15 @@ import {
   tagIdInputSchema,
 } from '@/lib/shared/roadmap-config'
 import { resolvePortalAccessForRequest } from './portal-access'
+import { teamOnlyFeedFilters } from '@/lib/server/domains/posts/post.public.team-filters'
 import { logger } from '@/lib/server/logger'
 import { toIsoStringOrNull } from '@/lib/shared/utils'
+import { PUBLIC_FEED_VIEWS, PUBLIC_POST_SORTS } from '@/lib/shared/types/filters'
 
 const log = logger.child({ component: 'portal' })
 
 // Schemas
-const sortSchema = z.enum(['top', 'new', 'trending'])
+const sortSchema = z.enum(PUBLIC_POST_SORTS)
 
 const fetchPublicPostsSchema = z.object({
   boardSlug: z.string().optional(),
@@ -79,7 +84,6 @@ const fetchPortalDataSchema = z.object({
   sort: sortSchema,
   statusSlugs: z.array(z.string()).optional(),
   tagIds: z.array(z.string()).optional(),
-  userId: z.string().optional(),
   minVotes: z.number().int().min(1).optional(),
   dateFrom: z
     .string()
@@ -92,6 +96,7 @@ const fetchPortalDataSchema = z.object({
   // payload can never be widened by a crafted request.
   owner: z.string().optional(),
   segmentIds: z.array(z.string()).optional(),
+  view: z.enum(PUBLIC_FEED_VIEWS).optional(),
 })
 
 /**
@@ -158,6 +163,7 @@ export const fetchPortalData = createServerFn({ method: 'GET' })
         tags: [],
         votedPostIds: [],
         principalId: null,
+        facets: null,
       }
     }
 
@@ -173,54 +179,53 @@ export const fetchPortalData = createServerFn({ method: 'GET' })
     // portal permission bootstrap. Everyone else has these params dropped, so
     // a crafted request can never surface owner/segment structure or widen the
     // public feed. `owner: 'unassigned'` maps to a null owner match.
-    const canViewPrivate = can(actor, PERMISSIONS.POST_VIEW_PRIVATE)
-    const ownerId = canViewPrivate
-      ? data.owner === 'unassigned'
-        ? null
-        : (data.owner as PrincipalId | undefined)
-      : undefined
-    const segmentIds =
-      canViewPrivate && data.segmentIds?.length ? (data.segmentIds as SegmentId[]) : undefined
+    const { ownerId, segmentIds } = teamOnlyFeedFilters(actor, data)
+
+    // The viewer's votes come from the session's principal, never from the
+    // request: a caller must not be able to name whose votes to read.
+    const principalId = auth?.principal.id ?? null
 
     // Run ALL queries in parallel for maximum performance — including the
     // (fail-closed) anonymous-ceiling read so buildBoardPermissions doesn't
     // serialize an extra round-trip onto this (highest-traffic) loader.
-    const [memberResult, boardsRaw, postsResult, statuses, tags, allVotedPosts, allowAnonymous] =
+    // A search settles its all-words-or-any mode first (one probe, and only
+    // for a multi-word search), so the list and its counts agree.
+    const feedParams = await withPublicSearchMode(
+      {
+        boardSlug: data.boardSlug,
+        search: data.search,
+        statusSlugs: data.statusSlugs,
+        tagIds: data.tagIds as PostTagId[] | undefined,
+        minVotes: data.minVotes,
+        dateFrom: data.dateFrom,
+        responded: data.responded,
+        ownerId,
+        segmentIds,
+        view: data.view,
+        portalFeed: true,
+      },
+      actor
+    )
+    const [boardsRaw, postsResult, statuses, tags, allVotedPosts, allowAnonymous, facets] =
       await Promise.all([
-        // Principal lookup (needed for principalId in response)
-        data.userId
-          ? db.query.principal.findFirst({
-              where: eq(principalTable.userId, data.userId as UserId),
-              columns: { id: true },
-            })
-          : null,
         listPublicBoardsWithStats(actor),
         // Posts WITHOUT embedded vote check (we get votes separately for parallelism)
         listPublicPostsWithVotesAndAvatars({
+          ...feedParams,
           actor,
-          boardSlug: data.boardSlug,
-          search: data.search,
-          statusSlugs: data.statusSlugs,
-          tagIds: data.tagIds as PostTagId[] | undefined,
           sort: data.sort,
           page: 1,
           limit: 20,
-          minVotes: data.minVotes,
-          dateFrom: data.dateFrom,
-          responded: data.responded,
-          ownerId,
-          segmentIds,
         }),
         listPublicStatuses(),
         // Actor-scoped: internal tags are only listed for team viewers.
         listPublicPostTags(actor),
-        // Get ALL voted post IDs for this user (runs in parallel, we'll filter to displayed posts)
-        data.userId
-          ? getVotedPostIdsByUserId(data.userId as UserId)
-          : Promise.resolve(new Set<PostId>()),
+        // Every post the viewer has voted on, so later feed pages highlight too.
+        principalId ? getAllUserVotedPostIds(principalId) : Promise.resolve(new Set<PostId>()),
         loadAllowAnonymous(),
+        // Filter panel counts, so they paint with the page.
+        countPublicPostFacetsOrNull(feedParams, actor),
       ])
-    const principalId = memberResult?.id ?? null
 
     // Per-board submit/vote capability for THIS viewer, composed with the
     // workspace anonymous switch. The UI uses these booleans to decide whether
@@ -247,9 +252,12 @@ export const fetchPortalData = createServerFn({ method: 'GET' })
         commentCount: post.commentCount,
         tags: post.tags,
         board: post.board,
+        changelogEntry: post.changelogEntry,
       })),
       hasMore: postsResult.hasMore,
       total: undefined,
+      ...(feedParams.search &&
+        feedParams.searchMode !== 'all' && { searchMode: feedParams.searchMode }),
     }
 
     return {
@@ -260,6 +268,7 @@ export const fetchPortalData = createServerFn({ method: 'GET' })
       votedPostIds,
       principalId,
       boardPermissions,
+      facets,
     }
   })
 
@@ -359,9 +368,17 @@ export const runFetchPublicPostDetail = createServerOnlyFn(async function runFet
   // per-board tier + the workspace anonymous ceiling (non-user actors only),
   // so the UI never advertises a vote/comment CTA the board's tier rejects
   // (#191). canSubmit is unused on the detail view.
-  const { boardCapabilitiesForActor } = await import('@/lib/server/policy')
-  const { canVote, canComment } = boardCapabilitiesForActor(
+  const { boardCapabilitiesForActor, canCommentOnPost } = await import('@/lib/server/policy')
+  const { canVote } = boardCapabilitiesForActor(actor, result.boardAccess, allowAnonymous)
+  // canComment is per-POST: on an author-only board the reply right turns on
+  // this post's own author, which the board-level capability can't see. View
+  // is already proven (getPublicPostDetail returned a row for this actor), so
+  // moderationState='published' keeps the inner view check a no-op and the
+  // decision reflects the comment gates — same convention as the vote gate in
+  // public-posts.ts.
+  const canComment = canCommentOnPost(
     actor,
+    { moderationState: 'published', principalId: result.principalId },
     result.boardAccess,
     allowAnonymous
   )
@@ -384,6 +401,11 @@ export const runFetchPublicPostDetail = createServerOnlyFn(async function runFet
     mergedPostCount: mergedPostsList.length > 0 ? mergedPostsList.length : undefined,
     canVote,
     canComment,
+    // The board's reply rule, so a denied viewer can be told WHY the composer
+    // is closed ("only the author and the team can reply") instead of getting
+    // the generic no-access notice. Safe to expose: it is a public property of
+    // the board, unlike the access matrix stripped above.
+    replyPolicy: resolveReplyPolicy(result.boardAccess),
   }
 })
 
@@ -715,7 +737,15 @@ export const getCommentsSectionDataFn = createServerFn({ method: 'GET' })
   .validator(getCommentsSectionDataSchema)
   .handler(async ({ data }) => {
     log.debug({ post_id: data.postId }, 'get comments section data')
-    const denied = { isMember: false, isTeamMember: false, canComment: false, user: undefined }
+    // replyPolicy rides the denied shape too, so the response type stays one
+    // object rather than a union the client has to narrow before reading it.
+    const denied = {
+      isMember: false,
+      isTeamMember: false,
+      canComment: false,
+      user: undefined,
+      replyPolicy: 'anyone' as ReplyPolicy,
+    }
     const postId = data.postId as PostId
 
     // Portal-visibility gate: a caller who can't see the portal must not
@@ -736,16 +766,17 @@ export const getCommentsSectionDataFn = createServerFn({ method: 'GET' })
       throw err
     }
 
-    // Per-board comment capability for the real actor, composed with the
-    // workspace anonymous ceiling. boardCapabilitiesForActor is the single
-    // source of truth the portal + widget UIs share, so the CTA can't desync
-    // from the server-side canCreateComment gate (it passes a published,
-    // unlocked post internally — assertPostViewable already proved view, and
-    // comments-locked is handled by the component's lockedMessage).
-    const { loadBoardAccessForPost } = await import('@/lib/server/domains/posts/post.access')
-    const { boardCapabilitiesForActor } = await import('@/lib/server/policy')
-    const boardAccess = await loadBoardAccessForPost(postId)
-    if (!boardAccess) return denied
+    // Per-POST comment capability for the real actor, composed with the
+    // workspace anonymous ceiling. canCommentOnPost is the single source of
+    // truth the portal + widget UIs share, so the CTA can't desync from the
+    // server-side canCreateComment gate. It needs the post's own author (an
+    // author-only board decides the reply right against it) alongside the
+    // board matrix, so the row carries all three; comments-locked stays out
+    // and is handled by the component's lockedMessage.
+    const { loadCommentContextForPost } = await import('@/lib/server/domains/posts/post.access')
+    const { canCommentOnPost } = await import('@/lib/server/policy')
+    const commentContext = await loadCommentContextForPost(postId)
+    if (!commentContext) return denied
 
     // The workspace anonymous ceiling only applies to non-user actors, so
     // only real anonymous / no-session viewers need the (uncached) config
@@ -756,7 +787,15 @@ export const getCommentsSectionDataFn = createServerFn({ method: 'GET' })
     if (actor.principalType !== 'user') {
       allowAnonymous = await loadAllowAnonymous()
     }
-    const canComment = boardCapabilitiesForActor(actor, boardAccess, allowAnonymous).canComment
+    const canComment = canCommentOnPost(
+      actor,
+      {
+        moderationState: commentContext.moderationState,
+        principalId: commentContext.principalId,
+      },
+      commentContext.access,
+      allowAnonymous
+    )
 
     const isMember = !!(ctx?.user && ctx?.principal)
     const isTeamMember =
@@ -769,6 +808,10 @@ export const getCommentsSectionDataFn = createServerFn({ method: 'GET' })
       user: isMember
         ? { name: ctx.user.name, email: ctx.user.email, principalId: ctx.principal.id }
         : undefined,
+      // Why the composer is closed, when it is: an author-only board tells the
+      // signed-in non-author that the thread is the author's, instead of the
+      // generic "you can't comment here" notice.
+      replyPolicy: resolveReplyPolicy(commentContext.access),
     }
   })
 

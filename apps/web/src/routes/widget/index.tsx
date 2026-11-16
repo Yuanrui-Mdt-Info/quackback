@@ -298,7 +298,7 @@ export const Route = createFileRoute('/widget/')({
       assistant:
         messengerTabEnabled && settings?.publicWidgetConfig?.messenger?.assistant?.enabled
           ? {
-              name: settings.publicWidgetConfig.messenger.assistant.name?.trim() || 'Quinn',
+              name: settings.publicWidgetConfig.messenger.assistant.name?.trim() || 'Quackback AI',
               avatarUrl: settings.publicWidgetConfig.messenger.assistant.avatarUrl || null,
             }
           : null,
@@ -470,6 +470,9 @@ function WidgetPage() {
   const [conversationTarget, setConversationTarget] = useState<ConversationId | 'new' | null>(
     resumeConversationId ? (resumeConversationId as ConversationId) : null
   )
+  // A host's `open({ view: 'chat', body })`. The nonce remounts the messenger
+  // so a draft sent while it is already open still lands in the composer.
+  const [messengerDraft, setMessengerDraft] = useState<{ nonce: number; body: string } | null>(null)
   // Manual size preference: the header's expand/collapse button flips this,
   // and it is STICKY — collapsing turns auto-expansion off for every later
   // item view until the visitor expands again. Persisted per browser.
@@ -657,6 +660,10 @@ function WidgetPage() {
           setView('help')
           break
         case 'messenger':
+          if (command.body) {
+            const body = command.body
+            setMessengerDraft((prev) => ({ nonce: (prev?.nonce ?? 0) + 1, body }))
+          }
           openMessenger()
           break
         case 'tickets':
@@ -971,7 +978,8 @@ function WidgetPage() {
           fallback={<WidgetMessengerViewSkeleton isNew={conversationTarget === 'new'} />}
         >
           <WidgetMessenger
-            key={conversationTarget ?? 'active'}
+            key={`${conversationTarget ?? 'active'}:${messengerDraft?.nonce ?? 0}`}
+            initialDraft={messengerDraft?.body}
             helpEnabled={tabs.help}
             onArticleSelect={handleHelpArticleSelect}
             conversationTarget={conversationTarget === null ? undefined : conversationTarget}
@@ -1192,7 +1200,7 @@ function SuccessView({
           <p className="text-[11px] text-muted-foreground">
             <FormattedMessage
               id="widget.success.subtitle"
-              defaultMessage="Your idea has been submitted."
+              defaultMessage="Your post has been submitted."
             />
           </p>
         </div>
@@ -1247,7 +1255,7 @@ function SuccessView({
           className="w-full flex items-center justify-center gap-1.5 px-3 py-2 text-sm font-medium text-foreground bg-muted/30 hover:bg-muted/50 rounded-lg border border-border/50 transition-colors"
         >
           <ArrowLeftIcon className="w-3.5 h-3.5 rtl:rotate-180" />
-          <FormattedMessage id="widget.success.backToIdeas" defaultMessage="Back to ideas" />
+          <FormattedMessage id="widget.success.backToIdeas" defaultMessage="Back to posts" />
         </button>
       </div>
     </div>

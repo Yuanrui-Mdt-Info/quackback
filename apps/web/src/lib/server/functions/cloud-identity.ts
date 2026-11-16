@@ -2,14 +2,18 @@ import { createServerFn } from '@tanstack/react-start'
 import { getRequestHeaders } from '@tanstack/react-start/server'
 import { z } from 'zod'
 import { PERMISSIONS } from '@/lib/shared/permissions'
-import { db, eq, settings } from '@/lib/server/db'
+import { db, settings } from '@/lib/server/db'
 import { requireAuth } from './auth-helpers'
 import { parseIdentityProjection } from '@/lib/server/domains/settings/cloud/identity-projection'
 import { verifyIdentityProjectionToken } from '@/lib/server/domains/settings/cloud/identity-projection.signature'
 import { writeIdentityProjection } from '@/lib/server/domains/settings/cloud/identity-projection.write'
 import { finishIdentityOnboarding, mutateSetupStateAtomic } from '@/lib/server/setup-state'
+import { applyOnboardingGoals, setupGoals } from '@/lib/server/onboarding-board'
 import { friendlyPlatformLabel, platformLabelFromHostname } from '@/lib/shared/platform-label'
-import { flagsForGoal, resolveFeatureFlags } from '@/lib/server/domains/settings/settings.types'
+import { shownProofSource, type ShownProofSource } from '@/lib/shared/domain-proof'
+import { provenZoneProofsAccepted } from '@/lib/server/control-plane/proven-zone-proofs'
+import type { CustomDomainInstruction } from '@/lib/server/control-plane/client'
+import { logger } from '@/lib/server/logger'
 
 export { platformLabelFromHostname }
 
@@ -42,17 +46,14 @@ export const markCloudWorkspaceDetailsSeenFn = createServerFn({ method: 'POST' }
       throw new Error('Choose a Workspace URL before continuing')
     }
     const { state } = await mutateSetupStateAtomic(async (current, row, tx) => {
-      const goal =
-        current.useCase && current.useCase !== 'internal' ? current.useCase : 'product_feedback'
+      // Finishing here stamps the starting point, so Home's own pass never
+      // runs: every chosen goal is applied now.
+      const goals = setupGoals(current)
       if (!current.steps.startingPoint || current.steps.startingPoint.source === 'managed') {
-        const { flags } = flagsForGoal(resolveFeatureFlags(row.featureFlags), goal)
-        await tx
-          .update(settings)
-          .set({ featureFlags: JSON.stringify(flags) })
-          .where(eq(settings.id, row.id))
+        await applyOnboardingGoals(tx, row, current)
       }
       return {
-        state: finishIdentityOnboarding(current, goal),
+        state: finishIdentityOnboarding({ ...current, goals }, goals[0]),
         value: undefined,
       }
     })
@@ -67,13 +68,38 @@ const customDomainInputSchema = z
   })
   .strict()
 
-export const getCloudCustomDomainsFn = createServerFn({ method: 'GET' }).handler(async () => {
-  await requireAuth({ permission: PERMISSIONS.SETTINGS_CUSTOM_DOMAIN })
-  const identity = await currentCloudIdentity()
-  if (!identity) throw new Error('Cloud workspace identity is not enabled')
-  const { fetchWorkspaceCustomDomains } = await import('@/lib/server/control-plane/client')
-  return fetchWorkspaceCustomDomains()
-})
+const log = logger.child({ component: 'web-addresses' })
+
+/**
+ * A web address as the Domains page shows it. `provenBy` is set when a zone
+ * this workspace already proved stands in for the challenge record, named only
+ * when the viewer may see what proved it.
+ */
+export type WebAddress = CustomDomainInstruction & { provenBy: ShownProofSource | null }
+
+export const getCloudCustomDomainsFn = createServerFn({ method: 'GET' }).handler(
+  async (): Promise<WebAddress[]> => {
+    const auth = await requireAuth({ permission: PERMISSIONS.SETTINGS_CUSTOM_DOMAIN })
+    const identity = await currentCloudIdentity()
+    if (!identity) throw new Error('Cloud workspace identity is not enabled')
+    const { fetchWorkspaceCustomDomains } = await import('@/lib/server/control-plane/client')
+    const domains = await fetchWorkspaceCustomDomains()
+    // Read only while the operator accepts proofs: otherwise it still needs
+    // the challenge record, and the page must keep asking for it.
+    const proofFor = provenZoneProofsAccepted() ? await hostnameProofReader() : () => null
+    return domains.map((domain) => {
+      const source =
+        proofFor(domain.hostname)?.source ??
+        (domain.ownership === 'proven-zone' ? domain.ownershipSource : undefined)
+      return { ...domain, provenBy: source ? shownProofSource(source, auth.permissions) : null }
+    })
+  }
+)
+
+async function hostnameProofReader() {
+  const { readHostnameProofs } = await import('@/lib/server/domains/domain-proof/hostname-proof')
+  return readHostnameProofs()
+}
 
 export const hasCustomDomainEntitlementFn = createServerFn({ method: 'GET' }).handler(async () => {
   await requireAuth({ permission: PERMISSIONS.SETTINGS_CUSTOM_DOMAIN })
@@ -99,8 +125,19 @@ export const mutateCloudCustomDomainFn = createServerFn({ method: 'POST' })
       if (!transferToken) throw new Error('Could not prepare a secure session transfer')
     }
 
+    // A zone this workspace already proved goes with the hostname, so the
+    // operator can accept it without a challenge record of its own.
+    const sendsProof =
+      (data.action === 'add' || data.action === 'refresh') && provenZoneProofsAccepted()
+    const proof = sendsProof ? (await hostnameProofReader())(data.hostname) : null
+    if (proof) {
+      log.info({ hostname: data.hostname, zone: proof.zone, source: proof.source }, 'proven zone')
+    }
+
     const { requestWorkspaceIdentityMutation } = await import('@/lib/server/control-plane/client')
-    const response = await requestWorkspaceIdentityMutation({ customDomain: data })
+    const response = await requestWorkspaceIdentityMutation({
+      customDomain: proof ? { ...data, proof } : data,
+    })
     const verified = await verifyIdentityProjectionToken(response.projectionToken)
     await writeIdentityProjection(verified.workspaceKey, verified.projection)
 

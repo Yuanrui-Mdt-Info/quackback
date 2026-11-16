@@ -37,6 +37,9 @@ vi.mock('@/lib/server/domains/principals/bootstrap-admin', () => ({
   findHumanAdmin: vi.fn(),
   isOpenToBootstrapClaim: vi.fn(),
   isSetupOpenToClaim: vi.fn(async () => true),
+  // Nobody has claimed setup by creating an account; that claim is covered
+  // against real Postgres.
+  findSetupClaimant: async () => undefined,
 }))
 
 vi.mock('@/lib/server/domains/settings/identity-providers.service', () => ({
@@ -138,6 +141,21 @@ describe('handleWidgetAccountMutationGate', () => {
         ctx({ path: '/one-time-token/generate', token: 'widget-tok', scope: 'widget' })
       )
     ).resolves.toBeUndefined()
+  })
+
+  it.each([
+    '/get-session',
+    '/sign-in/anonymous',
+    '/one-time-token/generate',
+    '/one-time-token/verify',
+  ])('refuses test credentials on %s before any cookie-setting hook', async (path) => {
+    const c = ctx({
+      path,
+      token: 'customer-session-00000000-0000-0000-0000-000000000000',
+      scope: 'widget',
+    })
+    await expect(handleWidgetAccountMutationGate(c)).rejects.toThrow(/test session/i)
+    expect(c.context.internalAdapter.findSession).not.toHaveBeenCalled()
   })
 
   it('skips the session lookup on allowlisted paths, whatever the credential', async () => {

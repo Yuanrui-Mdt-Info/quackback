@@ -6,19 +6,31 @@ import { publicStatusIncidentQueries } from '@/lib/client/queries/status'
 import { setPublicDocumentCacheHeaders } from '@/lib/server/functions/public-cache'
 import {
   StatusIncidentTimeline,
+  StatusIncidentTiming,
   StatusSubscribeButton,
+  StatusSignInPrompt,
+  useStatusSignInCouldGrantAccess,
+  useRefreshStatusForViewer,
   IMPACT_STYLE,
   IMPACT_LABEL,
   LIFECYCLE_STYLE,
   LIFECYCLE_LABEL,
 } from '@/components/portal/status'
 import { BackLink } from '@/components/ui/back-link'
+import { AreaMessages } from '@/components/shared/area-messages'
+import { DEFAULT_LOCALE, loadAreaMessages } from '@/lib/shared/i18n'
 import type { StatusIncidentId } from '@quackback/ids'
 
 export const Route = createFileRoute('/_portal/status/$incidentId')({
   loader: async ({ context, params }) => {
     if (typeof window === 'undefined') await setPublicDocumentCacheHeaders()
     const incidentId = params.incidentId as StatusIncidentId
+    // The status page's strings stay out of the catalog every other page
+    // seeds; the page reads them with its data.
+    const messagesPromise = loadAreaMessages(
+      context.acceptLanguageLocale ?? DEFAULT_LOCALE,
+      'statusPage'
+    )
 
     let incident
     try {
@@ -36,6 +48,7 @@ export const Route = createFileRoute('/_portal/status/$incidentId')({
       incidentTitle: incident.title,
       workspaceName: context.settings?.name ?? 'Quackback',
       baseUrl: context.baseUrl ?? '',
+      messages: await messagesPromise,
     }
   },
   head: ({ loaderData }) => {
@@ -57,12 +70,26 @@ export const Route = createFileRoute('/_portal/status/$incidentId')({
       links: canonicalUrl ? [{ rel: 'canonical', href: canonicalUrl }] : [],
     }
   },
-  notFoundComponent: StatusIncidentNotFound,
-  component: StatusIncidentPage,
+  notFoundComponent: () => (
+    <AreaMessages area="statusPage">
+      <StatusIncidentNotFound />
+    </AreaMessages>
+  ),
+  component: StatusIncidentRoute,
 })
+
+function StatusIncidentRoute() {
+  const { messages } = Route.useLoaderData()
+  return (
+    <AreaMessages area="statusPage" messages={messages}>
+      <StatusIncidentPage />
+    </AreaMessages>
+  )
+}
 
 function StatusIncidentPage() {
   const intl = useIntl()
+  useRefreshStatusForViewer()
   const { incidentId } = Route.useLoaderData()
   const { data: incident } = useSuspenseQuery(publicStatusIncidentQueries.detail(incidentId))
 
@@ -98,23 +125,7 @@ function StatusIncidentPage() {
           >
             {intl.formatMessage(LIFECYCLE_LABEL[incident.status])}
           </span>
-          <span className="text-xs text-muted-foreground">
-            {intl.formatMessage(
-              { id: 'portal.status.incidentDetail.started', defaultMessage: 'Started {date}' },
-              {
-                date:
-                  new Date(incident.startedAt).toLocaleString(intl.locale, {
-                    month: 'long',
-                    day: 'numeric',
-                    year: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    hour12: false,
-                    timeZone: 'UTC',
-                  }) + ' UTC',
-              }
-            )}
-          </span>
+          <StatusIncidentTiming incident={incident} />
         </div>
 
         {incident.affectedComponents.length > 0 && (
@@ -146,6 +157,16 @@ function StatusIncidentPage() {
 }
 
 function StatusIncidentNotFound() {
+  // An incident link from an email lands here too: when the page is for
+  // signed-in visitors, signing in is the way through.
+  const signInCouldGrantAccess = useStatusSignInCouldGrantAccess()
+  if (signInCouldGrantAccess) {
+    return (
+      <div className="mx-auto max-w-6xl w-full px-4 sm:px-6 py-16 text-center">
+        <StatusSignInPrompt />
+      </div>
+    )
+  }
   return (
     <div className="mx-auto max-w-6xl w-full px-4 sm:px-6 py-16 text-center">
       <h1 className="text-2xl font-bold mb-2">

@@ -43,13 +43,13 @@ import {
   markStandingWork,
   resetDormancyMarks,
 } from '@/lib/server/workspaces/activity'
-import { earliestWorkspaceDeadline } from './deadlines'
+import { clockWakeLeadMs, earliestWorkspaceDeadline, withinWakeLead } from './deadlines'
 import { catchUpDormantUsageReports } from './dormant-usage-report'
 import {
   enqueueUsageReport,
   isHostedBillingConfigured,
 } from '@/lib/server/domains/billing/usage-report'
-import { earliestPendingJobAt, isMissingJobQueue } from './job-queue'
+import { earliestPendingJobAt, isMissingJobQueue, nextPendingJobAt } from './job-queue'
 import {
   awaitPool,
   createJobPool,
@@ -72,8 +72,56 @@ const log = logger.child({ component: 'job-worker' })
 /** How often the pooled worker re-reads the active workspace list. */
 const WORKSPACE_REFRESH_MS = 60_000
 
+/**
+ * How far ahead of its clock-driven work a workspace counts as due, so a parked
+ * workspace's loop is running before the cron slot that spends the work. The lead
+ * and why it is this long are in `deadlines.ts`.
+ */
+const WAKE_LEAD_MS = clockWakeLeadMs(WORKSPACE_REFRESH_MS)
+
 /** Sentinel workspace id for a single-workspace install. Never a real workspace id. */
 const SINGLE = '__single__'
+
+/**
+ * A loop that will be back within this long does not ask when the next delayed
+ * job is due. A short poll finds it anyway, and the question would be one more
+ * query on every pass of a loop that polls every second.
+ */
+const LOOKAHEAD_MIN_SLEEP_MS = 5_000
+
+/**
+ * When an idle loop next needs its database: its next schedule slot, the next
+ * delayed job, or the poll interval, whichever comes first.
+ *
+ * Under pooled tenancy every wake of every loop is a connection to that
+ * workspace's database, and one the pooler has closed is a new server process.
+ * A loop that slept the poll interval regardless of its slots woke on its poll
+ * and again on its slot. One that sleeps until whichever is due wakes once, at
+ * its own offset in the slot (§6 of JOBS.md), so the fleet's connections are
+ * spread evenly instead of arriving together.
+ */
+export function idleWakeAt(input: {
+  now: number
+  pollIntervalMs: number
+  nextScheduleAt: number
+  nextPendingAt: number | null
+}): number {
+  let at = Math.min(input.now + input.pollIntervalMs, input.nextScheduleAt)
+  if (input.nextPendingAt !== null) at = Math.min(at, input.nextPendingAt)
+  return Math.max(input.now, at)
+}
+
+/**
+ * How much earlier than its interval a reap may run.
+ *
+ * A loop that wakes on its schedule slot starts each pass a slot after the last,
+ * give or take how late each timer fired. Without slack a one-minute reap,
+ * measured from a pass that started a few milliseconds late, is not quite due on
+ * the next minute's pass and slips to the one after: it would run every two.
+ */
+function reapSlackMs(reapIntervalMs: number): number {
+  return Math.min(2_000, Math.floor(reapIntervalMs / 10))
+}
 
 interface WorkspaceLoop {
   workspaceKey: string
@@ -110,6 +158,11 @@ interface LoopStats {
 
 const loops = new Map<string, WorkspaceLoop>()
 const stats = new Map<string, LoopStats>()
+/**
+ * When each parked workspace next has clock-driven work (ms), as the probe that parked
+ * it found. In memory: a restart probes every idle workspace once, which re-learns it.
+ */
+const scheduledWakes = new Map<string, number>()
 let running = false
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let storedConfig: RunnerConfig | null = null
@@ -144,7 +197,8 @@ function emptyStats(): LoopStats {
 }
 
 /**
- * One workspace's loop: schedule → dispatch → wait the poll interval.
+ * One workspace's loop: schedule → dispatch → sleep until the next slot, the
+ * next delayed job or the poll interval, whichever is first (`idleWakeAt`).
  *
  * The loop does not wait for the work it started. `dispatchPass` hands claimed
  * jobs to a bounded pool and returns, so the next schedule tick happens on
@@ -166,7 +220,9 @@ function startLoop(opts: {
   let nextMaintenanceAt = 0
   let nextPruneAt = 0
   let descriptor: WorkspaceDescriptor | null = opts.workspace
-  const schedule = createScheduleState()
+  // A pooled loop spreads its slots by its workspace key; a single install runs
+  // on the minute.
+  const schedule = createScheduleState({ spreadKey: opts.workspace ? opts.workspaceKey : null })
   const pool = createJobPool()
   const handle: WorkspaceLoop = {
     workspaceKey: opts.workspaceKey,
@@ -274,6 +330,9 @@ function startLoop(opts: {
         await wait(retryAt ? Math.max(250, retryAt - Date.now()) : 1_000)
         continue
       }
+      // Null after a pass that failed: back off the whole poll interval rather
+      // than sleep to a slot the failed pass may not have moved past.
+      let wakeAt: number | null = null
       try {
         const now = Date.now()
         const result = await opts.scoped(async () => {
@@ -293,11 +352,12 @@ function startLoop(opts: {
             const maintenance = await runMaintenanceTick(opts.config, { prune })
             s.requeued += maintenance.requeued
             s.terminated += maintenance.terminated
-            nextMaintenanceAt = now + opts.config.reapIntervalMs
+            nextMaintenanceAt =
+              now + opts.config.reapIntervalMs - reapSlackMs(opts.config.reapIntervalMs)
             if (prune) nextPruneAt = now + opts.config.pruneIntervalMs
           }
-          if (stopped) return { claimed: 0, saturated: true }
-          return dispatchPass({
+          if (stopped) return { claimed: 0, saturated: true, nextPendingAt: null }
+          const dispatched = await dispatchPass({
             pool,
             config: opts.config,
             run: (job) => opts.scoped(() => runJob(job)),
@@ -308,6 +368,14 @@ function startLoop(opts: {
               handle.nudge()
             },
           })
+          // Asked on the connection this pass already holds, and only by a loop
+          // about to sleep long enough for a delayed job to fall due meanwhile.
+          const sleepsFor =
+            Math.min(nextScheduleAt, Date.now() + opts.config.pollIntervalMs) - Date.now()
+          const lookAhead =
+            (dispatched.claimed === 0 || dispatched.saturated) && sleepsFor > LOOKAHEAD_MIN_SLEEP_MS
+          const nextPendingAt = lookAhead ? await nextPendingJobAt() : null
+          return { ...dispatched, nextPendingAt }
         })
         if (!running || stopped) break
 
@@ -321,6 +389,12 @@ function startLoop(opts: {
           pendingNudge = false
           continue
         }
+        wakeAt = idleWakeAt({
+          now: Date.now(),
+          pollIntervalMs: opts.config.pollIntervalMs,
+          nextScheduleAt,
+          nextPendingAt: result.nextPendingAt?.getTime() ?? null,
+        })
       } catch (err) {
         if (isMissingJobQueue(err)) {
           if (!s.schemaMissing) {
@@ -335,7 +409,7 @@ function startLoop(opts: {
         }
       }
       if (!running || stopped) break
-      await wait(opts.config.pollIntervalMs)
+      await wait(wakeAt === null ? opts.config.pollIntervalMs : Math.max(0, wakeAt - Date.now()))
     }
   }
 
@@ -385,47 +459,105 @@ function startWorkspaceLoop(workspace: WorkspaceDescriptor, cfg: RunnerConfig): 
   loops.set(workspace.workspaceKey, loop)
 }
 
+/** What an idle workspace's clock-driven work looks like from the worker. */
+interface ClockWork {
+  /** Work is due now or within `WAKE_LEAD_MS`: the loop must stay awake for it. */
+  standing: boolean
+  /** When the workspace's next clock-driven work falls due (ms), or null for none. */
+  nextAt: number | null
+}
+
 /**
  * Does this workspace have work a clock will create, whether or not anyone
- * visits? Pending `job_queue` rows (a hook retry, a scheduled publish) or a
- * registered deadline (a snooze, an SLA due-at). Asked inside the workspace's
- * scope, once per refresh, only for workspaces past the idle threshold.
+ * visits? Pending `job_queue` rows (a hook retry, a scheduled publish) and
+ * registered deadlines (a snooze, an SLA due-at, a Jira webhook refresh). Asked
+ * inside the workspace's scope, once per refresh, only for workspaces past the
+ * idle threshold.
+ *
+ * Only work inside `WAKE_LEAD_MS` keeps the loop awake. Later work is still
+ * reported, as the instant the parked workspace is woken for, so a workspace
+ * whose next refresh is days away parks now and is woken before it falls due
+ * rather than polling until then.
  *
  * Fail-safe direction: a scope that cannot be opened, or a query that throws,
- * answers "yes" — the cost of keeping an idle loop is one loop; the cost of
+ * answers "standing" — the cost of keeping an idle loop is one loop; the cost of
  * parking a workspace with a due job is the job.
  */
-async function probeStandingWork(workspace: WorkspaceDescriptor): Promise<boolean> {
+async function probeClockWork(workspace: WorkspaceDescriptor, now: number): Promise<ClockWork> {
   try {
     return await withWorkspaceScopeById(workspace.workspaceKey, 'queue', async () => {
       const [pendingAt, deadlineAt] = await Promise.all([
         earliestPendingJobAt(),
-        earliestWorkspaceDeadline(),
+        earliestWorkspaceDeadline(now),
       ])
-      return pendingAt !== null || deadlineAt !== null
+      return clockWorkAt([pendingAt, deadlineAt], now)
     })
   } catch (err) {
-    if (isMissingJobQueue(err)) return false
+    if (isMissingJobQueue(err)) return { standing: false, nextAt: null }
     log.warn(
       { err, workspace_key: workspace.workspaceKey },
-      'could not probe a dormancy candidate for standing work; keeping its loop'
+      'could not probe a dormancy candidate for clock-driven work; keeping its loop'
+    )
+    return { standing: true, nextAt: null }
+  }
+}
+
+function clockWorkAt(instants: ReadonlyArray<Date | null>, now: number): ClockWork {
+  let nextAt: number | null = null
+  for (const at of instants) {
+    if (at === null) continue
+    if (nextAt === null || at.getTime() < nextAt) nextAt = at.getTime()
+  }
+  return { standing: nextAt !== null && withinWakeLead(nextAt, now, WAKE_LEAD_MS), nextAt }
+}
+
+/** Is a parked workspace's clock-driven work due inside the refresh pass that is asking? */
+function clockWakeDue(workspaceKey: string, now: number): boolean {
+  const at = scheduledWakes.get(workspaceKey)
+  return at !== undefined && withinWakeLead(at, now, WAKE_LEAD_MS)
+}
+
+/**
+ * Start a parked workspace's loop because its clock-driven work falls due within
+ * the refresh pass. The loop's next probe either keeps it awake for work now due,
+ * or parks it again at the instant of its next work.
+ */
+function wakeForClockWork(
+  workspace: WorkspaceDescriptor,
+  cfg: RunnerConfig,
+  now: number
+): Promise<boolean> {
+  const key = workspace.workspaceKey
+  return withLoopSet(() => {
+    if (loops.get(key) || !isMarkedDormant(key) || !clockWakeDue(key, now)) return false
+    scheduledWakes.delete(key)
+    markDormant(key, false)
+    markStandingWork(key, true)
+    startWorkspaceLoop(workspace, cfg)
+    log.info(
+      { event: 'workspace.woke', workspace_key: key, via: 'clock' },
+      'dormant workspace woken for clock-driven work'
     )
     return true
-  }
+  })
 }
 
 /**
  * Reconcile the loop set with the registry and the dormancy rule (`activity.ts`).
  *
  * Three states per active registry workspace:
- * - **awake**: recent request, or idle but holding standing work → loop runs;
- * - **dormant**: idle past the threshold with nothing pending → no loop, no
- *   scope, nothing until a request stamps it and the next refresh sees that;
+ * - **awake**: recent request, or idle but holding work due within a refresh pass
+ *   → loop runs;
+ * - **dormant**: idle past the threshold with no work due soon → no loop, no
+ *   scope. It is woken by a request (the next refresh sees the stamp), by a
+ *   job-wake, or by a refresh pass that finds its next clock-driven work due;
  * - **gone**: no longer active in the registry → loop stopped as before.
  *
  * The standing-work probe is the only cost a dormant candidate pays, and it is
  * paid once per refresh only while the candidate still has a loop (to decide
  * whether to park it) — a workspace already parked is not reopened to ask again.
+ * Parking records when the workspace's clock-driven work next falls due, so the
+ * refresh can wake it without opening its scope.
  * A job-wake HTTP call starts a parked loop immediately; refresh only
  * reconciles. Park deactivates and deletes the handle from `loops` under
  * the lock, then `stop()`s outside. A concurrent wake sees missing and
@@ -450,7 +582,10 @@ async function refreshWorkspaceLoops(cfg: RunnerConfig): Promise<void> {
     }
   })
   for (const workspaceKey of listDormantWorkspaces()) {
-    if (!wanted.has(workspaceKey)) markDormant(workspaceKey, false)
+    if (!wanted.has(workspaceKey)) {
+      markDormant(workspaceKey, false)
+      scheduledWakes.delete(workspaceKey)
+    }
   }
 
   let parked = 0
@@ -477,20 +612,24 @@ async function refreshWorkspaceLoops(cfg: RunnerConfig): Promise<void> {
       continue
     }
 
-    if (!loops.get(key) && isMarkedDormant(key)) continue
+    if (!loops.get(key) && isMarkedDormant(key)) {
+      if (clockWakeDue(key, now) && (await wakeForClockWork(workspace, cfg, now))) woke += 1
+      continue
+    }
 
-    const standing = await probeStandingWork(workspace)
+    const clock = await probeClockWork(workspace, now)
     let didPark = false
     await withLoopSet(() => {
       const existing = loops.get(key)
       if (!existing && isMarkedDormant(key)) return
       const keep =
-        standing ||
+        clock.standing ||
         (existing !== undefined &&
           (existing.inFlightCount() > 0 ||
             (existing.recentWakeAt > 0 && now - existing.recentWakeAt < WORKSPACE_REFRESH_MS)))
       markStandingWork(key, keep)
       if (keep) {
+        scheduledWakes.delete(key)
         if (existing) existing.observe(workspace)
         else startWorkspaceLoop(workspace, cfg)
         return
@@ -501,6 +640,8 @@ async function refreshWorkspaceLoops(cfg: RunnerConfig): Promise<void> {
         toStop.push(existing)
       }
       markDormant(key, true)
+      if (clock.nextAt === null) scheduledWakes.delete(key)
+      else scheduledWakes.set(key, clock.nextAt)
       didPark = true
     })
     if (didPark) {
@@ -606,6 +747,7 @@ export async function stopJobWorker(): Promise<void> {
   loops.clear()
   await Promise.allSettled(all.map((l) => l.stop()))
   resetDormancyMarks()
+  scheduledWakes.clear()
   resetJobHandlers()
   if (wasRunning) log.info({ event: 'job.worker_stopped' }, 'job worker stopped')
 }

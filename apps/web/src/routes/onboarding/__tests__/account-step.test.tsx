@@ -32,6 +32,7 @@ import {
 } from '@testing-library/react'
 import { IntlProvider } from 'react-intl'
 import { DEFAULT_AUTH_CONFIG } from '@/lib/shared/types/settings'
+import { loadMessages } from '@/lib/shared/i18n'
 
 const navigate = vi.fn()
 const invalidate = vi.fn(async () => {})
@@ -157,6 +158,28 @@ function selfHosted(): AccountStepProps {
   }
 }
 
+/**
+ * The same install once its first account exists: that account has claimed
+ * setup, so everyone who arrives now, its owner included, is asked to sign in.
+ */
+function selfHostedClaimed(): AccountStepProps {
+  const props = selfHosted()
+  props.claim = { claimed: true, setupComplete: false, openToClaim: true, closedReason: null }
+  props.authConfig.signInOAuth = { password: true, github: true }
+  return props
+}
+
+/**
+ * A workspace the config file stamped complete before its owner arrived. Its
+ * portal is live, so an account there is not a claim, and the first-user form
+ * stays, with a way back in for someone who already made their account.
+ */
+function preStamped(): AccountStepProps {
+  const props = selfHosted()
+  props.claim = { claimed: false, setupComplete: true, openToClaim: true, closedReason: null }
+  return props
+}
+
 function renderStep(props: AccountStepProps) {
   return rtlRender(
     <IntlProvider locale="en" defaultLocale="en" messages={{}}>
@@ -211,6 +234,14 @@ describe('account step — a workspace that does not accept passwords', () => {
     // google/github: true — both social providers are enabled in the config.
     expect(screen.getByRole('button', { name: /sign in with google/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /sign in with github/i })).toBeInTheDocument()
+  })
+
+  // The arrow is decoration: a screen reader should hear "Continue", not
+  // "Continue right arrow".
+  it('names the continue button without its arrow', () => {
+    renderStep(provisioned())
+
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument()
   })
 
   it('drops a social button the config turns off', () => {
@@ -335,14 +366,240 @@ describe('account step — a finished install with no admin left', () => {
 })
 
 describe('account step — a self-hosted first user', () => {
-  it('uses the shared email-first signup form when password is on', async () => {
+  function fillAdminForm(values: { name?: string; email?: string; password?: string }) {
+    if (values.name !== undefined) {
+      fireEvent.change(screen.getByLabelText(/^name$/i), { target: { value: values.name } })
+    }
+    if (values.email !== undefined) {
+      fireEvent.change(screen.getByLabelText(/^email$/i), { target: { value: values.email } })
+    }
+    if (values.password !== undefined) {
+      fireEvent.change(screen.getByLabelText(/^password$/i), { target: { value: values.password } })
+    }
+  }
+
+  function createAccountButton() {
+    return screen.getByRole('button', { name: /^create account$/i })
+  }
+
+  it('names the browser tab for the step', () => {
+    renderStep(selfHosted())
+    expect(document.title).toBe('Create your account · Quackback')
+    cleanup()
+
+    renderStep(provisioned())
+    expect(document.title).toBe('Sign in · Quackback')
+  })
+
+  it('asks for name, email and password in one form', () => {
     const { container } = renderStep(selfHosted())
 
+    expect(screen.getByLabelText(/^name$/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/^email$/i)).toBeInTheDocument()
-    expect(container.querySelector('input[type="password"]')).toBeNull()
-    await continuePastEmail()
-    await waitFor(() => expect(container.querySelector('input[type="password"]')).not.toBeNull())
-    expect(screen.queryByText(/already has an owner/i)).toBeNull()
+    expect(container.querySelector('input[type="password"]')).not.toBeNull()
+    expect(createAccountButton()).toBeInTheDocument()
+    // No email-first stage: nobody has an account to look up yet.
+    expect(screen.queryByRole('button', { name: /continue/i })).toBeNull()
+  })
+
+  it('creates the account from the name, email and password given', async () => {
+    const { authClient } = await import('@/lib/client/auth-client')
+    vi.mocked(authClient.signUp.email).mockResolvedValueOnce({ data: {}, error: null } as never)
+    renderStep(selfHosted())
+
+    fillAdminForm({
+      name: '  Alex Owner ',
+      email: ' alex@acme.example ',
+      password: 'correct-horse',
+    })
+    fireEvent.click(createAccountButton())
+
+    await waitFor(() =>
+      expect(authClient.signUp.email).toHaveBeenCalledWith({
+        name: 'Alex Owner',
+        email: 'alex@acme.example',
+        password: 'correct-horse',
+      })
+    )
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith({ to: '/onboarding' }))
+    expect(track).toHaveBeenCalledWith('onboarding_account_created')
+  })
+
+  // The name is what customers see on replies and updates; an account created
+  // without one shows the address's local part instead.
+  it('asks for a name before creating the account', async () => {
+    const { authClient } = await import('@/lib/client/auth-client')
+    renderStep(selfHosted())
+
+    fillAdminForm({ name: ' ', email: 'alex@acme.example', password: 'correct-horse' })
+    fireEvent.click(createAccountButton())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/your name/i)
+    expect(screen.getByLabelText(/^name$/i)).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByLabelText(/^name$/i)).toHaveFocus()
+    expect(authClient.signUp.email).not.toHaveBeenCalled()
+  })
+
+  // Each problem sits under the field it is about, all of them at once, so a
+  // beginner never has to match a red box to a red field three rows away.
+  it('shows every problem under its own field at once', async () => {
+    const { authClient } = await import('@/lib/client/auth-client')
+    const { container } = renderStep(selfHosted())
+
+    fireEvent.click(createAccountButton())
+
+    const alerts = await screen.findAllByRole('alert')
+    expect(alerts).toHaveLength(3)
+    for (const [field, text] of [
+      ['name', /your name/i],
+      ['email', /valid email/i],
+      ['password', /at least 8 characters/i],
+    ] as const) {
+      const input = screen.getByLabelText(new RegExp(`^${field}$`, 'i'))
+      expect(input).toHaveAttribute('aria-invalid', 'true')
+      const error = alerts.find((alert) => text.test(alert.textContent ?? ''))!
+      expect(error).toBeDefined()
+      expect(input.getAttribute('aria-describedby')?.split(' ')).toContain(error.id)
+      // Directly under its own field, not in a shared slot by the button.
+      expect(error.parentElement).toBe(input.closest('[data-field]'))
+    }
+    // The first field to fix gets focus.
+    expect(screen.getByLabelText(/^name$/i)).toHaveFocus()
+    // No banner: that is for what the server says.
+    expect(container.querySelector('[data-banner]')).toBeNull()
+    expect(authClient.signUp.email).not.toHaveBeenCalled()
+  })
+
+  it('says the password rule once: the error takes the hint’s place', async () => {
+    renderStep(selfHosted())
+    const password = screen.getByLabelText(/^password$/i)
+    expect(screen.getByText('At least 8 characters.')).toBeInTheDocument()
+    expect(password.getAttribute('aria-describedby')).toBe('admin-password-hint')
+
+    fillAdminForm({ name: 'Alex', email: 'alex@acme.example', password: 'short' })
+    fireEvent.click(createAccountButton())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/at least 8 characters/i)
+    expect(screen.queryByText('At least 8 characters.')).toBeNull()
+    expect(password.getAttribute('aria-describedby')).toBe('admin-password-error')
+  })
+
+  it('clears a field’s problem once it is edited', async () => {
+    renderStep(selfHosted())
+    fireEvent.click(createAccountButton())
+    expect(await screen.findAllByRole('alert')).toHaveLength(3)
+
+    fillAdminForm({ name: 'Alex' })
+
+    expect(screen.getAllByRole('alert')).toHaveLength(2)
+    expect(screen.getByLabelText(/^name$/i)).not.toHaveAttribute('aria-invalid')
+  })
+
+  it('refuses a short password before calling the server', async () => {
+    const { authClient } = await import('@/lib/client/auth-client')
+    renderStep(selfHosted())
+
+    fillAdminForm({ name: 'Alex', email: 'alex@acme.example', password: 'short' })
+    fireEvent.click(createAccountButton())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/at least 8 characters/i)
+    expect(authClient.signUp.email).not.toHaveBeenCalled()
+  })
+
+  it('marks Create account busy while the account is created', async () => {
+    const { authClient } = await import('@/lib/client/auth-client')
+    vi.mocked(authClient.signUp.email).mockReturnValueOnce(new Promise(() => {}) as never)
+    renderStep(selfHosted())
+
+    fillAdminForm({ name: 'Alex', email: 'alex@acme.example', password: 'correct-horse' })
+    fireEvent.click(createAccountButton())
+
+    const busy = await screen.findByRole('button', { name: /creating account/i })
+    expect(busy).toBeDisabled()
+    expect(busy).toHaveAttribute('aria-busy', 'true')
+  })
+
+  it('shows the server refusal and stays on the form', async () => {
+    const { authClient } = await import('@/lib/client/auth-client')
+    vi.mocked(authClient.signUp.email).mockResolvedValueOnce({
+      data: null,
+      error: { message: 'User already exists. Use another email.' },
+    } as never)
+    renderStep(selfHosted())
+
+    fillAdminForm({ name: 'Alex', email: 'alex@acme.example', password: 'correct-horse' })
+    fireEvent.click(createAccountButton())
+
+    const refusal = await screen.findByRole('alert')
+    expect(refusal).toHaveTextContent(/already exists/i)
+    // What the server says is not about one field, so it keeps the banner.
+    expect(refusal.closest('[data-banner]')).not.toBeNull()
+    expect(navigate).not.toHaveBeenCalled()
+    expect(createAccountButton()).not.toBeDisabled()
+  })
+
+  it('lets the password be shown while it is typed', () => {
+    renderStep(selfHosted())
+    const password = screen.getByLabelText(/^password$/i)
+
+    expect(password).toHaveAttribute('type', 'password')
+    fireEvent.click(screen.getByRole('button', { name: /show password/i }))
+    expect(password).toHaveAttribute('type', 'text')
+    fireEvent.click(screen.getByRole('button', { name: /hide password/i }))
+    expect(password).toHaveAttribute('type', 'password')
+  })
+
+  it('offers to sign in when the address already has an account', async () => {
+    const { authClient } = await import('@/lib/client/auth-client')
+    vi.mocked(authClient.signUp.email).mockResolvedValueOnce({
+      data: null,
+      error: { code: 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL', message: 'User already exists.' },
+    } as never)
+    renderStep(selfHosted())
+
+    fillAdminForm({ name: 'Alex', email: 'alex@acme.example', password: 'correct-horse' })
+    fireEvent.click(createAccountButton())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/already an account/i)
+    fireEvent.click(screen.getByRole('button', { name: /sign in instead/i }))
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Welcome back')
+  })
+
+  // The fixture carries the shipped default, which lists Google and GitHub as
+  // on. Before setup nothing has credentials for them, so a tile here is a
+  // button that fails, and the first admin is always created with an email.
+  it('offers no social sign-up, even when the config turns providers on', () => {
+    renderStep(selfHosted())
+
+    expect(screen.queryByRole('button', { name: /google/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /github/i })).toBeNull()
+    expect(screen.getByLabelText(/^email$/i)).toBeInTheDocument()
+  })
+
+  // Nobody has an account here yet, so there is nobody to sign back in.
+  it('offers no sign-in before anyone has an account', () => {
+    renderStep(selfHosted())
+
+    expect(screen.queryByText(/already started setting up/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: /^sign in$/i })).toBeNull()
+  })
+
+  // On a workspace stamped complete, creating an account does not claim it,
+  // so someone who made theirs and was signed out still needs a way back.
+  it('lets someone who already started setup on a stamped workspace sign back in', () => {
+    const props = preStamped()
+    props.authConfig.signInOAuth = { password: true, github: true }
+    renderStep(props)
+
+    fireEvent.click(screen.getByRole('button', { name: /^sign in$/i }))
+
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Welcome back')
+    expect(screen.getByRole('button', { name: /sign in with github/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^create account$/i })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /create a new account instead/i }))
+    expect(screen.queryByRole('button', { name: /sign in with github/i })).toBeNull()
+    expect(screen.getByRole('button', { name: /^create account$/i })).toBeInTheDocument()
   })
 
   it('drops the password form when an unclaimed workspace has password off', () => {
@@ -356,9 +613,7 @@ describe('account step — a self-hosted first user', () => {
     expect(screen.getByLabelText(/^email$/i)).toBeInTheDocument()
   })
 
-  // Nobody has an account on a workspace nobody has claimed, so offering to
-  // sign in to one is a lie about what the button does.
-  it('offers to sign UP, not in, on a workspace nobody has claimed', () => {
+  it('offers no social or OIDC sign-up when an unclaimed workspace has password off', () => {
     const props = selfHosted()
     props.authConfig.oauth = {
       ...DEFAULT_AUTH_CONFIG.oauth,
@@ -366,10 +621,25 @@ describe('account step — a self-hosted first user', () => {
       magicLink: true,
       google: true,
     }
+    props.authConfig.oidcProviders = [{ id: 'okta', name: 'Okta', logoUrl: null }]
+    renderStep(props)
+
+    expect(screen.queryByRole('button', { name: /google/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /github/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /okta/i })).toBeNull()
+    expect(screen.getByLabelText(/^email$/i)).toBeInTheDocument()
+  })
+
+  // With neither email method the configured providers are the only way to
+  // claim the workspace, so they stay.
+  it('keeps the providers when the workspace has no email method at all', () => {
+    const props = selfHosted()
+    props.authConfig.found = true
+    props.authConfig.oauth = { password: false, magicLink: false, google: true }
+    props.authConfig.registeredAuthProviders = ['google']
     renderStep(props)
 
     expect(screen.getByRole('button', { name: /sign up with google/i })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /sign in with google/i })).toBeNull()
   })
 
   // `openSignup` governs who may open a PORTAL account. Applied to the first
@@ -387,6 +657,95 @@ describe('account step — a self-hosted first user', () => {
       expect(screen.getByRole('button', { name: /continue with email/i })).toBeInTheDocument()
     )
     expect(screen.queryByText(/sign-ups are off/i)).toBeNull()
+  })
+})
+
+// A translated visitor sees each screen in one language: every string the
+// first-user form and its way back in render is in the catalogue.
+describe('account step: in a translated locale', () => {
+  it('renders the first-user screen and the way back in from the German catalogue', async () => {
+    const de = await loadMessages('de')
+    const props = preStamped()
+    // Passwords off, so the first-user screen is the emailed-link one.
+    props.authConfig.oauth = { ...DEFAULT_AUTH_CONFIG.oauth, password: false, magicLink: true }
+    props.authConfig.signInOAuth = { password: true, github: true }
+    rtlRender(
+      <IntlProvider locale="de" defaultLocale="en" messages={de} onError={() => {}}>
+        <AccountStep {...props} />
+      </IntlProvider>
+    )
+
+    expect(
+      screen.getByText('Erstelle dein Admin-Konto, um diesen Workspace einzurichten.')
+    ).toBeInTheDocument()
+    expect(screen.getByText(/Schon mit der Einrichtung begonnen\?/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Anmelden' }))
+
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Willkommen zurück')
+    expect(
+      screen.getByText(
+        'Melde dich mit dem Konto an, das du hier erstellt hast, um die Einrichtung abzuschließen.'
+      )
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Stattdessen ein neues Konto erstellen' })
+    ).toBeInTheDocument()
+  })
+})
+
+// The window this closes: the first person created an account and has not
+// finished setup. Anyone who opens the address now, the owner after a sign-out
+// included, gets sign-in, not a second "Create account".
+describe('account step — an install whose first account has claimed setup', () => {
+  it('asks for sign-in to finish setting up, and offers no new account', async () => {
+    const { container } = renderStep(selfHostedClaimed())
+
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(
+      'Sign in to finish setting up'
+    )
+    expect(screen.queryByText(/create your admin account/i)).toBeNull()
+    expect(screen.queryByText(/already has an owner/i)).toBeNull()
+    // Sign-in mode: the providers this install can sign an existing account
+    // in with, and a password stage rather than account creation.
+    expect(screen.getByRole('button', { name: /sign in with github/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /sign up with/i })).toBeNull()
+    await continuePastEmail('owner@acme.example')
+    await waitFor(() => expect(container.querySelector('input[type="password"]')).not.toBeNull())
+    expect(screen.queryByRole('button', { name: /^create account$/i })).toBeNull()
+  })
+
+  it('tells anyone else to wait for an invitation, without naming the owner', () => {
+    const { container } = renderStep(selfHostedClaimed())
+
+    expect(screen.getByText(/ask them to invite you/i)).toBeInTheDocument()
+    // Nothing to request access to yet: every page but this one returns here.
+    expect(screen.queryByRole('link', { name: /request access/i })).toBeNull()
+    expect(container.innerHTML).not.toContain('acme.example')
+    expect(container.textContent).not.toMatch(/\*{2,}\s*@/)
+  })
+
+  // A first account nobody here can sign in with (a test, a stray visitor, a
+  // lost password) leaves the install stuck, and the way out is the server's.
+  it('says the server operator can restart setup, without naming anyone', () => {
+    const { container } = renderStep(selfHostedClaimed())
+
+    expect(screen.getByText(/the server's operator can restart setup/i)).toBeInTheDocument()
+    expect(container.innerHTML).not.toContain('acme.example')
+  })
+
+  it('says nothing about restarting setup before anyone has started it', () => {
+    renderStep(selfHosted())
+
+    expect(screen.queryByText(/restart setup/i)).toBeNull()
+  })
+
+  it('records the owner coming back as a sign-in', async () => {
+    track.mockClear()
+    renderStep(selfHostedClaimed())
+    act(() => postAuthSuccess())
+    await waitFor(() => expect(track).toHaveBeenCalledWith('onboarding_signed_in'))
+    expect(track).not.toHaveBeenCalledWith('onboarding_account_created')
   })
 })
 
@@ -425,6 +784,17 @@ describe('account step — after a sign-in completes', () => {
     renderStep(selfHosted())
     act(() => postAuthSuccess())
     await waitFor(() => expect(track).toHaveBeenCalledWith('onboarding_account_created'))
+  })
+
+  // Someone who already started setup signs back in from the first-user
+  // screen. No account is created, so the funnel must not count one.
+  it('records a returning sign-in from the first-user screen as a sign-in', async () => {
+    track.mockClear()
+    renderStep(preStamped())
+    fireEvent.click(screen.getByRole('button', { name: /^sign in$/i }))
+    act(() => postAuthSuccess())
+    await waitFor(() => expect(track).toHaveBeenCalledWith('onboarding_signed_in'))
+    expect(track).not.toHaveBeenCalledWith('onboarding_account_created')
   })
 
   it('records an owner signing in to a claimed workspace as a sign-in', async () => {

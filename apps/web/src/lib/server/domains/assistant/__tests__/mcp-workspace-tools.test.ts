@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { parseWithStandardSchema, type SchemaInput } from '@tanstack/ai'
 import { generateId } from '@quackback/ids'
 import { API_KEY_SCOPES } from '@/lib/shared/api-key-scopes'
 import { openWorkspaceMcp } from '../mcp-workspace-tools'
@@ -47,5 +48,24 @@ describe('workspace MCP tools', () => {
     expect(opened.specs.find((spec) => spec.name === 'delete_post')?.approvalPolicy).toBe(
       'approval'
     )
+  })
+  it('keeps area and destination enums in the model-facing tool schemas', async () => {
+    const opened = await openWorkspaceMcp({
+      principalId: generateId('principal'),
+      name: 'Acme',
+      role: 'admin',
+      authMethod: 'oauth',
+      scopes: [...API_KEY_SCOPES],
+    })
+    close = opened.close
+    const schema = (name: string) =>
+      opened.specs.find((spec) => spec.name === name)!.definition.inputSchema as SchemaInput
+    const validate = (input: SchemaInput, value: unknown) => () =>
+      parseWithStandardSchema(input, value)
+    expect(opened.specs.map((spec) => spec.name)).not.toContain('propose_settings_change')
+    expect(validate(schema('get_settings'), { area: 'messenger' })).not.toThrow()
+    expect(validate(schema('get_settings'), { area: 'billing' })).toThrow()
+    expect(validate(schema('navigate_workspace'), { destination: 'members' })).not.toThrow()
+    expect(validate(schema('navigate_workspace'), { destination: 'invented' })).toThrow()
   })
 })

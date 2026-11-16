@@ -22,9 +22,10 @@ const mockUpdatesInsertValues = vi.fn()
 const mockReconcileComponentStatus = vi.fn()
 const mockDispatchStatusEvent = vi.fn().mockResolvedValue(undefined)
 
-vi.mock('@/lib/server/db', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/lib/server/db')>()),
-  db: {
+vi.mock('@/lib/server/db', async (importOriginal) => {
+  // Lifecycle writes run in a transaction; the mock hands the same stubs in
+  // as the transaction handle.
+  const db = {
     query: {
       statusIncidents: { findFirst: (...args: unknown[]) => mockIncidentFindFirst(...args) },
       statusIncidentComponents: {
@@ -34,7 +35,13 @@ vi.mock('@/lib/server/db', async (importOriginal) => ({
     update: () => ({
       set: (arg: unknown) => {
         mockIncidentUpdateSet(arg)
-        return { where: () => Promise.resolve() }
+        // The start/complete claim reads back the row it matched.
+        return {
+          where: () =>
+            Object.assign(Promise.resolve(), {
+              returning: async () => [{ ...(await mockIncidentFindFirst()), ...(arg as object) }],
+            }),
+        }
       },
     }),
     insert: () => ({
@@ -43,13 +50,27 @@ vi.mock('@/lib/server/db', async (importOriginal) => ({
         return Promise.resolve()
       },
     }),
-  },
-}))
+    // Settling started_at builds subqueries; the stubbed updates ignore them.
+    select: () => ({ from: () => ({ where: () => ({}) }) }),
+    // A distinct handle, so a test can tell the transaction from the connection.
+    transaction: (fn: (tx: unknown) => unknown) =>
+      fn(Object.assign(Object.create(db), { isTransaction: true })),
+  }
+  return { ...(await importOriginal<typeof import('@/lib/server/db')>()), db }
+})
 
 vi.mock('../status.components', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../status.components')>()),
   reconcileComponentStatus: (...args: unknown[]) => mockReconcileComponentStatus(...args),
-  dispatchStatusEvent: (...args: unknown[]) => mockDispatchStatusEvent(...args),
+  // The batch form recomputes each component in id order through the single one.
+  reconcileComponentStatuses: async (ids: Iterable<string>, ...rest: unknown[]) => {
+    for (const id of [...new Set(ids)].sort()) await mockReconcileComponentStatus(id, ...rest)
+  },
+  writeStatusEvent: (...args: unknown[]) => {
+    // Status events are written on the change's own transaction.
+    expect((args[3] as { isTransaction?: boolean }).isTransaction).toBe(true)
+    return mockDispatchStatusEvent(...args)
+  },
 }))
 
 vi.mock('@/lib/server/events/scheduler', () => ({
@@ -125,12 +146,14 @@ describe('handleMaintenanceStart — stale reschedule boundary', () => {
     expect(mockReconcileComponentStatus).toHaveBeenCalledWith(
       COMPONENT_ID,
       'maintenance',
-      INCIDENT_B
+      INCIDENT_B,
+      expect.anything()
     )
     expect(mockDispatchStatusEvent).toHaveBeenCalledWith(
       'status.maintenance_started',
       expect.anything(),
-      expect.objectContaining({ incidentId: INCIDENT_B })
+      expect.objectContaining({ incidentId: INCIDENT_B }),
+      expect.anything()
     )
   })
 

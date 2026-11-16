@@ -302,6 +302,24 @@ describe('the real corpus', () => {
     // 0291 rewrites only feature_flags blobs that lack the `feedback` key and
     // its last UPDATE adds that key to every such blob, so a second run
     // selects no rows and skips the cache DELETE.
+    // 0294 widens the parent check once, guarded by its existing definition,
+    // and adds the internal-only check once, guarded by its exact name. Its
+    // migration regression also verifies existing parent rows and constraint OIDs.
+    // 0295 marks a settings row only while its metadata lacks brandingLookup,
+    // so a second run writes zero rows.
+    // 0298 moves a maintenance started_at only while it is earlier than the
+    // window's first in_progress or verifying update (or, for a window still
+    // scheduled or with neither, its scheduled start), never past
+    // resolved_at, and leaves the two equal, so a second run writes zero
+    // rows. The app settles every window it writes the same way
+    // (settleMaintenanceStart), so a later replay writes zero rows too.
+    // 0302 widens the pending-action parent check to allow no parent, once,
+    // guarded by its existing definition already reading `<= 1`.
+    // 0305 gives pending sending domains with no check window one; it fills
+    // only NULL windows and leaves none, so a second run writes zero rows.
+    // 0308 archives only unarchived approval bells and strips approval.* only
+    // from webhooks and apps that still hold one; every row it updates leaves
+    // its predicate, so a second run writes zero rows.
     const vouching = files.filter(
       (f) => assessReplaySafety(f, readFileSync(join(MIGRATIONS_DIR, f), 'utf8')).vouched.length > 0
     )
@@ -324,6 +342,13 @@ describe('the real corpus', () => {
       '0285_integration_link_scope.sql',
       '0288_kb_translations_dutch_search.sql',
       '0291_legacy_surface_switches.sql',
+      '0294_workspace_copilot.sql',
+      '0295_website_branding_existing_workspaces.sql',
+      '0296_validate_workspace_copilot_checks.sql',
+      '0298_status_maintenance_started_at.sql',
+      '0302_approvals_foundation.sql',
+      '0305_sending_domain_setup.sql',
+      '0308_remove_approvals_leftovers.sql',
     ])
   })
 

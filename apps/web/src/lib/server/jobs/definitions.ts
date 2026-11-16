@@ -52,7 +52,11 @@ export interface JobDefinition {
    * may take".
    */
   leaseMs?: number
-  /** Delay before the first retry; doubled per attempt. Ignored when maxAttempts is 1. */
+  /**
+   * Delay before the first retry; doubled per attempt, plus up to half again at
+   * random so jobs that failed together do not retry together. Ignored when
+   * maxAttempts is 1.
+   */
   retryBackoffMs?: number
   /**
    * Per-attempt backoff, when a doubling curve is not what the queue had.
@@ -73,6 +77,16 @@ export interface JobDefinition {
    * order (see runner.ts), so a handler must not depend on it for correctness.
    */
   concurrency?: number
+  /**
+   * How many jobs from this queue may run at once across every workspace loop
+   * in this process. Unset means no cap beyond `concurrency` per loop.
+   *
+   * `concurrency` binds per workspace, so a pooled process can run
+   * `concurrency` times the fleet. A queue whose work is heavy on the shared
+   * database sets this so the fleet's runs cannot all land at once. Jobs over
+   * the cap stay `pending`, unclaimed, until a slot frees.
+   */
+  fleetConcurrency?: number
   /** How long succeeded rows are kept. Defaults to the process-wide setting. */
   retentionMs?: number
   /**
@@ -270,6 +284,16 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
       import('@/lib/server/email/email-log.retention').then((m) => m.runEmailLogRetention),
   },
   {
+    // The welcome and day-two setup emails, queued when a new workspace's
+    // owner first lands. Each decides at run time whether it is still due.
+    name: 'onboarding-email',
+    maxAttempts: 3,
+    handler: () =>
+      import('@/lib/server/domains/onboarding/onboarding-emails').then(
+        (m) => m.runOnboardingEmailJob
+      ),
+  },
+  {
     name: 'spam-retention',
     cron: '0 5 * * *',
     maxAttempts: 3,
@@ -298,9 +322,54 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
       ),
   },
   {
+    // The automatic check on sending domains being set up, for 72 hours after
+    // each is added or restarted, so a domain goes live within minutes of its
+    // records being published. Returns after one query in a workspace with
+    // nothing pending, which is nearly all of them. Offset off the hour's
+    // first minute, where the hourly and daily passes start, and capped across
+    // the fleet because each pending domain costs DNS lookups and sometimes a
+    // provider call. One attempt: the next tick is the retry.
+    name: 'sending-domain-watch',
+    cron: '7/10 * * * *',
+    fleetConcurrency: 4,
+    maxAttempts: 1,
+    handler: () =>
+      import('@/lib/server/domains/channel-accounts/sending-domain-watch-queue').then(
+        (m) => m.runSendingDomainWatch
+      ),
+  },
+  {
+    // The workspace's mail provider tenant, when the operator isolates sending
+    // reputation per workspace. Hourly, but each tick returns after one row
+    // read unless the workspace has never been reconciled, is not ready, or
+    // was last reconciled a day ago; adding, verifying or removing a sending
+    // domain enqueues one on demand. Capped across the fleet because each run
+    // makes several provider management calls.
+    name: 'ses-tenant-reconcile',
+    cron: '41 * * * *',
+    cronEnabled: () =>
+      import('@/lib/server/domains/channel-accounts/ses-tenant-queue').then((m) =>
+        m.sesTenantReconcileEnabled()
+      ),
+    fleetConcurrency: 2,
+    maxAttempts: 3,
+    retryBackoffMs: 60_000,
+    handler: () =>
+      import('@/lib/server/domains/channel-accounts/ses-tenant-queue').then(
+        (m) => m.runSesTenantReconcile
+      ),
+  },
+  {
+    // Whole-table aggregates in every workspace's database, all against the
+    // one shared server, so the fleet runs a few at a time rather than all of
+    // them inside the hour's first minute.
     name: 'analytics',
     cron: '0 * * * *',
+    fleetConcurrency: 4,
     maxAttempts: 3,
+    // Past a database restart's recovery, not inside it. The next slot is an
+    // hour away, so a late retry costs nothing.
+    retryBackoffMs: 60_000,
     handler: () =>
       import('@/lib/server/domains/analytics/analytics-queue').then((m) => m.runAnalyticsRefresh),
   },
@@ -339,6 +408,42 @@ export const JOB_DEFINITIONS: readonly JobDefinition[] = [
     concurrency: 1,
     handler: () =>
       import('@/lib/server/integrations/sync/sweep-queue').then((m) => m.sweepIntegrationSync),
+    // Only a running sync can need recovering. Most workspaces have none, and
+    // without the gate each of them ran this job every minute to find so.
+    cronEnabled: () =>
+      import('@/lib/server/integrations/sync/sweep-queue').then((m) =>
+        m.isIntegrationSyncSweepDue()
+      ),
+  },
+  {
+    name: 'integration-sync-retention',
+    cron: '45 2 * * *',
+    concurrency: 1,
+    // Retried like the other retention schedules: its statements are safe to
+    // repeat, and one attempt would leave a transient failure for a day.
+    maxAttempts: 3,
+    handler: () =>
+      import('@/lib/server/integrations/sync/retention-queue').then(
+        (m) => m.pruneIntegrationSyncHistory
+      ),
+  },
+  {
+    // Jira expires a status-sync webhook 30 days after it was last extended.
+    // A per-minute cron gated on a refresh being due, the same shape as
+    // snooze-sweep: the gate is shut for every workspace whose webhook is not
+    // inside its refresh window, so nothing is enqueued and an idle workspace is
+    // woken only at the instant its refresh falls due (see deadlines.ts).
+    name: 'jira-webhook-refresh',
+    cron: '* * * * *',
+    maxAttempts: 3,
+    handler: () =>
+      import('@/lib/server/integrations/jira-webhook-refresh-queue').then(
+        (m) => m.runJiraWebhookRefresh
+      ),
+    cronEnabled: () =>
+      import('@/lib/server/integrations/jira-webhook-refresh-queue').then((m) =>
+        m.isJiraWebhookRefreshDue()
+      ),
   },
   {
     // Drains one job-owned outbox row. The row is written in emit()'s
@@ -599,6 +704,11 @@ export function concurrencyFor(def: JobDefinition): number {
   return def.concurrency ?? DEFAULT_CONCURRENCY
 }
 
+/** The process-wide cap for a queue; unlimited when the definition sets none. */
+export function fleetConcurrencyFor(def: JobDefinition): number {
+  return def.fleetConcurrency ?? Number.POSITIVE_INFINITY
+}
+
 /**
  * Backoff for the next attempt.
  *
@@ -607,10 +717,18 @@ export function concurrencyFor(def: JobDefinition): number {
  * definition may supply its own curve instead — `events` does, because its
  * BullMQ `backoffStrategy` was not geometric.
  */
-export function retryBackoffMs(def: JobDefinition, attemptsMade: number): number {
+export function retryBackoffMs(
+  def: JobDefinition,
+  attemptsMade: number,
+  random: () => number = Math.random
+): number {
   if (def.backoffMs) return def.backoffMs(attemptsMade)
   const base = def.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS
-  return base * Math.pow(2, Math.max(0, attemptsMade - 1))
+  const delay = base * Math.pow(2, Math.max(0, attemptsMade - 1))
+  // Jobs that fail together (a database restart fails every running job at
+  // once) would otherwise retry together and meet the same overload. Each
+  // retry lands somewhere in [delay, 1.5 x delay): never sooner than the curve.
+  return Math.floor(delay * (1 + random() / 2))
 }
 
 /**

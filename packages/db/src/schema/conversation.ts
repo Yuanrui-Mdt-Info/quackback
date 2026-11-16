@@ -15,6 +15,7 @@ import {
 import { relations, sql } from 'drizzle-orm'
 import { typeIdWithDefault, typeIdColumn, typeIdColumnNullable } from '@quackback/ids/drizzle'
 import { principal } from './auth'
+import { workspaceAssistantThreads } from './workspace-assistant'
 import { teams } from './teams'
 import { channelAccounts } from './channel-accounts'
 // conversation <-> tickets is a mutual import cycle (tickets FKs conversations,
@@ -202,6 +203,13 @@ export const conversations = pgTable(
     // FILING instant, which is the clock the retention window is measured from;
     // restore-from-spam clears end_reason, so a released thread leaves this
     // index rather than lingering in it (migration 0252).
+    // Workspace search by subject (0309).
+    index('conversations_subject_search_idx').using(
+      'gin',
+      sql`to_tsvector('english', coalesce(${table.subject}, ''))`
+    ),
+    // Workspace search: a subject containing the query anywhere inside (0309).
+    index('conversations_subject_trgm_idx').using('gin', table.subject.op('gin_trgm_ops')),
     index('conversations_spam_resolved_at_idx')
       .on(table.resolvedAt)
       .where(sql`status = 'closed' AND end_reason = 'spam'`),
@@ -262,6 +270,9 @@ export const conversationMessages = pgTable(
     // below guarantees precisely one is set.
     conversationId: typeIdColumnNullable('conversation')('conversation_id'),
     ticketId: typeIdColumnNullable('ticket')('ticket_id'),
+    // Retired Home chat transcripts only. Nothing writes it now; existing rows
+    // stay and remain hidden from every public read.
+    workspaceThreadKey: text('workspace_thread_key'),
     // Nullable: system events (e.g. assignment notices) have no human author.
     principalId: typeIdColumnNullable('principal')('principal_id'),
     // Explicit sender side for rendering + authorization, independent of the
@@ -311,8 +322,27 @@ export const conversationMessages = pgTable(
     // Exactly one parent: a message belongs to a conversation XOR a ticket.
     check(
       'conversation_messages_parent_check',
-      sql`num_nonnulls(${table.conversationId}, ${table.ticketId}) = 1`
+      sql`num_nonnulls(${table.conversationId}, ${table.ticketId}, ${table.workspaceThreadKey}) = 1`
     ),
+    foreignKey({
+      name: 'conversation_messages_workspace_thread_key_fkey',
+      columns: [table.workspaceThreadKey],
+      foreignColumns: [workspaceAssistantThreads.key],
+    }).onDelete('cascade'),
+    check(
+      'conversation_messages_workspace_internal_check',
+      sql`${table.workspaceThreadKey} IS NULL OR ${table.isInternal} = true`
+    ),
+    index('conversation_messages_workspace_created_idx')
+      .on(table.workspaceThreadKey, table.createdAt, table.id)
+      .where(sql`${table.workspaceThreadKey} IS NOT NULL`),
+    uniqueIndex('conversation_messages_workspace_run_sender_idx')
+      .on(
+        table.workspaceThreadKey,
+        sql`(${table.metadata}->'workspaceTurn'->>'runId')`,
+        table.senderType
+      )
+      .where(sql`${table.workspaceThreadKey} IS NOT NULL`),
     foreignKey({
       name: 'conversation_messages_principal_id_fkey',
       columns: [table.principalId],

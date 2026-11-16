@@ -2,6 +2,7 @@ import {
   db,
   eq,
   settings,
+  sql,
   ssoVerifiedDomain,
   type Database,
   type Transaction,
@@ -69,10 +70,13 @@ import {
   readSettingsRow,
   type SettingsFreshness,
   type SettingsRecord,
+  type SettingsWriteOptions,
 } from './settings.helpers'
 import { withCurrentStorageReadTokens } from '@/lib/server/content/storage-read-urls'
 
 import { logSettingsReadError } from './settings-log'
+import { getTierLimits } from './tier-limits.service'
+import { TierLimitError } from '@/lib/server/errors/tier-limit-error'
 
 const log = logger.child({ component: 'settings' })
 
@@ -814,21 +818,50 @@ export async function enableHelpCenterLocale(input: {
       'Enabling a locale requires a homepage title'
     )
   }
-  const current = await getHelpCenterConfig('fresh')
-  if (input.locale === current.locales.default) {
-    throw new ValidationError('HC_LOCALE_IS_DEFAULT', 'The default locale is always enabled')
-  }
-  const additional = current.locales.additional.includes(input.locale)
-    ? current.locales.additional
-    : [...current.locales.additional, input.locale]
-  const updated = await updateHelpCenterConfig({
-    locales: {
-      ...current.locales,
-      additional,
-      chrome: { ...current.locales.chrome, [input.locale]: input.chrome },
-    },
+  const limit = (await getTierLimits()).maxHelpCenterLocales
+  // The lock is held to the end of the transaction, so two concurrent enables
+  // read the same language count only one at a time and cannot both take the
+  // last slot. The read and the write both run on the transaction.
+  const locales = await db.transaction(async (tx) => {
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtext('quackback:help_center_locale_slot'))`
+    )
+    const org = await requireSettings(tx)
+    const existing = parseJsonConfig(org.helpCenterConfig, DEFAULT_HELP_CENTER_CONFIG)
+    if (input.locale === existing.locales.default) {
+      throw new ValidationError('HC_LOCALE_IS_DEFAULT', 'The default locale is always enabled')
+    }
+    const alreadyEnabled = existing.locales.additional.includes(input.locale)
+    if (!alreadyEnabled && limit !== null) {
+      // The default language counts toward the plan's language cap.
+      const enabled = 1 + existing.locales.additional.length
+      if (enabled >= limit) {
+        throw new TierLimitError({
+          limit: 'maxHelpCenterLocales',
+          current: enabled,
+          max: limit,
+          message: `You've reached your plan's help center languages limit (${limit}). Upgrade to add more.`,
+        })
+      }
+    }
+    const additional = alreadyEnabled
+      ? existing.locales.additional
+      : [...existing.locales.additional, input.locale]
+    const next = deepMerge(existing, {
+      locales: {
+        ...existing.locales,
+        additional,
+        chrome: { ...existing.locales.chrome, [input.locale]: input.chrome },
+      },
+    } as Partial<HelpCenterConfig>)
+    await tx
+      .update(settings)
+      .set({ helpCenterConfig: JSON.stringify(next) })
+      .where(eq(settings.id, org.id))
+    return next.locales
   })
-  return updated.locales
+  await invalidateSettingsCache()
+  return locales
 }
 
 /** Disabling a locale keeps its translation rows (re-enabling picks them back up). */
@@ -1114,22 +1147,35 @@ export async function isCopilotCapabilityEnabled(
 /**
  * Update feature flags (partial update, merges with existing)
  */
-export async function updateFeatureFlags(input: Partial<FeatureFlags>): Promise<FeatureFlags> {
+export async function updateFeatureFlags(
+  input: Partial<FeatureFlags>,
+  options: SettingsWriteOptions = {}
+): Promise<FeatureFlags> {
   // The patch rewrites columns it was computed from (flags, metadata, widget
   // and portal config), so the row is read under its lock: a concurrent write
   // to any of them is read here rather than overwritten.
-  const flags = await db.transaction(async (tx) => {
+  const write = async (tx: Database | Transaction) => {
     const [org] = await tx.select().from(settings).limit(1).for('update')
     if (!org) throw new NotFoundError('SETTINGS_NOT_FOUND', 'Settings not found')
     const { updated, patch } = featureFlagsWrite(org, input)
     await tx.update(settings).set(patch).where(eq(settings.id, org.id))
     return updated
-  })
-  await invalidateSettingsCache()
+  }
+  const flags = options.executor ? await write(options.executor) : await db.transaction(write)
+  if (!options.executor) await invalidateSettingsCache()
   return flags
 }
 
-function featureFlagsWrite(org: SettingsRecord, input: Partial<FeatureFlags>) {
+/**
+ * The settings columns one flag change writes. Exported so setup applies its
+ * goals through the same side effects as Settings > General: Status ON
+ * publishes the page, Support ON opens the Messenger and portal surfaces,
+ * Help center ON adds the Messenger help tab.
+ */
+export function featureFlagsWrite(
+  org: Pick<SettingsRecord, 'id' | 'featureFlags' | 'metadata' | 'widgetConfig' | 'portalConfig'>,
+  input: Partial<FeatureFlags>
+) {
   // Unknown stored keys (retired Labs flags) drop here; the next write
   // persists a clean shape.
   const current = resolveFeatureFlags(org.featureFlags)

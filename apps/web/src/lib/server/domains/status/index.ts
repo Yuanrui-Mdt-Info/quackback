@@ -76,7 +76,7 @@ export {
   deleteStatusComponent,
   reorderStatusComponents,
   setComponentStatus,
-  dispatchStatusEvent,
+  writeStatusEvent,
   type StatusEventType,
 } from './status.components'
 
@@ -87,6 +87,7 @@ export {
   deleteIncident,
   clearStatusHistory,
   getStatusIncidentById,
+  findStatusIncidentById,
   listStatusIncidents,
   countStatusIncidentsSince,
   notifyStatusIncidentPublished,
@@ -113,6 +114,8 @@ export {
   getPublicStatusIncident,
   getUptimeSeries,
   listIncidentHistory,
+  listStatusFeedItems,
+  statusIncidentLastActivityAt,
 } from './status.public'
 
 export {
@@ -124,8 +127,10 @@ export {
   getStatusSubscriptionCounts,
   countStatusSubscriptionsSince,
   getActiveSubscribersForComponents,
+  getActiveSubscriptionsForComponents,
   countActiveSubscribersForComponents,
   addStatusSubscriberByEmail,
   importStatusSubscribersFromEmails,
+  removeStatusSubscriberByAdmin,
   listAllStatusSubscribersForExport,
 } from './status.subscription'

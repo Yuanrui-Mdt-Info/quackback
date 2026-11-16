@@ -4,34 +4,46 @@ import type { ApiKey, ApiKeyScope } from '@/lib/server/domains/api-keys'
 import type { PrincipalId, ApiKeyId } from '@quackback/ids'
 import { UnauthorizedError, ForbiddenError } from '@/lib/shared/errors'
 import { PERMISSIONS } from '@/lib/shared/permissions'
+import type { Role } from '@/lib/shared/roles'
+import { resolveActorPermissions } from '@/lib/server/policy/permissions'
 
 // Mock the verifyApiKey function
 vi.mock('@/lib/server/domains/api-keys/api-key.service', () => ({
   verifyApiKey: vi.fn(),
 }))
 
-// Mock the database — use vi.hoisted() so mockFindFirst is available when vi.mock factory runs
-const { mockFindFirst } = vi.hoisted(() => ({
-  mockFindFirst: vi.fn().mockResolvedValue({ role: 'admin' }),
-}))
 vi.mock('@/lib/server/db', async (importOriginal) => ({
   // Spread the real db module so tables/operators stay current; override only what this suite drives.
   ...(await importOriginal<typeof import('@/lib/server/db')>()),
   db: {
-    query: {
-      principal: {
-        findFirst: mockFindFirst,
-      },
-    },
     select: () => ({ from: () => ({ limit: () => Promise.resolve([]) }) }),
   },
-  eq: vi.fn(),
 }))
+
+// The key's authority is resolved against the creator's current access by
+// resolveApiKeyAuthority, covered against real Postgres in
+// api-key-owner-access.db.test.ts. Here it is stubbed so this suite covers how
+// the gates consume it.
+const { mockAuthority } = vi.hoisted(() => ({ mockAuthority: vi.fn() }))
+vi.mock('@/lib/server/domains/api-keys/api-key-authority', () => ({
+  resolveApiKeyAuthority: (...args: unknown[]) => mockAuthority(...args),
+}))
+
+/** Resolve the key to the full preset of `role`, as for a creator who holds that role. */
+function keyRole(role: Role) {
+  mockAuthority.mockResolvedValue({
+    principal: { role },
+    owner: null,
+    role,
+    permissions: resolveActorPermissions(role),
+  })
+}
 
 describe('API Auth', () => {
   const mockApiKey: ApiKey = {
     id: 'apikey_01h455vb4pex5vsknk084sn02q' as ApiKeyId,
     name: 'Test Key',
+    kind: 'personal' as const,
     keyPrefix: 'qb_test',
     principalId: 'principal_01h455vb4pex5vsknk084sn02s' as PrincipalId,
     createdById: 'member_01h455vb4pex5vsknk084sn02r' as PrincipalId,
@@ -46,6 +58,7 @@ describe('API Auth', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    keyRole('admin')
   })
 
   describe('requireApiKey', () => {
@@ -101,6 +114,7 @@ describe('API Auth', () => {
         apiKey: mockApiKey,
         principalId: mockApiKey.principalId,
         role: 'admin',
+        permissions: resolveActorPermissions('admin'),
         // The principal row from the single auth query rides along for reuse
         principal: { role: 'admin' },
         importMode: false,
@@ -162,7 +176,7 @@ describe('API Auth', () => {
     it('returns the auth context when the key owner holds the permission', async () => {
       const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
       vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
-      mockFindFirst.mockResolvedValue({ role: 'admin' })
+      keyRole('admin')
 
       const result = await withApiKeyAuth(bearer(), { permission: PERMISSIONS.POST_VIEW_PRIVATE })
 
@@ -170,6 +184,7 @@ describe('API Auth', () => {
         apiKey: mockApiKey,
         principalId: mockApiKey.principalId,
         role: 'admin',
+        permissions: resolveActorPermissions('admin'),
         principal: { role: 'admin' },
         importMode: false,
       })
@@ -178,7 +193,7 @@ describe('API Auth', () => {
     it('throws ForbiddenError when the owner (member) lacks a workspace-admin permission', async () => {
       const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
       vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
-      mockFindFirst.mockResolvedValue({ role: 'member' })
+      keyRole('member')
 
       await expect(
         withApiKeyAuth(bearer(), { permission: PERMISSIONS.BILLING_MANAGE })
@@ -191,20 +206,109 @@ describe('API Auth', () => {
     it('throws ForbiddenError when the owner is a portal user (no team permissions)', async () => {
       const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
       vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
-      mockFindFirst.mockResolvedValue({ role: 'user' })
+      keyRole('user')
 
       await expect(
         withApiKeyAuth(bearer(), { permission: PERMISSIONS.POST_VIEW_PRIVATE })
       ).rejects.toThrow(ForbiddenError)
     })
 
+    it('refuses a key its creator no longer vouches for, like an unknown key', async () => {
+      const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
+      vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
+      mockAuthority.mockResolvedValue(null)
+
+      expect(await requireApiKey(bearer())).toBeNull()
+      await expect(withApiKeyAuth(bearer())).rejects.toThrow(UnauthorizedError)
+      expect(mockAuthority).toHaveBeenCalledWith(mockApiKey)
+    })
+
+    it('gates on the resolved permission set, never a preset of the role', async () => {
+      const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
+      vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
+      mockAuthority.mockResolvedValue({
+        principal: { role: 'admin' },
+        owner: null,
+        role: 'admin',
+        permissions: new Set([PERMISSIONS.POST_VIEW_PRIVATE]),
+      })
+
+      await expect(
+        withApiKeyAuth(bearer(), { permission: PERMISSIONS.POST_CREATE })
+      ).rejects.toThrow("Requires the 'post.create' permission")
+      const auth = await withApiKeyAuth(bearer(), { permission: PERMISSIONS.POST_VIEW_PRIVATE })
+      expect(() => assertApiPermissions(auth, [PERMISSIONS.POST_EDIT])).toThrow(ForbiddenError)
+    })
+
     it('allows a valid key with no permission gate (public read)', async () => {
       const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
       vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
-      mockFindFirst.mockResolvedValue({ role: 'user' })
+      keyRole('user')
 
       const result = await withApiKeyAuth(bearer())
       expect(result.principalId).toBe(mockApiKey.principalId)
+    })
+
+    it('states the key as the request attribution, even when a permission gate then refuses it', async () => {
+      const { runWithAuditAttribution, getAuditAttribution, getAuditBoundaryActor } =
+        await import('@/lib/server/audit/attribution')
+      const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
+      vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
+      mockAuthority.mockResolvedValue({
+        principal: { role: 'member', type: 'service', user: null },
+        owner: null,
+        role: 'member',
+        permissions: resolveActorPermissions('member'),
+      })
+
+      const seen = await runWithAuditAttribution(null, async () => {
+        await expect(
+          withApiKeyAuth(bearer(), { permission: PERMISSIONS.BILLING_MANAGE })
+        ).rejects.toThrow(ForbiddenError)
+        return { attribution: getAuditAttribution(), actor: getAuditBoundaryActor() }
+      })
+
+      expect(seen.attribution).toEqual({
+        channel: 'api',
+        credentialKind: 'api_key',
+        credentialId: mockApiKey.id,
+        clientName: 'Test Key',
+        onBehalfOfPrincipalId: mockApiKey.createdById,
+      })
+      expect(seen.actor).toEqual({
+        userId: null,
+        email: null,
+        role: 'member',
+        type: 'service',
+        authMethod: 'api_key',
+      })
+    })
+
+    it('keeps the MCP label when the key authenticates an MCP request', async () => {
+      const { runWithAuditAttribution, getAuditAttribution, MCP_ATTRIBUTION } =
+        await import('@/lib/server/audit/attribution')
+      const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
+      vi.mocked(verifyApiKey).mockResolvedValue(mockApiKey)
+      keyRole('admin')
+
+      const seen = await runWithAuditAttribution(MCP_ATTRIBUTION, async () => {
+        await withApiKeyAuth(bearer())
+        return getAuditAttribution()
+      })
+      expect(seen).toMatchObject({ channel: 'mcp', credentialId: mockApiKey.id })
+    })
+
+    it('leaves the request attribution empty when the key does not authenticate', async () => {
+      const { runWithAuditAttribution, getAuditAttribution } =
+        await import('@/lib/server/audit/attribution')
+      const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
+      vi.mocked(verifyApiKey).mockResolvedValue(null)
+
+      const seen = await runWithAuditAttribution(null, async () => {
+        await expect(withApiKeyAuth(bearer())).rejects.toThrow(UnauthorizedError)
+        return getAuditAttribution()
+      })
+      expect(seen).toBeNull()
     })
   })
 
@@ -212,7 +316,7 @@ describe('API Auth', () => {
     const asAdminOwner = async (key: ApiKey) => {
       const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
       vi.mocked(verifyApiKey).mockResolvedValue(key)
-      mockFindFirst.mockResolvedValue({ role: 'admin' })
+      keyRole('admin')
     }
     const bearer = () =>
       new Request('https://example.com/api', {
@@ -254,7 +358,7 @@ describe('API Auth', () => {
       // A member-owned key with every scope still cannot pass an admin-only gate.
       const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
       vi.mocked(verifyApiKey).mockResolvedValue(scopedKey(['read:feedback', 'write:feedback']))
-      mockFindFirst.mockResolvedValue({ role: 'member' })
+      keyRole('member')
       await expect(
         withApiKeyAuth(bearer(), { permission: PERMISSIONS.BILLING_MANAGE })
       ).rejects.toThrow("'billing.manage' permission")

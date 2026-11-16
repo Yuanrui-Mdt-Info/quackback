@@ -386,6 +386,9 @@ export interface ConversationDTO {
    *  applicable. Agent-only — stripped (null) on visitor-facing payloads so
    *  the customer widget never sees it (it has no UI for this feature). */
   translation: ConversationTranslationStateDTO | null
+  /** Agent-only: a test thread (the try-it round trip, or a teammate writing
+   *  in as a customer). Kept out of every metric and deleted after a week. */
+  isTest?: boolean
 }
 
 /**
@@ -451,10 +454,11 @@ export const HANDOFF_REASON_LABELS: Record<string, string> = {
   explicit_request: 'customer asked for a person',
   frustration: 'customer seemed frustrated',
   repetition: 'customer repeated the issue',
-  low_confidence: "Quinn wasn't confident",
-  capability_limit: 'outside what Quinn can do',
+  low_confidence: "AI agent wasn't confident",
+  capability_limit: 'outside what the AI agent can do',
   safety: 'safety topic',
-  system_error: 'Quinn hit an error',
+  system_error: 'AI agent hit an error',
+  awaiting_confirmation: 'AI agent is waiting for a teammate to confirm an action',
 }
 
 /** Quinn's activity on one conversation, for the agent details panel. Null when

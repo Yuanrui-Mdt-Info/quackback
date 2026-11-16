@@ -12,11 +12,14 @@
  * principal_role_assignments in the same transaction: the assignment is what
  * permissionsForPrincipal actually reads, so a role write that skipped it would
  * leave the old grant live (a removed teammate keeping Owner permissions).
+ * A role write that moves a person onto or off the team also revokes the API
+ * keys they created, in the same transaction.
  * Every function takes an optional `Executor` so a caller can enlist the write
  * in its own transaction.
  */
 import {
   db,
+  apiKeys,
   principal,
   principalRoleAssignments,
   roles,
@@ -80,6 +83,7 @@ export interface CreatePrincipalInput extends ProfileFields {
   type?: PrincipalType
   userId?: UserId | null
   id?: PrincipalId
+  testOwnerPrincipalId?: PrincipalId | null
 }
 
 /** The one place principal column defaults live. createdAt is always stamped
@@ -89,6 +93,7 @@ function toRow(input: CreatePrincipalInput): typeof principal.$inferInsert {
     id: input.id ?? generateId('principal'),
     userId: input.userId ?? null,
     role: input.role,
+    testOwnerPrincipalId: input.testOwnerPrincipalId ?? null,
     type: input.type ?? 'user',
     displayName: input.displayName ?? null,
     avatarUrl: input.avatarUrl ?? null,
@@ -160,6 +165,18 @@ export async function ensurePrincipalForUser(
     where: eq(principal.userId, input.userId),
   })
   if (existing) return { principal: existing, created: false }
+
+  const profile = await exec.query.user.findFirst({
+    where: eq(user.id, input.userId),
+    columns: { metadata: true },
+  })
+  let testOwner: unknown
+  try {
+    testOwner = JSON.parse(profile?.metadata ?? '{}')?.onboarding?.testOwnerPrincipalId
+  } catch {
+    /* Invalid profile metadata has no test identity. */
+  }
+  if (testOwner) throw new Error('A deleted test customer cannot become an ordinary customer')
 
   const [inserted] = await exec
     .insert(principal)
@@ -344,6 +361,13 @@ export async function setPrincipalRole(
       opts.assignGrantedBy
     )
   }
+  // A key acts for its creator only while they are on the team, so joining or
+  // leaving it ends every live key they created: a person removed and later
+  // re-added starts with none. A move between team roles keeps them, capped
+  // at the new role on each request.
+  if (target?.type === 'user' && isTeamMember(target.role) !== isTeamMember(role)) {
+    await revokeApiKeysCreatedBy(exec, target.id)
+  }
   const type = target?.type ?? current?.type
   const fromRole = target?.role ?? current?.role
   if (roleMoved && shouldSyncMembership({ type, fromRole, toRole: role })) {
@@ -352,6 +376,35 @@ export async function setPrincipalRole(
   const keys = userId ? [CACHE_KEYS.PRINCIPAL_BY_USER(userId)] : []
   if (!opts.executor) for (const k of keys) await cacheDel(k)
   return { cacheKeysToBust: keys }
+}
+
+/**
+ * Revoke every live personal key a principal created, inside the caller's
+ * executor, and downgrade each key's service principal as revoking a key does.
+ * Runs when a person joins or leaves the team, and before a person is deleted,
+ * since deleting them clears `created_by_id` on their keys. Workspace keys
+ * belong to nobody and are untouched.
+ */
+export async function revokeApiKeysCreatedBy(
+  exec: Executor,
+  creatorId: PrincipalId
+): Promise<void> {
+  const revoked = await exec
+    .update(apiKeys)
+    .set({ revokedAt: new Date() })
+    .where(
+      and(
+        eq(apiKeys.createdById, creatorId),
+        eq(apiKeys.kind, 'personal'),
+        isNull(apiKeys.revokedAt)
+      )
+    )
+    .returning({ principalId: apiKeys.principalId })
+  for (const key of revoked) {
+    // A legacy key backed by the creator's own principal goes with that principal.
+    if (key.principalId === creatorId) continue
+    await setPrincipalRole({ principalId: key.principalId }, 'user', { executor: exec })
+  }
 }
 
 /**

@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import { useIntl } from 'react-intl'
 import {
   Select,
   SelectContent,
@@ -36,10 +37,11 @@ export function roleValueOf(role: { role: 'admin' | 'member'; roleId?: string | 
 }
 
 /**
- * Presets (Member, Admin) then any custom roles. Admin-tier roles are offered
- * only to someone who can grant them; the server refuses them otherwise
- * anyway. A role the person already holds that is neither (another system
- * role, such as Contributor) is listed in its group so the select opens on it.
+ * Presets (Member, Admin, and Support lead when the workspace has it) then any
+ * custom roles. Admin-tier roles are offered only to someone who can grant
+ * them; the server refuses them otherwise anyway. A role the person already
+ * holds that is neither (another system role, such as Contributor) is listed
+ * in its group so the select opens on it.
  */
 export function RoleSelect({
   id,
@@ -56,11 +58,15 @@ export function RoleSelect({
   invalid?: boolean
   held?: RoleChoice
 }) {
+  const intl = useIntl()
   const { data } = useQuery(settingsQueries.roles())
   const customRoles = (data?.roles ?? []).filter((r) => !r.isSystem)
+  const supportLead = (data?.roles ?? []).find(
+    (r) => r.isSystem && r.key === SYSTEM_ROLES.SUPPORT_LEAD
+  )
   const heldId = held?.roleId
   const heldExtra =
-    heldId && !customRoles.some((r) => r.id === heldId) ? (
+    heldId && heldId !== supportLead?.id && !customRoles.some((r) => r.id === heldId) ? (
       <SelectItem value={heldId} disabled={held.role === 'admin' && !canGrantAdmin}>
         {data?.roles.find((r) => r.id === heldId)?.name ?? held.label}
       </SelectItem>
@@ -81,6 +87,15 @@ export function RoleSelect({
           <SelectItem value="admin" disabled={!canGrantAdmin}>
             Admin - Can manage settings and members
           </SelectItem>
+          {supportLead && (
+            <SelectItem value={supportLead.id}>
+              {intl.formatMessage({
+                id: 'team.roleSelect.supportLead',
+                defaultMessage:
+                  'Support lead - Can also set up routing, workflows, SLAs and channels',
+              })}
+            </SelectItem>
+          )}
           {heldExtra}
         </SelectGroup>
         {customRoles.length > 0 && (

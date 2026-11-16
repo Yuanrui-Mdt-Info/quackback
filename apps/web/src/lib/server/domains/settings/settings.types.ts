@@ -16,6 +16,7 @@ import type { OidcRedirectStyle } from '@/lib/shared/oidc-redirect'
 // logger.client-stub.ts), so it is safe for this otherwise client-bundled
 // module to import it for the one server-side parse-failure log below.
 import { logger } from '@/lib/server/logger'
+import { DEFAULT_WELCOME_MESSAGE } from '@/lib/shared/conversation/default-greeting'
 
 const log = logger.child({ component: 'settings-types' })
 
@@ -453,11 +454,13 @@ export interface ThemeColors {
   mutedForeground?: string
   accent?: string
   accentForeground?: string
+  accentInk?: string
   destructive?: string
   destructiveForeground?: string
   border?: string
   input?: string
   ring?: string
+  success?: string
   sidebarBackground?: string
   sidebarForeground?: string
   sidebarPrimary?: string
@@ -471,6 +474,15 @@ export interface ThemeColors {
   chart3?: string
   chart4?: string
   chart5?: string
+  fontSans?: string
+  shadow2xs?: string
+  shadowXs?: string
+  shadowSm?: string
+  shadow?: string
+  shadowMd?: string
+  shadowLg?: string
+  shadowXl?: string
+  shadow2xl?: string
   /** Border radius CSS variable value */
   radius?: string
 }
@@ -514,6 +526,11 @@ export interface DeveloperConfig {
    * toggle takes effect without a restart.
    */
   oauthDynamicClientRegistrationEnabled: boolean
+  /**
+   * Whether teammates may create personal API keys for themselves. Turning it
+   * off stops new keys only; existing keys keep working until revoked.
+   */
+  personalApiKeysEnabled: boolean
 }
 
 /**
@@ -524,6 +541,7 @@ export const DEFAULT_DEVELOPER_CONFIG: DeveloperConfig = {
   mcpEnabled: true,
   mcpPortalAccessEnabled: false,
   oauthDynamicClientRegistrationEnabled: true,
+  personalApiKeysEnabled: true,
 }
 
 /**
@@ -533,6 +551,7 @@ export interface UpdateDeveloperConfigInput {
   mcpEnabled?: boolean
   mcpPortalAccessEnabled?: boolean
   oauthDynamicClientRegistrationEnabled?: boolean
+  personalApiKeysEnabled?: boolean
 }
 
 // =============================================================================
@@ -717,6 +736,14 @@ export interface WidgetConfig {
   /** Per-locale overrides of the messenger welcome/offline message. The base
    *  fields are the fallback. */
   translations?: WidgetTranslations
+  /** Count pageviews from the host page the widget is embedded on. Absent
+   *  resolves to on where the plan includes visitor analytics; the embed
+   *  receives false wherever the plan does not include it. */
+  visitorAnalytics?: boolean
+  /** Store a durable device id in the visitor's browser so returning visitors
+   *  are recognised. Absent resolves to on where the plan includes visitor
+   *  analytics. Only has effect while `visitorAnalytics` resolves to on. */
+  visitorDeviceTracking?: boolean
 }
 
 /**
@@ -742,7 +769,7 @@ export type PublicWidgetConfig = Pick<
 
 export const DEFAULT_MESSENGER_CONFIG: MessengerConfig = {
   enabled: false,
-  welcomeMessage: 'Hi! 👋 How can we help you today?',
+  welcomeMessage: DEFAULT_WELCOME_MESSAGE,
   offlineMessage: "We're away right now. Leave a message and we'll get back to you by email.",
   // AI-first: identity on, and Quinn answers when a model is configured.
   // Admins pause replies under Automation → Agent. The widget master stays
@@ -809,6 +836,8 @@ export interface UpdateWidgetConfigInput {
   messenger?: Partial<MessengerConfig>
   home?: WidgetHomeConfig
   translations?: WidgetTranslations
+  visitorAnalytics?: boolean
+  visitorDeviceTracking?: boolean
 }
 
 // =============================================================================
@@ -1205,10 +1234,46 @@ export const DEFAULT_FEATURE_FLAGS: FeatureFlags = {
   statusPage: false,
 }
 
+/**
+ * A new workspace's flags when its row was created bare (by an operator):
+ * Changelog follows the goals when the row never stored it. A stored choice
+ * always stands.
+ */
+export function withNewWorkspaceFlags(
+  storedJson: string | null | undefined,
+  flags: FeatureFlags,
+  goals?: readonly FeatureFlagUseCase[]
+): FeatureFlags {
+  const stored = parseStoredFeatureFlags(storedJson)
+  const next = { ...flags }
+  if (goals && typeof stored.changelog !== 'boolean') {
+    next.changelog = newWorkspaceBaseFlags(goals).changelog
+  }
+  return next
+}
+
+/** A new workspace's flags before its goals add their modules. */
+export function newWorkspaceBaseFlags(goals: readonly FeatureFlagUseCase[]): FeatureFlags {
+  return {
+    ...DEFAULT_FEATURE_FLAGS,
+    changelog: goals.length === 0 || goals.includes('product_feedback'),
+  }
+}
+
+/**
+ * Flags a workspace starts with for the goals chosen at setup: the new
+ * workspace defaults plus each goal's modules. Changelog starts on only with
+ * the Feedback goal, so a support or status workspace is not handed a module
+ * it never asked for.
+ */
+export function newWorkspaceFlagsForGoals(goals: readonly FeatureFlagUseCase[]): FeatureFlags {
+  return flagsForGoals(newWorkspaceBaseFlags(goals), goals).flags
+}
+
 /** Onboarding outcomes that may turn extra products on. Kept local so this
  *  file stays free of the db package. */
 export type FeatureFlagUseCase =
-  'product_feedback' | 'customer_support' | 'help_center' | 'internal'
+  'product_feedback' | 'customer_support' | 'help_center' | 'status_page' | 'internal'
 
 /** Flags to persist for a new workspace, or to merge on (never off) when
  *  the operator picks a goal that needs a module. */
@@ -1219,6 +1284,8 @@ export function featureFlagsForUseCase(useCase?: FeatureFlagUseCase | null): Fea
     flags.supportTickets = true
   } else if (useCase === 'help_center') {
     flags.helpCenter = true
+  } else if (useCase === 'status_page') {
+    flags.statusPage = true
   }
   return flags
 }
@@ -1231,9 +1298,12 @@ export function enableFlagsForUseCase(
   const needed = featureFlagsForUseCase(useCase)
   return {
     ...current,
+    // Shipping updates belongs with collecting ideas; other goals leave it alone.
+    changelog: current.changelog || useCase === 'product_feedback',
     supportInbox: current.supportInbox || needed.supportInbox,
     supportTickets: current.supportTickets || needed.supportTickets,
     helpCenter: current.helpCenter || needed.helpCenter,
+    statusPage: current.statusPage || needed.statusPage,
   }
 }
 
@@ -1305,6 +1375,15 @@ export function flagsForGoal(
   useCase?: FeatureFlagUseCase | null
 ): { flags: FeatureFlags; enabledModules: string[] } {
   const flags = enableFlagsForUseCase(current, useCase)
+  return { flags, enabledModules: newlyEnabledProductLabels(current, flags) }
+}
+
+/** Enable the union of selected goals without disabling existing products. */
+export function flagsForGoals(
+  current: FeatureFlags,
+  goals: readonly FeatureFlagUseCase[]
+): { flags: FeatureFlags; enabledModules: string[] } {
+  const flags = goals.reduce((flags, goal) => enableFlagsForUseCase(flags, goal), current)
   return { flags, enabledModules: newlyEnabledProductLabels(current, flags) }
 }
 

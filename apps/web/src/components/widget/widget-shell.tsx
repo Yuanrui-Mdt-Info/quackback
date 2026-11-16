@@ -208,7 +208,8 @@ export function WidgetShell({
           // focused. Otherwise ProseMirror swallows Escape (preventDefault)
           // without doing anything visible, so the composer would trap the
           // key: blur it and let the next press close.
-          if (!suggestionWasOpen) target.blur()
+          if (suggestionWasOpen) return
+          target.blur()
           return
         }
         if (e.defaultPrevented) return
@@ -291,10 +292,7 @@ export function WidgetShell({
         {!onBack && activeTab !== 'home' && (
           <h2 className="pointer-events-none absolute left-1/2 max-w-[55%] -translate-x-1/2 truncate text-center text-base font-semibold text-foreground">
             {activeTab === 'feedback' ? (
-              <FormattedMessage
-                id="widget.shell.heading.feedback"
-                defaultMessage="Share your ideas"
-              />
+              <FormattedMessage id="widget.shell.heading.feedback" defaultMessage="Post feedback" />
             ) : activeTab === 'messages' ? (
               <FormattedMessage id="widget.shell.heading.messages" defaultMessage="Messages" />
             ) : activeTab === 'tickets' ? (

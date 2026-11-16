@@ -24,6 +24,7 @@ vi.mock('@tanstack/react-router', () => ({
 
 import { withApiKeyAuth } from '@/lib/server/domains/api/auth'
 import type { ApiAuthContext } from '@/lib/server/domains/api/auth'
+import { SYSTEM_ROLE_PERMISSIONS } from '@/lib/shared/permissions'
 import { isFeatureEnabled } from '@/lib/server/domains/settings/settings.service'
 import {
   listCategories,
@@ -71,6 +72,7 @@ const mockAuthContext: ApiAuthContext = {
   apiKey: {
     id: 'api_key_test' as ApiKeyId,
     name: 'test',
+    kind: 'personal' as const,
     keyPrefix: 'qb_',
     createdById: null,
     principalId: 'principal_1' as PrincipalId,
@@ -82,6 +84,7 @@ const mockAuthContext: ApiAuthContext = {
   },
   principalId: 'principal_1' as PrincipalId,
   role: 'admin',
+  permissions: new Set(SYSTEM_ROLE_PERMISSIONS.owner),
   principal: null,
   importMode: false,
 }
@@ -90,6 +93,7 @@ const mockTeamAuthContext: ApiAuthContext = {
   apiKey: {
     id: 'api_key_test' as ApiKeyId,
     name: 'test',
+    kind: 'personal' as const,
     keyPrefix: 'qb_',
     createdById: null,
     principalId: 'principal_1' as PrincipalId,
@@ -101,6 +105,7 @@ const mockTeamAuthContext: ApiAuthContext = {
   },
   principalId: 'principal_1' as PrincipalId,
   role: 'member',
+  permissions: new Set(SYSTEM_ROLE_PERMISSIONS.manager),
   principal: null,
   importMode: false,
 }

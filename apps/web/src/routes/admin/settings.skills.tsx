@@ -31,12 +31,14 @@ import {
   useUpdateSkill,
 } from '@/lib/client/mutations/assistant-skills'
 import { skillInputSchema, type SkillDTO } from '@/lib/shared/assistant/skills'
-import { PERMISSIONS } from '@/lib/shared/permissions'
-import { assertRoutePermission } from '@/lib/shared/route-permission'
+import { assertRouteAnyPermission } from '@/lib/shared/route-permission'
+import { AI_ANY_PERMISSIONS } from '@/lib/shared/ai-permissions'
+import { adminPageHead } from '@/lib/client/admin-head'
 
 export const Route = createFileRoute('/admin/settings/skills')({
+  head: adminPageHead('Skills settings'),
   beforeLoad: ({ context }) => {
-    assertRoutePermission(context.permissions, PERMISSIONS.ASSISTANT_MANAGE)
+    assertRouteAnyPermission(context.permissions, AI_ANY_PERMISSIONS)
   },
   loader: async ({ context }) => {
     await context.queryClient.ensureQueryData(skillQueries.list())
@@ -135,7 +137,7 @@ function SkillsPage() {
       page="/admin/settings/skills"
       description={intl.formatMessage({
         id: 'automation.skills.description',
-        defaultMessage: 'Procedures Quinn follows for specific situations.',
+        defaultMessage: 'Procedures Quackback AI follows for specific situations.',
       })}
       actions={newButton}
     >
@@ -215,7 +217,7 @@ function SkillsPage() {
       )}
 
       <Dialog open={editor !== null} onOpenChange={(open) => !open && setEditor(null)}>
-        <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-lg">
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>
               {editor === 'new'
@@ -245,7 +247,7 @@ function SkillsPage() {
                 {intl.formatMessage({
                   id: 'automation.skills.whenHint',
                   defaultMessage:
-                    'Always visible to Quinn. Keep it to one line; it decides when the skill loads.',
+                    'Always visible to Quackback AI. Keep it to one line; it decides when the skill loads.',
                 })}
               </p>
             </div>

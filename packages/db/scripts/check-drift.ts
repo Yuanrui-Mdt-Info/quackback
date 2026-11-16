@@ -98,6 +98,14 @@ const SCRATCH_DB = 'quackback_drift_check'
  */
 const EXEMPTIONS: { reason: string; pattern: RegExp; optional?: boolean }[] = [
   {
+    reason: 'workspace turn dedupe: jsonb expression member does not round-trip introspection',
+    pattern: /^CREATE UNIQUE INDEX "conversation_messages_workspace_run_sender_idx"/,
+  },
+  {
+    reason: 'workspace turn dedupe: jsonb expression member does not round-trip introspection',
+    pattern: /^DROP INDEX "conversation_messages_workspace_run_sender_idx"/,
+  },
+  {
     reason:
       'drizzle-kit composite PK column-order rewrite on PG 17; identical named key and columns',
     pattern:
@@ -192,6 +200,19 @@ const EXEMPTIONS: { reason: string; pattern: RegExp; optional?: boolean }[] = [
     reason:
       'pg_trgm GIN index on user.name for admin people search; drizzle-kit cannot round-trip the gin_trgm index, so it re-emits the DROP',
     pattern: /^DROP INDEX "user_name_trgm_idx"/,
+  },
+  {
+    // GIN pg_trgm index on posts.title for search's close-spelling fallback.
+    // Same gin_trgm_ops introspection limitation as the indexes above.
+    reason:
+      'pg_trgm GIN index on posts.title for typo-tolerant search; gin_trgm_ops opclass is not introspectable, so drizzle-kit re-emits the CREATE',
+    pattern: /^CREATE INDEX "posts_title_trgm_idx" ON "posts" USING gin /,
+  },
+  {
+    // Drop half of the same spurious pair for the partial gin_trgm index.
+    reason:
+      'pg_trgm GIN index on posts.title for typo-tolerant search; drizzle-kit cannot round-trip the partial gin_trgm index, so it re-emits the DROP',
+    pattern: /^DROP INDEX "posts_title_trgm_idx"/,
   },
   {
     // Case-insensitive unique index on lower(name) (0156). drizzle-kit cannot

@@ -1,10 +1,9 @@
-import { memo, useEffect, useState } from 'react'
+import { nameInitial } from '@/lib/shared/utils/initial'
+import { memo, useEffect, useRef, useState } from 'react'
 import { Link, useRouter, useRouterState, useRouteContext } from '@tanstack/react-router'
 import { useTheme } from 'next-themes'
-import { resolvePortalNavItems, type PortalNavItem } from './portal-header-nav'
-import { usePreviewNav } from './preview-draft-context'
-import { isProductEnabled } from '@/lib/shared/types/settings'
-import { isStatusPagePublished } from '@/lib/shared/status-settings'
+import { isHelpPath, isTabActive, type PortalNavItem } from './portal-header-nav'
+import { usePortalNavItems } from './use-portal-nav-items'
 import { isPortalSupportSurfaceEnabled } from '@/lib/shared/support-surfaces'
 import { useIntl, FormattedMessage } from 'react-intl'
 import { cn } from '@/lib/shared/utils'
@@ -70,6 +69,7 @@ export function PortalHeader({
 }: PortalHeaderProps) {
   const intl = useIntl()
   const router = useRouter()
+  const headerRef = useStickyHeaderHeight()
   const queryClient = useQueryClient()
   // Each part is selected: the route context is a new object after every
   // navigation, while these stay the same until the viewer or workspace
@@ -81,34 +81,10 @@ export function PortalHeader({
     select: (context) => context.registeredAuthProviders,
   })
 
-  const flags = settings?.featureFlags
-  const feedbackEnabled = isProductEnabled(flags, 'feedback')
-  const helpCenterEnabled = isProductEnabled(flags, 'helpCenter')
-  const supportEnabled = isPortalSupportSurfaceEnabled(flags, settings?.portalConfig)
-  const changelogEnabled = isProductEnabled(flags, 'changelog')
-  // Status tab: product flag + published. A non-public audience still needs
-  // a signed-in viewer to bother showing the tab; the route enforces the
-  // real per-viewer segment gate (settings here are workspace-global, not
-  // per-viewer). Hide or reorder the tab in Portal → Navigation.
-  const statusAudience = settings?.statusConfig?.audience ?? 'public'
-  const statusLoggedIn = !!session?.user && session.user.principalType !== 'anonymous'
-  const statusEnabled =
-    isStatusPagePublished(flags, settings?.statusConfig) &&
-    (statusAudience === 'public' || statusLoggedIn)
-  // The unsaved navigation from the admin branding preview (undefined outside
-  // preview mode). Only that draft: a stylesheet or welcome-card edit leaves the
-  // header alone.
-  const previewNav = usePreviewNav()
-  const navItems = resolvePortalNavItems(
-    {
-      feedback: feedbackEnabled,
-      roadmap: feedbackEnabled,
-      changelog: changelogEnabled,
-      help: helpCenterEnabled,
-      support: supportEnabled,
-      status: statusEnabled,
-    },
-    previewNav ?? settings?.portalConfig?.nav
+  const navItems = usePortalNavItems()
+  const supportEnabled = isPortalSupportSurfaceEnabled(
+    settings?.featureFlags,
+    settings?.portalConfig
   )
 
   // Hide Log in / Sign up when no portal sign-in surface is usable.
@@ -308,7 +284,11 @@ export function PortalHeader({
 
   // Two-row layout: Logo + Auth on top, Navigation below
   return (
-    <div className="portal-header w-full py-2 border-b border-[var(--header-border)] bg-[var(--header-background)] shadow-sm">
+    // A banner landmark, so the logo and account controls sit in one.
+    <header
+      ref={headerRef}
+      className="portal-header sticky top-0 z-40 w-full py-2 border-b border-[var(--header-border)] bg-[var(--header-background)] shadow-sm"
+    >
       {/* Row 1: Logo + Name + Auth */}
       <div>
         <div className="max-w-6xl mx-auto w-full px-4 sm:px-6">
@@ -322,10 +302,13 @@ export function PortalHeader({
                 />
               ) : (
                 <div className="h-8 w-8 [border-radius:calc(var(--radius)*0.6)] bg-primary flex items-center justify-center text-primary-foreground font-semibold">
-                  {orgName.charAt(0).toUpperCase()}
+                  {nameInitial(orgName)}
                 </div>
               )}
-              <span className="portal-header__name font-semibold hidden sm:block max-w-[18ch] line-clamp-2 text-[var(--header-foreground)]">
+              <span
+                title={orgName}
+                className="portal-header__name font-semibold hidden sm:block max-w-[18ch] truncate text-[var(--header-foreground)]"
+              >
                 {orgName}
               </span>
             </Link>
@@ -344,16 +327,8 @@ export function PortalHeader({
           />
         </div>
       </div>
-    </div>
+    </header>
   )
-}
-
-const isHelpPath = (pathname: string) => pathname === '/hc' || pathname.startsWith('/hc/')
-
-function isTabActive(to: string, pathname: string): boolean {
-  if (to === '/') return pathname === '/' || /^\/[^/]+\/posts\//.test(pathname)
-  if (to === '/hc') return isHelpPath(pathname)
-  return pathname.startsWith(to)
 }
 
 const navItemClass = (isActive: boolean) =>
@@ -462,18 +437,42 @@ const NavTab = memo(
     prev.item.defaultMessage === next.item.defaultMessage
 )
 
+/**
+ * The header sticks to the top of the page. Its height (the logo, the tabs and
+ * any custom CSS set it) is published as --portal-header-height, so what else
+ * sticks sits below it and anchor jumps land clear of it.
+ */
+function useStickyHeaderHeight() {
+  const ref = useRef<HTMLElement>(null)
+  useEffect(() => {
+    const header = ref.current
+    if (!header) return
+    const root = document.documentElement
+    const publish = () =>
+      root.style.setProperty('--portal-header-height', `${header.offsetHeight}px`)
+    publish()
+    const observer = new ResizeObserver(publish)
+    observer.observe(header)
+    return () => {
+      observer.disconnect()
+      root.style.removeProperty('--portal-header-height')
+    }
+  }, [])
+  return ref
+}
+
 /** Compact theme toggle dropdown for the header. */
 function ThemeToggle() {
   const intl = useIntl()
   const { theme, setTheme } = useTheme()
   const [mounted, setMounted] = useState(false)
 
-  // Avoid hydration mismatch for theme toggle
+  // The saved choice is only known in the browser. Until then the button
+  // shows System, the default, so the header is complete on first paint and
+  // nothing shifts when the stored theme is read.
   useEffect(() => {
     setMounted(true)
   }, [])
-
-  if (!mounted) return null
 
   const themeOptions = [
     {
@@ -493,7 +492,7 @@ function ThemeToggle() {
     },
   ] as const
 
-  const currentTheme = themeOptions.find((t) => t.value === theme) ?? themeOptions[0]
+  const currentTheme = (mounted && themeOptions.find((t) => t.value === theme)) || themeOptions[0]
   const CurrentIcon = currentTheme.icon
 
   return (
@@ -514,7 +513,7 @@ function ThemeToggle() {
           <DropdownMenuItem
             key={t.value}
             onClick={() => setTheme(t.value)}
-            className={cn(theme === t.value && 'bg-accent')}
+            className={cn(mounted && theme === t.value && 'bg-accent')}
           >
             <t.icon className="me-2 h-4 w-4" />
             {t.label}

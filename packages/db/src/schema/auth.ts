@@ -211,6 +211,8 @@ export const user = pgTable(
     // A leading-wildcard ILIKE cannot use a btree, so mirror the
     // principal_display_name_trgm_idx approach with a gin_trgm_ops index.
     index('user_name_trgm_idx').using('gin', sql`${table.name} gin_trgm_ops`),
+    // Workspace search matches an email anywhere inside (0309).
+    index('user_email_trgm_idx').using('gin', table.email.op('gin_trgm_ops')),
   ]
 )
 
@@ -911,6 +913,7 @@ export const principal = pgTable(
     companyId: typeIdColumnNullable('company')('company_id').references(() => companies.id, {
       onDelete: 'set null',
     }),
+    testOwnerPrincipalId: typeIdColumnNullable('principal')('test_owner_principal_id'),
     // Blocking (support platform §4.6). `blocked_at` = when the person was
     // blocked (null = not blocked, the enforcement flag); `blocked_by_principal_id`
     // = the team actor who blocked them. The FK is self-referential and set-null
@@ -920,6 +923,14 @@ export const principal = pgTable(
     blockedByPrincipalId: typeIdColumnNullable('principal')('blocked_by_principal_id'),
   },
   (table) => [
+    foreignKey({
+      name: 'principal_test_owner_principal_id_principal_id_fk',
+      columns: [table.testOwnerPrincipalId],
+      foreignColumns: [table.id],
+    }).onDelete('cascade'),
+    uniqueIndex('principal_test_owner_idx')
+      .on(table.testOwnerPrincipalId)
+      .where(sql`test_owner_principal_id IS NOT NULL`),
     // Self-referential blocking actor FK; named to match the SQL migration.
     foreignKey({
       name: 'principal_blocked_by_principal_id_principal_id_fk',
@@ -1238,6 +1249,40 @@ export const oauthClientAssertion = pgTable('oauth_client_assertion', {
   id: text('id').primaryKey(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 })
+
+/**
+ * Device authorization grant (RFC 8628): a pending device sign-in, bound to the
+ * OAuth client and resources it asked for. Written and consumed by Better
+ * Auth's device-authorization plugin.
+ */
+export const deviceCode = pgTable(
+  'device_code',
+  {
+    id: text('id').primaryKey(),
+    deviceCode: text('device_code').notNull(),
+    userCode: text('user_code').notNull(),
+    userId: typeIdColumnNullable('user')('user_id'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    status: text('status').notNull(),
+    lastPolledAt: timestamp('last_polled_at', { withTimezone: true }),
+    pollingInterval: integer('polling_interval'),
+    clientId: text('client_id'),
+    scope: text('scope'),
+    resources: text('resources').array(),
+    oauthClientId: text('oauth_client_id'),
+  },
+  (table) => [
+    foreignKey({
+      name: 'device_code_user_id_fkey',
+      columns: [table.userId],
+      foreignColumns: [user.id],
+    }).onDelete('cascade'),
+    uniqueIndex('device_code_device_code_idx').on(table.deviceCode),
+    uniqueIndex('device_code_user_code_idx').on(table.userCode),
+    index('device_code_user_id_idx').on(table.userId),
+    index('device_code_expires_at_idx').on(table.expiresAt),
+  ]
+)
 
 // Relations for Drizzle relational queries (enables experimental joins)
 export const userRelations = relations(user, ({ many }) => ({

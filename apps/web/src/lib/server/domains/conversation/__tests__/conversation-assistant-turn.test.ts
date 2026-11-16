@@ -40,6 +40,15 @@ const assistantMock = vi.hoisted(() => ({
         : 'reviewing_conversation'
   ),
 }))
+const testCustomers = vi.hoisted(() => new Set<string>())
+const testConversations = vi.hoisted(() => new Set<string>())
+vi.mock('@/lib/server/test-data', () => ({
+  isTestCustomer: async (id: string) => testCustomers.has(id),
+  isTestConversation: async (id: string) => testConversations.has(id),
+  testOwnerOf: async (id: string) => (testCustomers.has(id) ? 'principal_owner' : null),
+  activeTestOwnerOf: async () => null,
+  notTestPrincipal: () => ({}),
+}))
 vi.mock('@/lib/server/domains/assistant', () => assistantMock)
 
 const getMessengerConfig = vi.hoisted(() => vi.fn())
@@ -238,7 +247,7 @@ const V2_IDENTITY: DeliveredFields['identity'] = {
 // Durable trace fixtures contain only bounded config metadata and tool names/outcomes,
 // never prompts, customer text, tool arguments, or tool results.
 const PRIVACY_SAFE_TRACE: DeliveredFields['trace'] = {
-  promptVersion: 'support-agent-v6',
+  promptVersion: 'support-agent-v7',
   configRevision: 12,
   role: 'customer_support',
   tone: 'balanced',
@@ -559,6 +568,119 @@ describe('runAssistantTurnForConversation escalation dispatch', () => {
   })
 })
 
+describe('runAssistantTurnForConversation hand-off on a filed proposal', () => {
+  const PROPOSAL = {
+    id: 'assistant_action_1',
+    toolName: 'refund_order',
+    summary: 'Refund order 1042',
+    label: 'Refund order',
+  }
+
+  it('hands the conversation to the team when the turn filed a pending action', async () => {
+    assistantMock.getLatestInvolvement.mockResolvedValue(involvementRow('active'))
+    assistantMock.runAssistantTurn.mockResolvedValue(
+      answered({
+        text: 'I have asked a teammate to confirm the refund. They will pick this up.',
+        proposedActions: [PROPOSAL],
+      })
+    )
+
+    await runAssistantTurnForConversation(CONV)
+
+    // The model's own reply persists, flagged as waiting on the team.
+    expect(insertedMessages[0]).toMatchObject({
+      content: 'I have asked a teammate to confirm the refund. They will pick this up.',
+    })
+    expect(updateSets[0].waitingSince).toBeInstanceOf(Date)
+    // The shared terminal path: involvement CAS, then the conversation-side hand-off.
+    expect(assistantMock.recordHandoff).toHaveBeenCalledTimes(1)
+    expect(assistantMock.recordHandoff).toHaveBeenCalledWith(
+      'assistant_involvement_1',
+      'awaiting_confirmation'
+    )
+    expect(mockSetConversationAttribute).toHaveBeenCalledWith(
+      { conversationId: CONV },
+      'assistant_escalation_reason',
+      'awaiting_confirmation',
+      'ai'
+    )
+    expect(insertedMessages.map((m) => m.content)).toContain('Connecting you to the team')
+    // The teammate's note names the action waiting on them.
+    expect(mockAppendAssistantHandoffNote).toHaveBeenCalledTimes(1)
+    const [, packet] = mockAppendAssistantHandoffNote.mock.calls[0] as [
+      unknown,
+      { reason: string; customerNeed: string; recommendedNextStep: string },
+    ]
+    expect(packet.reason).toBe('awaiting_confirmation')
+    expect(packet.customerNeed).toContain('Refund order 1042')
+    expect(`${packet.customerNeed} ${packet.recommendedNextStep}`).not.toMatch(/\u2014/)
+    // A hand-off is terminal: the answer clock is not stamped.
+    expect(assistantMock.recordAssistantAnswer).not.toHaveBeenCalled()
+  })
+
+  it('opens an involvement to hand off when none was active yet', async () => {
+    assistantMock.runAssistantTurn.mockResolvedValue(
+      cannotAnswer({ text: 'A teammate will confirm this for you.', proposedActions: [PROPOSAL] })
+    )
+
+    await runAssistantTurnForConversation(CONV)
+
+    expect(assistantMock.openInvolvement).toHaveBeenCalledWith({
+      conversationId: CONV,
+      triggeredBy: 'first_touch',
+    })
+    expect(assistantMock.recordHandoff).toHaveBeenCalledWith(
+      'assistant_involvement_1',
+      'awaiting_confirmation'
+    )
+  })
+
+  it('hands off once, with the model reason, when the model also chose a hand-off', async () => {
+    assistantMock.getLatestInvolvement.mockResolvedValue(involvementRow('active'))
+    assistantMock.runAssistantTurn.mockResolvedValue(
+      answered({
+        text: 'I am connecting you with a teammate now.',
+        escalation: { ...HANDOFF_PACKET, mode: 'handoff' },
+        proposedActions: [PROPOSAL],
+      })
+    )
+
+    await runAssistantTurnForConversation(CONV)
+
+    expect(assistantMock.recordHandoff).toHaveBeenCalledTimes(1)
+    expect(assistantMock.recordHandoff).toHaveBeenCalledWith(
+      'assistant_involvement_1',
+      'low_confidence'
+    )
+    expect(mockAppendAssistantHandoffNote).toHaveBeenCalledTimes(1)
+    expect(insertedMessages.filter((m) => m.content === 'Connecting you to the team')).toHaveLength(
+      1
+    )
+  })
+
+  it('does not hand off again when a workflow step proposes on an already handed-off conversation', async () => {
+    assistantMock.getLatestInvolvement.mockResolvedValue(involvementRow('handed_off'))
+    assistantMock.runAssistantTurn.mockResolvedValue(answered({ proposedActions: [PROPOSAL] }))
+
+    await runAssistantTurnForConversation(CONV, { surface: 'workflow_step' })
+
+    expect(assistantMock.recordHandoff).not.toHaveBeenCalled()
+    expect(insertedMessages.map((m) => m.content)).not.toContain('Connecting you to the team')
+    // The new proposal still waits on the team, so the conversation keeps waiting.
+    expect(updateSets[0].waitingSince).toBeInstanceOf(Date)
+  })
+
+  it('leaves a turn that proposed nothing alone', async () => {
+    assistantMock.getLatestInvolvement.mockResolvedValue(involvementRow('active'))
+    assistantMock.runAssistantTurn.mockResolvedValue(answered({}))
+
+    await runAssistantTurnForConversation(CONV)
+
+    expect(assistantMock.recordHandoff).not.toHaveBeenCalled()
+    expect(updateSets[0].waitingSince).toBeNull()
+  })
+})
+
 describe('runAssistantTurnForConversation preview retraction (invalidated attempt)', () => {
   async function publishedEvents(): Promise<Array<Record<string, unknown>>> {
     const { publishConversationOnlyEvent } =
@@ -608,6 +730,43 @@ describe('runAssistantTurnForConversation preview retraction (invalidated attemp
     const deltas = (await publishedEvents()).filter((e) => e.kind === 'assistant_delta')
     expect(deltas.length).toBeGreaterThan(0)
     expect(deltas.every((e) => (e.text as string).length > 0)).toBe(true)
+  })
+})
+
+describe("runAssistantTurnForConversation on a teammate's test thread", () => {
+  async function inboxEvents(): Promise<Array<Record<string, unknown>>> {
+    const { publishAgentConversationEvent } =
+      await import('@/lib/server/realtime/conversation-channels')
+    return vi.mocked(publishAgentConversationEvent).mock.calls.map(([e]) => e as never)
+  }
+  const streamOnce = async (input: {
+    onActivity: (a: unknown) => void
+    onTextDelta: (d: string) => void
+  }) => {
+    input.onActivity({ kind: 'thinking' })
+    input.onTextDelta('Hi! I am here.')
+    return answered({ text: 'Hi! I am here.' })
+  }
+
+  it('mirrors the live turn to the inbox so the Try Messenger pane streams it too', async () => {
+    testConversations.add(CONV)
+    try {
+      assistantMock.runAssistantTurn.mockImplementation(streamOnce)
+      await runAssistantTurnForConversation(CONV)
+    } finally {
+      testConversations.clear()
+    }
+    const kinds = (await inboxEvents()).map((e) => e.kind)
+    expect(kinds).toContain('assistant_activity')
+    expect(kinds).toContain('assistant_delta')
+  })
+
+  it("keeps a real customer's live turn off the inbox channel", async () => {
+    assistantMock.runAssistantTurn.mockImplementation(streamOnce)
+    await runAssistantTurnForConversation(CONV)
+    const kinds = (await inboxEvents()).map((e) => e.kind)
+    expect(kinds).not.toContain('assistant_delta')
+    expect(kinds).not.toContain('assistant_activity')
   })
 })
 

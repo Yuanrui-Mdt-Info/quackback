@@ -62,6 +62,8 @@ import type { SlaApplied } from '@/lib/server/domains/sla/sla.service'
 import { assistantPrincipalIdOnce } from '@/lib/server/messages/assistant-principal'
 import { hasLinkedCustomerTicketSql } from '@/lib/server/messages/pair-link'
 import { conversationFilter } from '@/lib/server/policy/conversations'
+import { isTestThreadSql } from './conversation.test-data'
+import { testOwnerOf } from '@/lib/server/test-data'
 import type { Actor } from '@/lib/server/policy/types'
 import { priorityRankSql } from '@/lib/server/utils/priority-rank'
 import {
@@ -77,6 +79,7 @@ import { loadAuthors, loadAuthorAudiences, fallbackAuthor } from '../principals/
 import { toMessageDTO } from '@/lib/server/messages/message-core'
 import { aggregateReactions } from '@/lib/shared'
 import { supportContactName } from '@/lib/shared/support-contact-name'
+import { displayAssistantName } from '@/lib/shared/assistant/config'
 import { truncate } from '@/lib/shared/utils/string'
 import type { Channel } from '@/lib/shared/channels'
 import { keywordInContext, type TermSegment } from '@/lib/shared/utils/keyword-context'
@@ -322,6 +325,7 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
         content: conversationMessages.content,
         senderType: conversationMessages.senderType,
         authorPublicName: principal.displayName,
+        authorIsAssistant: sql<boolean>`${principal.serviceMetadata}->>'integrationType' = 'assistant'`,
         authorAccountName: user.name,
         visitorPrincipalId: conversations.visitorPrincipalId,
         flaggedAt: conversationMessageFlags.flaggedAt,
@@ -347,6 +351,7 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
         content: conversationMessages.content,
         senderType: conversationMessages.senderType,
         authorPublicName: principal.displayName,
+        authorIsAssistant: sql<boolean>`${principal.serviceMetadata}->>'integrationType' = 'assistant'`,
         authorAccountName: user.name,
         ticketTitle: tickets.title,
         ticketNumber: tickets.number,
@@ -375,11 +380,15 @@ export async function listFlaggedMessages(actor: Actor): Promise<FlaggedMessageD
   const flaggedAuthor = (row: {
     authorAccountName: string | null
     authorPublicName: string | null
+    authorIsAssistant: boolean | null
     senderType: string
   }) =>
     supportContactName({
       accountName: row.authorAccountName,
-      publicName: row.authorPublicName,
+      publicName:
+        row.authorIsAssistant && row.authorPublicName
+          ? displayAssistantName(row.authorPublicName)
+          : row.authorPublicName,
       fallback: row.senderType === 'agent' ? 'Agent' : 'Visitor',
     })
   const fromConversations: FlaggedMessageDTO[] = conversationRows.map((r) => ({
@@ -499,7 +508,9 @@ export function toConversationDTO(
   translation: ConversationTranslationStateDTO | null = null,
   // Which rule/classifier filed a spam-ended thread (agent-only); callers
   // pass null on visitor paths.
-  spamReason: ConversationSpamFiledBy | null = null
+  spamReason: ConversationSpamFiledBy | null = null,
+  // The visitor is a teammate's test customer (agent-only).
+  isTest = false
 ): ConversationDTO {
   return {
     id: conversation.id,
@@ -530,6 +541,7 @@ export function toConversationDTO(
     sla,
     customAttributes,
     translation,
+    isTest,
   }
 }
 
@@ -616,6 +628,9 @@ export async function conversationToDTO(
       ? loadConversationTagsForConversations([conversation.id])
       : Promise.resolve(new Map<ConversationId, ConversationTagDTO[]>()),
   ])
+  // The author read above already told the process whether the visitor is a
+  // test customer, so this answers without another query.
+  const testOwner = side === 'agent' ? await testOwnerOf(conversation.visitorPrincipalId) : null
   return toConversationDTO(
     conversation,
     authors.get(conversation.visitorPrincipalId) ?? fallbackAuthor(conversation.visitorPrincipalId),
@@ -633,7 +648,8 @@ export async function conversationToDTO(
     side === 'agent' ? ((conversation.customAttributes ?? {}) as Record<string, JsonValue>) : {},
     side === 'agent' ? translationStateFrom(conversation) : null,
     // App-constrained taxonomy (CONVERSATION_SPAM_FILED_BY), like endReason.
-    side === 'agent' ? ((conversation.spamReason as ConversationSpamFiledBy | null) ?? null) : null
+    side === 'agent' ? ((conversation.spamReason as ConversationSpamFiledBy | null) ?? null) : null,
+    testOwner !== null
   )
 }
 
@@ -1175,6 +1191,9 @@ export interface ConversationListFilter {
    *  excluded from every other list (the triage facets, queues, and searches
    *  must never surface them) — this flag is the one opt-in that lists them. */
   spamOnly?: boolean
+  /** "Test" view: only test conversations (the try-it round trip, or a
+   *  teammate writing in as a customer). */
+  testOnly?: boolean
   /** Inbox ordering. Omitted = 'relevance' on a searched list, 'recent'
    *  otherwise; a pinned sort always wins. Keyset pagination adapts per sort. */
   sort?: ConversationSort
@@ -1642,11 +1661,13 @@ export async function listConversationsForAgent(
       translationEnabled: conversations.translationEnabled,
       detectedCustomerLanguage: conversations.detectedCustomerLanguage,
       translationDismissedAt: conversations.translationDismissedAt,
+      isTest: isTestThreadSql(conversations.visitorPrincipalId).mapWith(Boolean),
     })
     .from(conversations)
     .where(
       and(
         conversationFilter(actor),
+        filter.testOnly ? isTestThreadSql(conversations.visitorPrincipalId) : undefined,
         // Spam lifecycle: a spam-ended thread is out of every triage view.
         // The Spam view (spamOnly) is the single list that surfaces them.
         filter.spamOnly
@@ -1850,8 +1871,8 @@ export async function listConversationsForAgent(
   const tagMap = await loadConversationTagsForConversations(ids)
 
   return {
-    conversations: page.map((c) =>
-      toConversationDTO(
+    conversations: page.map((c) => ({
+      ...toConversationDTO(
         c,
         authors.get(c.visitorPrincipalId) ?? fallbackAuthor(c.visitorPrincipalId),
         c.assignedAgentPrincipalId
@@ -1869,8 +1890,9 @@ export async function listConversationsForAgent(
         undefined,
         translationStateFrom(c),
         (c.spamReason as ConversationSpamFiledBy | null) ?? null
-      )
-    ),
+      ),
+      isTest: c.isTest,
+    })),
     hasMore,
     // Opaque keyset cursor: the last conversation id, re-resolved on the next call.
     nextCursor: page[page.length - 1].id,

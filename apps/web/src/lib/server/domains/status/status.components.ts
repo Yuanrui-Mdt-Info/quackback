@@ -1,6 +1,6 @@
 /**
  * Status component + group CRUD, manual/API status writes, and the shared
- * event-dispatch bridge used by every status.* module (kept here — the
+ * event-writing helpers used by every status.* module (kept here — the
  * dependency-free leaf of the domain — so status.service.ts and
  * status.maintenance.ts can both import it without a cycle).
  */
@@ -18,11 +18,12 @@ import {
   statusIncidentComponents,
   statusIncidents,
 } from '@/lib/server/db'
+import type { Database, Transaction } from '@/lib/server/db'
 import type { StatusComponentId, StatusComponentGroupId, StatusIncidentId } from '@quackback/ids'
 import { NotFoundError, ValidationError } from '@/lib/shared/errors'
 import { assertTrimmedName, nextPosition, positionCaseSql } from '@/lib/server/utils'
-import { logger } from '@/lib/server/logger'
 import type { EventActor } from '@/lib/server/events/dispatch'
+import type { EventData } from '@/lib/server/events/types'
 import type {
   StatusComponentStatus,
   StatusComponentEventSource,
@@ -34,7 +35,8 @@ import type {
   StatusComponentRow,
 } from './status.types'
 
-const log = logger.child({ component: 'status-components' })
+/** The global handle, or a transaction a lifecycle write is running in. */
+type Executor = Database | Transaction
 
 function validateName(name: string, label: string): string {
   return assertTrimmedName(
@@ -220,7 +222,10 @@ export async function updateStatusComponent(
   return toComponentRow(updated)
 }
 
-/** Soft delete — keeps incident history (affected-component links) readable. */
+/** Soft delete — keeps incident history (affected-component links) readable.
+ *  Lifecycle writes skip a deleted component (reconcileComponentStatus), and
+ *  the admin incident detail and templates leave it out, so an open incident
+ *  that used it still resolves, and the editor stops resubmitting it. */
 export async function deleteStatusComponent(id: StatusComponentId): Promise<void> {
   const result = await db
     .update(statusComponents)
@@ -237,10 +242,22 @@ export async function reorderStatusComponents(ids: StatusComponentId[]): Promise
   if (!ids || ids.length === 0) {
     throw new ValidationError('VALIDATION_ERROR', 'Component IDs are required')
   }
-  await db
-    .update(statusComponents)
-    .set({ position: positionCaseSql(statusComponents.id, ids) })
-    .where(inArray(statusComponents.id, ids))
+  // Locked in id order first, like a lifecycle recompute takes them (see
+  // reconcileComponentStatus). A bare UPDATE locks rows in whatever order the
+  // database scans them, so against a recompute sharing two or more of these
+  // services each could hold one the other waits for.
+  await db.transaction(async (tx) => {
+    await tx
+      .select({ id: statusComponents.id })
+      .from(statusComponents)
+      .where(inArray(statusComponents.id, ids))
+      .orderBy(asc(statusComponents.id))
+      .for('no key update')
+    await tx
+      .update(statusComponents)
+      .set({ position: positionCaseSql(statusComponents.id, ids) })
+      .where(inArray(statusComponents.id, ids))
+  })
 }
 
 /**
@@ -259,33 +276,62 @@ export async function setComponentStatus(
   source: StatusComponentEventSource,
   incidentId?: StatusIncidentId | null
 ): Promise<void> {
-  const existing = await getComponentOrThrow(componentId)
+  // The row is locked and read inside the transaction, so the previous
+  // status in the event is the one this write replaced, and the change, its
+  // history row and its event commit together or not at all.
+  await db.transaction(async (tx) => {
+    const [locked] = await tx
+      .select()
+      .from(statusComponents)
+      .where(and(eq(statusComponents.id, componentId), isNull(statusComponents.deletedAt)))
+      .for('no key update')
+    if (!locked) {
+      throw new NotFoundError(
+        'STATUS_COMPONENT_NOT_FOUND',
+        `Status component ${componentId} not found`
+      )
+    }
+    if (locked.status === status) return
+    await writeComponentStatus(locked, status, source, incidentId, tx)
+
+    if (source === 'manual' || source === 'api') {
+      const actor: EventActor = { type: 'service', displayName: source }
+      await writeStatusEvent(
+        'status.component_changed',
+        actor,
+        {
+          componentId: locked.id,
+          componentName: locked.name,
+          previousStatus: locked.status,
+          status,
+          source,
+        },
+        tx
+      )
+    }
+  })
+}
+
+async function writeComponentStatus(
+  existing: typeof statusComponents.$inferSelect,
+  status: StatusComponentStatus,
+  source: StatusComponentEventSource,
+  incidentId: StatusIncidentId | null | undefined,
+  executor: Executor
+): Promise<void> {
   if (existing.status === status) return
 
-  await db
+  await executor
     .update(statusComponents)
     .set({ status, updatedAt: new Date() })
-    .where(eq(statusComponents.id, componentId))
+    .where(eq(statusComponents.id, existing.id))
 
-  await db.insert(statusComponentEvents).values({
-    componentId,
+  await executor.insert(statusComponentEvents).values({
+    componentId: existing.id,
     status,
     source,
     incidentId: incidentId ?? null,
   })
-
-  if (source === 'manual' || source === 'api') {
-    const actor: EventActor = { type: 'service', displayName: source }
-    await dispatchStatusEvent('status.component_changed', actor, {
-      componentId,
-      componentName: existing.name,
-      previousStatus: existing.status,
-      status,
-      source,
-    }).catch((err) =>
-      log.error({ err, component_id: componentId }, 'failed to dispatch status.component_changed')
-    )
-  }
 }
 
 const STATUS_WEIGHT: Record<StatusComponentStatus, number> = {
@@ -296,13 +342,56 @@ const STATUS_WEIGHT: Record<StatusComponentStatus, number> = {
   major_outage: 4,
 }
 
-/** Recompute a component from every currently active incident/window. */
+/** Whether a row in this status holds its services at their affected status.
+ *  Mirrors the active-set filter in reconcileComponentStatus's query below. A
+ *  write recomputes a row's services only when the row holds them before or
+ *  after it: recomputing for a row that holds them neither way would only
+ *  reset a status set by hand or through the API since. */
+export function holdsComponents(kind: string, status: string): boolean {
+  if (kind === 'incident') return status !== 'resolved'
+  return status === 'in_progress' || status === 'verifying'
+}
+
+/**
+ * Recompute a component from every currently active incident/window. A
+ * soft-deleted component is skipped rather than thrown on: it is off the page
+ * and has no live status, but an incident that still links to it must stay
+ * resolvable, reopenable and deletable, and its other components must still
+ * be recomputed. Pass `executor` to run inside the caller's transaction.
+ */
 export async function reconcileComponentStatus(
   componentId: StatusComponentId,
   source: StatusComponentEventSource,
-  incidentId?: StatusIncidentId | null
+  incidentId?: StatusIncidentId | null,
+  executor: Executor = db
 ): Promise<void> {
-  const active = await db
+  // Lock the component before reading which incidents hold it. Two lifecycle
+  // writes sharing a component (say, two incidents deleted at once) would
+  // otherwise each read the other's change as not yet made, and the later
+  // commit would restore a status neither incident still sets. Holding the
+  // row, the second waits for the first to commit and then reads its result.
+  // NO KEY UPDATE, not UPDATE: a caller has usually just inserted a link to
+  // this service, whose foreign key check holds KEY SHARE on the row. Two
+  // writes linking the same service both hold it, and FOR UPDATE would make
+  // each wait on the other's (a deadlock); NO KEY UPDATE still serialises
+  // recomputes against each other without conflicting with it.
+  //
+  // Lock order: lifecycle writes lock and refresh their incident row before
+  // this (lockIncident in status.service.ts, or the scheduler's claim), then
+  // take services in id order (reconcileComponentStatuses), and reordering
+  // services takes them in id order too. Two of these never wait on each
+  // other in a cycle. The one write that can't be ordered is deleting a
+  // group: its ON DELETE SET NULL cascade updates the group's services in
+  // the order the database scans them, so against a recompute sharing two or
+  // more of them, Postgres may abort one of the two as a deadlock.
+  const [component] = await executor
+    .select()
+    .from(statusComponents)
+    .where(and(eq(statusComponents.id, componentId), isNull(statusComponents.deletedAt)))
+    .for('no key update')
+  if (!component) return
+
+  const active = await executor
     .select({ status: statusIncidentComponents.componentStatus })
     .from(statusIncidentComponents)
     .innerJoin(statusIncidents, eq(statusIncidents.id, statusIncidentComponents.incidentId))
@@ -321,17 +410,30 @@ export async function reconcileComponentStatus(
     (worst, row) => (STATUS_WEIGHT[row.status] > STATUS_WEIGHT[worst] ? row.status : worst),
     'operational'
   )
-  await setComponentStatus(componentId, effective, source, incidentId)
+  await writeComponentStatus(component, effective, source, incidentId, executor)
+}
+
+/**
+ * Recompute several components in one lifecycle write. They are locked in id
+ * order, so two writes that share components always take them in the same
+ * order and can't deadlock.
+ */
+export async function reconcileComponentStatuses(
+  componentIds: Iterable<StatusComponentId>,
+  source: StatusComponentEventSource,
+  incidentId: StatusIncidentId | null | undefined,
+  executor: Executor
+): Promise<void> {
+  for (const componentId of [...new Set(componentIds)].sort()) {
+    await reconcileComponentStatus(componentId, source, incidentId, executor)
+  }
 }
 
 // ============================================================================
-// Shared event-dispatch bridge (see module docblock)
+// Shared event-writing helpers (see module docblock)
 // ============================================================================
 
-/**
- * Status event types this domain emits. NOT yet registered in
- * `events/types.ts`'s `EventType` union — see the dispatch note below.
- */
+/** Status event types this domain emits. */
 export type StatusEventType =
   | 'status.incident_created'
   | 'status.incident_updated'
@@ -340,36 +442,31 @@ export type StatusEventType =
   | 'status.maintenance_completed'
   | 'status.component_changed'
 
-/**
- * Mirrors the private `dispatchEvent` helper in events/dispatch.ts (best-effort,
- * optional rethrow), but lives in the status domain: `status.*` isn't in the
- * events/ package's `EventType` union / `EventData` discriminated union yet
- * (owned by another workstream — see this domain's final build report for the
- * exact registry/targets/handlers wiring it needs). The cast below is the
- * deliberate bridge until that lands. Runtime behavior is safe either way:
- * `processEvent` resolves zero hook targets for an unregistered type today
- * (no webhook/workflow config can reference a type that doesn't exist yet),
- * and starts actually notifying the moment the registry is updated, with zero
- * further domain-layer changes.
- */
-export async function dispatchStatusEvent(
+/** A status event as the envelope the outbox writer takes. */
+export function buildStatusEvent(
   type: StatusEventType,
   actor: EventActor,
-  data: Record<string, unknown>,
-  opts?: { rethrow?: boolean }
-): Promise<void> {
-  const event = {
+  data: Record<string, unknown>
+): EventData {
+  return {
     id: globalThis.crypto.randomUUID(),
     type,
     timestamp: new Date().toISOString(),
     actor,
     data,
-  }
-  try {
-    const { processEvent } = await import('@/lib/server/events/process')
-    await processEvent(event as unknown as Parameters<typeof processEvent>[0])
-  } catch (err) {
-    log.error({ err, event_type: type }, 'failed to dispatch status event')
-    if (opts?.rethrow) throw err
-  }
+  } as unknown as EventData
+}
+
+/**
+ * Write a status event on the transaction that makes the change it describes,
+ * so the two commit or roll back together and a crash can't lose the event.
+ */
+export async function writeStatusEvent(
+  type: StatusEventType,
+  actor: EventActor,
+  data: Record<string, unknown>,
+  tx: Transaction
+): Promise<void> {
+  const { writeEventToOutbox } = await import('@/lib/server/events/outbox-dispatch')
+  await writeEventToOutbox(buildStatusEvent(type, actor, data), tx)
 }

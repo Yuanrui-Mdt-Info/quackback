@@ -219,6 +219,27 @@ export function assertPermission(
 }
 
 /**
+ * Assert the authenticated caller holds at least one of the permissions. For
+ * shared settings that either of two roles may manage; keep the gate a bare
+ * `requireAuth()` so the authz scanner classifies it as dynamic.
+ */
+export function assertAnyPermission(
+  auth: Pick<AuthContext, 'permissions' | 'principal' | 'scope'>,
+  permissions: readonly PermissionKey[]
+): void {
+  if (auth.scope !== 'dashboard') {
+    throw new Error(
+      `Access denied: Requires permission '${permissions.join("' or '")}' on a dashboard session`
+    )
+  }
+  if (!permissions.some((permission) => auth.permissions.includes(permission))) {
+    throw new Error(
+      `Access denied: Requires permission '${permissions.join("' or '")}', role ${auth.principal.role} lacks it`
+    )
+  }
+}
+
+/**
  * Get auth context if authenticated, null otherwise.
  * Useful for public endpoints that behave differently for logged-in users.
  *
@@ -328,11 +349,14 @@ export function normalizePrincipalType(raw: string | null | undefined): Principa
 export async function policyActorFromAuth(auth: AuthContext | null): Promise<Actor> {
   if (!auth) return ANONYMOUS_ACTOR
   const segmentIds = await segmentIdsForPrincipal(auth.principal.id)
-  return {
+  const actor: Actor = {
     principalId: auth.principal.id,
     role: auth.principal.role,
     principalType: normalizePrincipalType(auth.principal.type),
     segmentIds,
     permissions: new Set(auth.permissions),
   }
+  if (actor.principalType !== 'anonymous') return actor
+  const { resolveTestFeedbackActor } = await import('@/lib/server/test-customer-feedback')
+  return resolveTestFeedbackActor(actor)
 }

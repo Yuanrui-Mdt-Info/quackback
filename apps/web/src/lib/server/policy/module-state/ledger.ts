@@ -115,6 +115,15 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
       'CloudCredentialSource reads only the process environment populated before startup. Cross-workspace calls return the same centrally managed OAuth application credentials; per-workspace installation tokens remain in workspace databases.',
   },
   {
+    file: 'apps/web/src/lib/server/domains/assistant/workspace-semantic-search.ts',
+    name: 'vectors',
+    category: 'workspace-keyed',
+    reason:
+      'Query embeddings for workspace search, kept a few minutes so paging reuses one request. ' +
+      'A cross-workspace hit would reveal that another workspace searched the same words and ' +
+      'skip the embedding request billed to this one.',
+  },
+  {
     file: 'apps/web/src/lib/server/auth/index.ts',
     name: 'authConfigVersions',
     category: 'workspace-keyed',
@@ -344,6 +353,15 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
       "another workspace's messages on a bus with no authorization layer of its own.",
   },
   {
+    file: 'apps/web/src/lib/server/test-data.ts',
+    name: 'testOwners',
+    category: 'workspace-keyed',
+    reason:
+      "Which principals are a teammate's test customer, by principal id. The answer is fixed when the " +
+      'principal is created, but it is read from one workspace database: shared across workspaces a ' +
+      "copied id could answer from the wrong workspace and leak or hide that workspace's test data.",
+  },
+  {
     file: 'apps/web/src/lib/server/local-cache.ts',
     name: 'localCopies',
     category: 'workspace-keyed',
@@ -351,6 +369,16 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
       "Short-lived copies of cached values, chiefly the workspace settings, which hold one workspace's " +
       'auth config, secrets and flags. Shared, one workspace would be served another workspace settings ' +
       'for up to the copy lifetime.',
+  },
+  {
+    file: 'apps/web/src/lib/server/mcp/untrusted.ts',
+    name: 'itemFacts',
+    category: 'workspace-scoped-key',
+    keyedBy: 'CallToolResult',
+    reason:
+      "Keyed by one MCP tool call's result object, which exists only for the request that produced " +
+      'it, so a lookup can only ever find facts about its own result. It is a WeakMap, so nothing ' +
+      'outlives the result once the response is sent.',
   },
   {
     file: 'apps/web/src/lib/server/response-hooks.ts',
@@ -541,6 +569,14 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
       'the constructor and no request attaches per-caller headers.',
   },
   {
+    file: 'apps/web/src/lib/server/github-star-count.ts',
+    name: 'readStarCount',
+    category: 'fleet-wide',
+    reason:
+      "The public repo's star count and its backoff, shown on the star prompt's button. It is the " +
+      'same number for every workspace, so a cross-workspace hit returns the right answer.',
+  },
+  {
     file: 'apps/web/src/lib/server/functions/version.ts',
     name: 'lastFailureAt',
     category: 'fleet-wide',
@@ -612,6 +648,16 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
       "send behind another workspace's sends by at most the 30s wait cap, never read or alter them.",
   },
   {
+    file: 'apps/web/src/lib/server/dns/resolver.ts',
+    name: 'resolvers',
+    category: 'fleet-wide',
+    reason:
+      'DNS resolvers keyed by try count, each built from fixed options (two second timeout) and the system ' +
+      'nameservers. It holds no answers and no workspace: every lookup is a fresh public DNS ' +
+      'query, so a cross-workspace hit asks the same question of the same nameservers that ' +
+      'either workspace would have built a resolver to ask.',
+  },
+  {
     file: 'packages/email/src/ses-identity.ts',
     name: 'cachedClient',
     category: 'fleet-wide',
@@ -639,6 +685,16 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
       'Holds a function pointer installed at boot. Each send awaits it, and the function reads ' +
       'live workspace cloud config through the scoped db Proxy, so sharing the pointer is not a ' +
       'cross-workspace cache.',
+  },
+  {
+    file: 'packages/email/src/tenant-hooks.ts',
+    name: 'hooks',
+    category: 'process-lifetime',
+    reason:
+      'Holds two function pointers installed at boot. Each send awaits the tenant lookup, which ' +
+      'derives the tenant name from getCurrentWorkspace() and reads that workspace row through ' +
+      'the scoped db Proxy, so two workspaces in one process get their own tenants. Nothing about ' +
+      'a workspace is kept in here.',
   },
   {
     file: 'packages/email/src/default-from.ts',
@@ -698,6 +754,16 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
       'PROCESS and no workspace data: TRUSTED_PROXY_HOPS is process configuration, so the condition ' +
       'it describes has no workspace dimension, and sharing the latch across workspaces costs one ' +
       'suppressed duplicate log line.',
+  },
+  {
+    file: 'apps/web/src/lib/server/domains/api-keys/api-key-authority.ts',
+    name: 'reportedCreatorless',
+    category: 'process-lifetime',
+    reason:
+      'A log-once set of API key ids refused for having no recorded creator. Ids are TypeIDs over ' +
+      'UUIDs, so there is no cross-workspace collision to have; the only shared effect would be ' +
+      'suppressing a duplicate diagnostic. It never decides authority (the empty creator column ' +
+      'does), and it grows only with keys whose creator column is empty.',
   },
   {
     file: 'apps/web/src/lib/server/domains/conversation/conversation.email-imap-queue.ts',
@@ -1072,6 +1138,21 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
   },
   {
     file: 'apps/web/src/lib/server/jobs/worker.ts',
+    name: 'scheduledWakes',
+    category: 'workspace-scoped-key',
+    keyedBy: 'workspaceKey',
+    reason:
+      'The next instant each parked workspace has clock-driven work, as the probe that parked it ' +
+      'found it, so the refresh pass can start that workspace loop when the work falls due. One ' +
+      'entry per parked workspace, deleted when the loop wakes or the workspace leaves the active ' +
+      'set. Per-process and safe to lose on restart: the dormancy marks are in memory too, so a ' +
+      'boot treats every idle workspace as unprobed and re-learns the schedule with one probe each. ' +
+      'Each replica holds the schedule for the loops it runs, so replicas never need to agree on it. ' +
+      'A wrong entry costs one extra probe if it is early, and delays that workspace clock-driven ' +
+      'work until the stored instant if it is late.',
+  },
+  {
+    file: 'apps/web/src/lib/server/jobs/worker.ts',
     name: 'running',
     category: 'process-lifetime',
     owner: 'Piece 6 (saas/queue-lease)',
@@ -1146,13 +1227,28 @@ export const MODULE_STATE_LEDGER: readonly LedgerEntry[] = [
   },
   {
     file: 'apps/web/src/lib/server/jobs/runner.ts',
+    name: 'fleetInFlight',
+    category: 'process-lifetime',
+    owner: 'Piece 6 (saas/queue-lease)',
+    reason:
+      'Slots reserved by claims in flight or held by running jobs, per queue name, across ' +
+      'every workspace pool in this process - what fleetConcurrency caps. Being shared ' +
+      'across workspaces is its purpose: a ' +
+      'per-workspace count would cap nothing a fleet does at once. It holds queue names and ' +
+      'counts only, never a payload or a workspace identity, so a cross-workspace read reveals ' +
+      'nothing but how busy the process is.',
+  },
+  {
+    file: 'apps/web/src/lib/server/jobs/runner.ts',
     name: 'cronCache',
     category: 'content-addressed',
     owner: 'Piece 6 (saas/queue-lease)',
     reason:
-      'Parsed cron expressions keyed by the pattern string. Parsing is a pure function of that ' +
-      'string, so a cross-workspace hit returns exactly what the requesting workspace would have ' +
-      'parsed - and the patterns are compile-time constants in jobs/definitions.ts anyway.',
+      'Parsed cron expressions and their slot spread windows, keyed by the pattern string. ' +
+      'Both are pure functions of that string, so a cross-workspace hit returns exactly what the ' +
+      'requesting workspace would have computed - and the patterns are compile-time constants in ' +
+      'jobs/definitions.ts anyway. The per-workspace offset is derived from the spread key at ' +
+      'call time and is never cached here.',
   },
   {
     file: 'apps/web/src/lib/server/jobs/job-queue.ts',

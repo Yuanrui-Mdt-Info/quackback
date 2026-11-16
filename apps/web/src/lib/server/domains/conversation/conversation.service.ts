@@ -30,6 +30,7 @@ import {
 } from '@/lib/server/db'
 import { resolveBlockReply, type BlockReplyInput, type ResolvedBlockReply } from './block-reply'
 import { isTeamMember } from '@/lib/shared/roles'
+import { conversationFilter } from '@/lib/server/policy/conversations'
 import type { ConversationAttachment, ConversationMessageCitation, Team } from '@/lib/server/db'
 import { getTeam } from '@/lib/server/domains/teams'
 import { isBlocked } from '@/lib/server/domains/principals/blocking'
@@ -128,6 +129,7 @@ import type {
   SendAgentMessageResult,
 } from './conversation.types'
 import { logger } from '@/lib/server/logger'
+import { activeTestOwnerOf, notTestPrincipal, testOwnerOf } from '@/lib/server/test-data'
 
 const log = logger.child({ component: 'conversation' })
 
@@ -160,6 +162,16 @@ async function loadConversationOr404(conversationId: ConversationId): Promise<Co
   return row
 }
 
+/** Whether `conversationFilter` admits the conversation for this actor. */
+async function conversationInScope(conversationId: ConversationId, actor: Actor): Promise<boolean> {
+  const [row] = await db
+    .select({ id: conversations.id })
+    .from(conversations)
+    .where(and(eq(conversations.id, conversationId), conversationFilter(actor)))
+    .limit(1)
+  return !!row
+}
+
 /**
  * Read chokepoint: resolve a conversation the actor is allowed to see, or throw
  * NotFound (never Forbidden) so a non-owner can't probe conversation ids.
@@ -169,6 +181,11 @@ export async function assertConversationViewable(
   actor: Actor
 ): Promise<Conversation> {
   const conversation = await loadConversationOr404(conversationId)
+  // A personal API key reads only what its creator's inbox lists. The per-item
+  // team boundary for people lands separately; a key must not wait for it.
+  if (actor.scopePrincipalId && !(await conversationInScope(conversationId, actor))) {
+    throw new NotFoundError('CONVERSATION_NOT_FOUND', 'Conversation not found')
+  }
   const decision = canViewConversation(actor, conversation)
   if (!decision.allowed) {
     throw new NotFoundError('CONVERSATION_NOT_FOUND', 'Conversation not found')
@@ -361,6 +378,9 @@ export async function sendVisitorMessage(
     } else {
       const start = canStartConversation(actor)
       if (!start.allowed) throw new ForbiddenError('FORBIDDEN', start.reason)
+      // A test customer's thread goes straight to the teammate trying it out,
+      // never through routing to whoever else is online.
+      const testOwner = await activeTestOwnerOf(author.principalId, tx)
       const [createdConv] = await tx
         .insert(conversations)
         .values({
@@ -368,6 +388,7 @@ export async function sendVisitorMessage(
           channel: 'messenger',
           status: 'open',
           subject: preview(content || fallbackLabel, attachments),
+          ...(testOwner ? { assignedAgentPrincipalId: testOwner } : {}),
         })
         .returning()
       conversation = createdConv
@@ -1474,6 +1495,9 @@ export async function routeUnassignedConversation(
 }
 
 async function assignRoutedConversation(conversation: Conversation): Promise<PrincipalId | null> {
+  // Test threads belong to the teammate trying them out; they never take a
+  // colleague's routing slot.
+  if (await testOwnerOf(conversation.visitorPrincipalId)) return null
   const { routeConversation } = await import('./routing')
   const { assignedPrincipalId } = await routeConversation(conversation)
   if (!assignedPrincipalId) return null
@@ -1641,10 +1665,16 @@ export async function requeueUnansweredOnAgentOffline(
   agentPrincipalId: PrincipalId
 ): Promise<void> {
   try {
+    // A test thread stays with the teammate who owns it, online or not.
     const assigned = await db
       .select({ id: conversations.id, status: conversations.status })
       .from(conversations)
-      .where(eq(conversations.assignedAgentPrincipalId, agentPrincipalId))
+      .where(
+        and(
+          eq(conversations.assignedAgentPrincipalId, agentPrincipalId),
+          notTestPrincipal(conversations.visitorPrincipalId)
+        )
+      )
     if (assigned.length === 0) return
 
     // Which of those threads have a real, visitor-facing agent reply (so they
@@ -2255,7 +2285,7 @@ export async function appendAssistantPendingActionNote(
       principalId: author.principalId,
       senderType: 'agent',
       isInternal: true,
-      content: `Requested approval: ${pendingAction.summary}`,
+      content: `Waiting for a teammate to confirm: ${pendingAction.summary}`,
       metadata: { assistantPendingAction: pendingAction },
     })
     .returning()

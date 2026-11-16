@@ -26,8 +26,12 @@ if (!connectionString) {
 const sql = postgres(connectionString)
 
 async function getMagicLinkToken(): Promise<string> {
-  // Better Auth 1.7.7 namespaces the storage identifier and types the payload.
-  // Only the unprefixed public token belongs in the verification URL.
+  // Better-auth's magic-link plugin stores rows as
+  //   { identifier: 'magic-link:<token>', value: '{"type":"magic-link","email":"..."}' }
+  // (the 'magic-link:' prefix arrived in better-auth 1.7.7 with the account
+  // takeover fix; the token is stored as given). The verify endpoint takes the
+  // bare token, so the prefix is stripped. `value` carries the recipient email,
+  // so the row is found by the email embedded in the JSON.
   const result = await sql`
     SELECT identifier, value, expires_at
     FROM verification
@@ -42,7 +46,7 @@ async function getMagicLinkToken(): Promise<string> {
     throw new Error(`No live magic-link verification row found for email: ${email}`)
   }
 
-  return (result[0].identifier as string).slice('magic-link:'.length)
+  return (result[0].identifier as string).replace(/^magic-link:/, '')
 }
 
 try {

@@ -11,6 +11,7 @@ import { billingQueries } from '@/lib/client/queries/billing'
 import { checkoutSuccessCopy } from '@/lib/shared/billing/checkout-flash'
 import { cn } from '@/lib/shared/utils'
 import { useBillingEnabled } from '@/lib/client/hooks/use-root-context'
+import { adminPageHead } from '@/lib/client/admin-head'
 
 const BILLING_ERROR_COPY: Record<string, string> = {
   seats_below_usage: 'Pick at least as many seats as people you already have.',
@@ -19,7 +20,6 @@ const BILLING_ERROR_COPY: Record<string, string> = {
   over_plan_limits: 'Remove anything that is over the new plan before switching.',
   already_on_plan: 'You are already on this plan.',
   already_on_addon: 'Branding removal is already on this workspace.',
-  price_changed: 'The pack price just changed. Check the new price and try again.',
   not_on_addon: 'Branding removal is not on this workspace.',
   unavailable: 'That billing action is not available right now.',
   invalid: 'That billing request was not valid. Try again from this page.',
@@ -37,6 +37,7 @@ const BILLING_ERROR_COPY: Record<string, string> = {
  * workspaces therefore have no navigation item or commercial dependency.
  */
 export const Route = createFileRoute('/admin/settings/billing')({
+  head: adminPageHead('Billing settings'),
   validateSearch: (search: Record<string, unknown>) => ({
     checkout:
       search.checkout === 'success' || search.checkout === 'cancelled'
@@ -99,7 +100,7 @@ function BillingPage() {
         <BillingSettings />
       ) : (
         <p className="text-sm text-muted-foreground">
-          Plan and billing is available only in a Quackback Cloud workspace.
+          Plan and billing are not enabled for this workspace.
         </p>
       )}
     </SettingsPage>

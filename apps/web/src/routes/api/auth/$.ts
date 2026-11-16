@@ -47,7 +47,11 @@ export const Route = createFileRoute('/api/auth/$')({
        */
       GET: async ({ request }) => {
         const url = new URL(request.url)
-        if (url.pathname.startsWith('/api/auth/oauth2/')) {
+        if (
+          url.pathname.startsWith('/api/auth/device/') ||
+          (url.pathname.startsWith('/api/auth/oauth2/') &&
+            !url.pathname.startsWith('/api/auth/oauth2/callback/'))
+        ) {
           const { mcpOAuthUnavailableResponse } =
             await import('@/lib/server/auth/mcp-oauth-availability')
           const unavailable = mcpOAuthUnavailableResponse()
@@ -94,7 +98,11 @@ export const Route = createFileRoute('/api/auth/$')({
        */
       POST: async ({ request }) => {
         const url = new URL(request.url)
-        if (url.pathname.startsWith('/api/auth/oauth2/')) {
+        if (
+          url.pathname.startsWith('/api/auth/device/') ||
+          (url.pathname.startsWith('/api/auth/oauth2/') &&
+            !url.pathname.startsWith('/api/auth/oauth2/callback/'))
+        ) {
           const { mcpOAuthUnavailableResponse } =
             await import('@/lib/server/auth/mcp-oauth-availability')
           const unavailable = mcpOAuthUnavailableResponse()
@@ -125,6 +133,15 @@ export const Route = createFileRoute('/api/auth/$')({
               body: JSON.stringify(mcpDcrRegistrationBody(body)),
             })
           }
+        }
+
+        // A device authorization request gets the MCP `resource` by default (as
+        // the token exchange below does) and loses any `user_id` pre-binding.
+        const { isDeviceCodeRequest, prepareDeviceCodeRequest } =
+          await import('@/lib/server/auth/device-request')
+        if (isDeviceCodeRequest(request)) {
+          const { config } = await import('@/lib/server/config')
+          request = await prepareDeviceCodeRequest(request, `${config.baseUrl}/api/mcp`)
         }
 
         // Ensure `resource` is present in token exchange requests.

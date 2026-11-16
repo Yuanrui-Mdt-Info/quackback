@@ -144,7 +144,7 @@ export function GuidanceRulesCard({ agent }: { agent: AssistantAgentKind }) {
         <p role="status" className="text-sm text-muted-foreground">
           {intl.formatMessage({
             id: 'automation.agent.guidance.loading',
-            defaultMessage: 'Loading guidance…',
+            defaultMessage: 'Loading guidance...',
           })}
         </p>
       </SettingsCard>
@@ -316,7 +316,7 @@ export function GuidanceRulesCard({ agent }: { agent: AssistantAgentKind }) {
                 {intl.formatMessage({
                   id: 'automation.agent.guidance.emptyDescription',
                   defaultMessage:
-                    'For example, when a customer asks about refunds, explain the 30-day policy before sharing the relevant Help Center article.',
+                    'For example, when a customer asks about refunds, explain the 30-day policy before sharing the relevant help center article.',
                 })}
               </p>
               <NewButton noun="guidance" onClick={openNew} className="mt-4 min-h-11 sm:min-h-8">
@@ -329,7 +329,7 @@ export function GuidanceRulesCard({ agent }: { agent: AssistantAgentKind }) {
             {intl.formatMessage(
               {
                 id: 'automation.agent.guidance.noResults',
-                defaultMessage: 'No guidance matches “{query}”.',
+                defaultMessage: 'No guidance matches "{query}".',
               },
               { query: query.trim() }
             )}
@@ -427,7 +427,7 @@ export function GuidanceRulesCard({ agent }: { agent: AssistantAgentKind }) {
           {
             id: 'automation.agent.guidance.deleteDescription',
             defaultMessage:
-              '“{name}” will no longer be available to the AI agent. This cannot be undone.',
+              '"{name}" will no longer be available to the AI agent. This cannot be undone.',
           },
           { name: deletingRule?.name ?? '' }
         )}
@@ -711,7 +711,7 @@ function GuidanceRuleDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
+      <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>
             {rule
@@ -845,7 +845,7 @@ function GuidanceRuleDialog({
                     {intl.formatMessage({
                       id: 'automation.agent.guidance.conditionHelp',
                       defaultMessage:
-                        'Conditions are interpreted from the conversation. Try a real widget or inbox conversation to verify them.',
+                        'Conditions are interpreted from the conversation. Use Test agent to verify realistic examples.',
                     })}
                   </p>
                   <span
@@ -878,7 +878,7 @@ function GuidanceRuleDialog({
               placeholder={intl.formatMessage({
                 id: 'automation.agent.guidance.instructionPlaceholder',
                 defaultMessage:
-                  'For example: Explain the 30-day refund policy before sharing the relevant Help Center article.',
+                  'For example: Explain the 30-day refund policy before sharing the relevant help center article.',
               })}
               onChange={(event) => setInstruction(event.target.value)}
             />
@@ -940,7 +940,7 @@ function GuidanceRuleDialog({
               {saving
                 ? intl.formatMessage({
                     id: 'automation.agent.save.savingButton',
-                    defaultMessage: 'Saving…',
+                    defaultMessage: 'Saving...',
                   })
                 : rule
                   ? intl.formatMessage({

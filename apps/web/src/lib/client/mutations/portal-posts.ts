@@ -19,6 +19,8 @@ import {
 import { portalDetailQueries, type PublicPostDetailView } from '@/lib/client/queries/portal-detail'
 import { adminQueries } from '@/lib/client/queries/admin'
 import type { PublicPostListItem } from '@/lib/shared/types'
+import type { PublicFeedbackFilters } from '@/lib/shared/types/filters'
+import type { JSONContent } from '@tiptap/react'
 import type { PostId, BoardId, PostStatusId } from '@quackback/ids'
 
 // ============================================================================
@@ -47,7 +49,8 @@ interface CreatePostInput {
   boardId: BoardId
   title: string
   content: string
-  contentJson: unknown
+  /** The details as a document; left out when there are none. */
+  contentJson?: JSONContent
   /** Answers to the board's configured custom fields, keyed by field key. */
   customFields?: Record<string, unknown>
 }
@@ -192,6 +195,16 @@ export function useVoteMutation(options?: { getAuthHeaders?: () => Record<string
         }
         return next
       })
+
+      // The Voted view no longer holds what it shows. The card stays where it
+      // is, so an unvote can be taken back, and the view refreshes the next
+      // time it's shown.
+      void queryClient.invalidateQueries({
+        queryKey: publicPostsKeys.lists(),
+        predicate: (query) =>
+          (query.queryKey[2] as PublicFeedbackFilters | undefined)?.view === 'voted',
+        refetchType: 'none',
+      })
     },
   })
 }
@@ -210,7 +223,7 @@ export function useCreatePublicPost() {
           boardId,
           title,
           content,
-          contentJson: contentJson as { type: 'doc'; content?: unknown[] },
+          contentJson: contentJson as { type: 'doc'; content?: unknown[] } | undefined,
           customFields,
         },
       }),

@@ -9,6 +9,7 @@ import { queryOptions, infiniteQueryOptions, keepPreviousData } from '@tanstack/
 import type { StatusComponentId, StatusIncidentId } from '@quackback/ids'
 import {
   listStatusComponentsAdminFn,
+  listStatusComponentChoicesFn,
   listStatusIncidentsAdminFn,
   getStatusIncidentAdminFn,
   getStatusOverviewAdminFn,
@@ -30,6 +31,7 @@ const STALE_TIME_MEDIUM = 60 * 1000
 export type StatusComponentsAdmin = Awaited<ReturnType<typeof listStatusComponentsAdminFn>>
 export type StatusComponentGroupAdmin = StatusComponentsAdmin['groups'][number]
 export type StatusComponentAdmin = StatusComponentGroupAdmin['components'][number]
+export type StatusComponentChoices = Awaited<ReturnType<typeof listStatusComponentChoicesFn>>
 
 /** List-item shape (the detail fn adds `notifiedSubscriberCount` on top). */
 export type StatusIncidentAdmin = Awaited<
@@ -75,7 +77,7 @@ export const statusKeys = {
   publicIncident: (id: string) => [...statusKeys.public(), 'incident', id] as const,
   publicUptime: (componentIds: string[], windowDays?: number) =>
     [...statusKeys.public(), 'uptime', [...componentIds].sort(), windowDays ?? 90] as const,
-  publicHistory: () => [...statusKeys.public(), 'history'] as const,
+  publicHistory: (before?: string) => [...statusKeys.public(), 'history', before] as const,
   mySubscription: () => [...statusKeys.public(), 'my-subscription'] as const,
 }
 
@@ -87,6 +89,16 @@ export const statusComponentQueries = {
     queryOptions({
       queryKey: statusKeys.components(),
       queryFn: () => listStatusComponentsAdminFn(),
+      staleTime: STALE_TIME_SHORT,
+    }),
+
+  /** The composers' affected-services picker. Publish-gated (the full list
+   *  above is manage-only); keyed under components() so every component
+   *  mutation's invalidation refreshes it too. */
+  choices: () =>
+    queryOptions({
+      queryKey: [...statusKeys.components(), 'choices'] as const,
+      queryFn: () => listStatusComponentChoicesFn(),
       staleTime: STALE_TIME_SHORT,
     }),
 
@@ -102,7 +114,10 @@ export const statusComponentQueries = {
 }
 
 export type StatusOverview = Awaited<ReturnType<typeof getStatusOverviewAdminFn>>
-export type StatusIncidentAdminDetail = Awaited<ReturnType<typeof getStatusIncidentAdminFn>>
+/** The detail fn returns null for a deleted or unknown incident. */
+export type StatusIncidentAdminDetail = NonNullable<
+  Awaited<ReturnType<typeof getStatusIncidentAdminFn>>
+>
 
 export const statusOverviewQueries = {
   get: () =>
@@ -221,13 +236,15 @@ export const publicStatusUptimeQueries = {
     }),
 }
 
-/** Paginated resolved-incident history, for the "Incident history" load-more. */
+/** Paginated resolved-incident history, for the "Incident history" load-more.
+ *  `before` is the page snapshot's `recentWindow.start`, so history continues
+ *  after the incidents the page already shows instead of repeating them. */
 export const publicStatusHistoryQueries = {
-  list: () =>
+  list: (before?: string) =>
     infiniteQueryOptions({
-      queryKey: statusKeys.publicHistory(),
+      queryKey: statusKeys.publicHistory(before),
       queryFn: ({ pageParam }: { pageParam: string | undefined }) =>
-        listStatusHistoryFn({ data: { cursor: pageParam, limit: 20 } }),
+        listStatusHistoryFn({ data: { cursor: pageParam, limit: 20, before } }),
       initialPageParam: undefined as string | undefined,
       getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
       staleTime: STALE_TIME_MEDIUM,

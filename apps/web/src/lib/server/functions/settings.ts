@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { createServerFn } from '@tanstack/react-start'
 import { tiptapContentSchema } from '@/lib/shared/schemas/posts'
+import { updateThemeSchema } from '@/lib/shared/schemas/settings'
 // Import types from barrel export (client-safe)
 import {
   DEFAULT_PORTAL_CONFIG,
@@ -323,10 +324,6 @@ export const fetchUserProfile = createServerFn({ method: 'GET' })
 // ============================================
 // Write Operations
 // ============================================
-
-const updateThemeSchema = z.object({
-  brandingConfig: z.record(z.string(), z.unknown()),
-})
 
 export const updatePortalConfigSchema = z.object({
   features: z
@@ -828,6 +825,8 @@ const updateWidgetConfigSchema = z.object({
   position: z.enum(['bottom-right', 'bottom-left']).optional(),
   launcherGreeting: z.string().max(120).optional(),
   launcherLabel: z.string().max(60).optional(),
+  visitorAnalytics: z.boolean().optional(),
+  visitorDeviceTracking: z.boolean().optional(),
   tabs: z
     .object({
       feedback: z.boolean().optional(),
@@ -1114,6 +1113,8 @@ export const getEmailChannelStatusFn = createServerFn({ method: 'GET' }).handler
   const { getEmailProvider, getEmailFrom } = await import('@quackback/email')
   const { isEmailInboundConfigured, inboundMintDomain } =
     await import('@/lib/server/domains/conversation/conversation.email-channel')
+  const { customSendingDomainsAvailable } =
+    await import('@/lib/server/domains/channel-accounts/sending-identity')
   let fromAddress: string | null = null
   try {
     fromAddress = getEmailFrom()
@@ -1128,6 +1129,9 @@ export const getEmailChannelStatusFn = createServerFn({ method: 'GET' }).handler
     // naming no single domain resolves to none, so this surface reports the
     // channel unconfigured rather than echoing a string nothing can receive on.
     inboundDomain: inboundMintDomain(),
+    customDomains: customSendingDomainsAvailable()
+      ? ('available' as const)
+      : ('unavailable' as const),
   }
 })
 

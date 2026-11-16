@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { useIntl, type IntlShape } from 'react-intl'
 import { XMarkIcon } from '@heroicons/react/24/solid'
 import { FileBadge } from '@/components/shared/files/file-badge'
@@ -142,7 +143,13 @@ function ImageTile({ item, onRemove, onRetry, onOpen }: TileProps) {
             <img src={src} alt="" className="size-full object-cover" />
           </button>
         ) : (
-          <img src={src} alt={item.name || 'Image'} className="size-full object-cover" />
+          <img
+            src={src}
+            alt={
+              item.name || intl.formatMessage({ id: 'files.family.image', defaultMessage: 'Image' })
+            }
+            className="size-full object-cover"
+          />
         ))}
       {item.status === 'uploading' && (
         <>
@@ -182,7 +189,9 @@ function FileTile({ item, onRemove, onRetry, onOpen }: TileProps) {
     <>
       <FileBadge name={item.name} family={item.family} size="sm" />
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-xs font-medium text-foreground">{item.name || 'File'}</span>
+        <span className="truncate text-xs font-medium text-foreground">
+          {item.name || intl.formatMessage({ id: 'files.family.other', defaultMessage: 'File' })}
+        </span>
         {ready && (
           <span className="text-[11px] text-muted-foreground">{formatBytes(item.size)}</span>
         )}
@@ -279,7 +288,7 @@ function CapNoticeLine({ item, onRemove }: Omit<TileProps, 'onRetry'>) {
  * gallery — the still-uploading/failed ones have nothing to show yet and are
  * left out.
  */
-export function ComposerAttachmentTray({
+export const ComposerAttachmentTray = memo(function ComposerAttachmentTray({
   items,
   onRemove,
   onRetry,
@@ -328,4 +337,4 @@ export function ComposerAttachmentTray({
       )}
     </div>
   )
-}
+})

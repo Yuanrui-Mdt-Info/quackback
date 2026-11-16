@@ -1,5 +1,9 @@
+import { lazy, Suspense, useContext } from 'react'
+import { IntlContext, useIntl, type MessageDescriptor } from 'react-intl'
+import { DocumentLocaleContext } from '@/components/shared/document-locale-context'
 import { Button } from '@/components/ui/button'
 import { describePlanRefusal } from '@/lib/shared/describe-upgrade'
+import { DEFAULT_LOCALE, messageArea, normalizeLocale } from '@/lib/shared/i18n'
 import { cn } from '@/lib/shared/utils'
 
 interface ErrorPageProps {
@@ -11,6 +15,52 @@ interface ErrorPageProps {
 interface FriendlyShellProps {
   children: React.ReactNode
   fullPage?: boolean
+}
+
+type Copy = (message: MessageDescriptor & { defaultMessage: string }) => string
+
+const english: Copy = (message) => message.defaultMessage
+
+// Error pages render under every route, so the module that loads their strings
+// is fetched when one shows rather than shipped in the chunk every page loads
+// (the notification list does the same).
+const AreaMessages = lazy(() =>
+  import('@/components/shared/area-messages').then((m) => ({ default: m.AreaMessages }))
+)
+
+/**
+ * Words an error page in the document's language, so it matches the page
+ * around it: translated on localized pages, English on the ones that stay
+ * English (most of admin, whose IntlProvider still follows the browser). Its
+ * strings stay out of the catalog every page seeds and load as the page shows,
+ * so it reads in English until they arrive. The router's default not-found and
+ * error pages can also render above every IntlProvider; with none mounted they
+ * stay English rather than throwing the way `useIntl` would.
+ */
+function ErrorPageCopy({ children }: { children: (copy: Copy) => React.ReactNode }) {
+  const intl = useContext(IntlContext)
+  const documentLocale = useContext(DocumentLocaleContext)
+  if (!intl || documentLocale === DEFAULT_LOCALE) return children(english)
+  // English needs nothing loaded, and a catalog loaded whole already holds the
+  // strings: word the page now rather than waiting on the loader's chunk.
+  if (
+    normalizeLocale(intl.locale) === DEFAULT_LOCALE ||
+    Object.keys(intl.messages).some((key) => messageArea(key) === 'errorPage')
+  ) {
+    return <PageLanguage>{children}</PageLanguage>
+  }
+  return (
+    <Suspense fallback={children(english)}>
+      <AreaMessages area="errorPage" fallback={children(english)}>
+        <PageLanguage>{children}</PageLanguage>
+      </AreaMessages>
+    </Suspense>
+  )
+}
+
+function PageLanguage({ children }: { children: (copy: Copy) => React.ReactNode }) {
+  const intl = useIntl()
+  return children((message) => intl.formatMessage(message))
 }
 
 export function FriendlyShell({ children, fullPage = true }: FriendlyShellProps) {
@@ -154,30 +204,45 @@ export function DefaultErrorPage({ error, reset, fullPage = true }: ErrorPagePro
   const message = errorMessage(error)
   return (
     <FriendlyShell fullPage={fullPage}>
-      <h1 className="text-2xl font-semibold tracking-tight">Something went wrong</h1>
-      <p className="mt-2 text-sm text-muted-foreground">
-        An unexpected error occurred. Try again, or return to the home page.
-      </p>
+      <ErrorPageCopy>
+        {(copy) => (
+          <>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              {copy({ id: 'common.errorPage.error.title', defaultMessage: 'Something went wrong' })}
+            </h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {copy({
+                id: 'common.errorPage.error.description',
+                defaultMessage:
+                  'An unexpected error occurred. Try again, or return to the home page.',
+              })}
+            </p>
 
-      {message && (
-        <details className="mt-4 rounded-md border bg-muted/40 px-4 py-3 text-left">
-          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
-            Technical details
-          </summary>
-          <p className="mt-2 break-words text-sm text-muted-foreground">{message}</p>
-        </details>
-      )}
+            {message && (
+              <details className="mt-4 rounded-md border bg-muted/40 px-4 py-3 text-left">
+                <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                  {copy({
+                    id: 'common.errorPage.technicalDetails',
+                    defaultMessage: 'Technical details',
+                  })}
+                </summary>
+                <p className="mt-2 break-words text-sm text-muted-foreground">{message}</p>
+              </details>
+            )}
 
-      <div className="mt-6 flex items-center justify-center gap-3">
-        {reset && (
-          <Button onClick={reset} variant="default">
-            Try again
-          </Button>
+            <div className="mt-6 flex items-center justify-center gap-3">
+              {reset && (
+                <Button onClick={reset} variant="default">
+                  {copy({ id: 'common.errorPage.tryAgain', defaultMessage: 'Try again' })}
+                </Button>
+              )}
+              <Button variant="outline" asChild>
+                <a href="/">{copy({ id: 'common.errorPage.goHome', defaultMessage: 'Go home' })}</a>
+              </Button>
+            </div>
+          </>
         )}
-        <Button variant="outline" asChild>
-          <a href="/">Go home</a>
-        </Button>
-      </div>
+      </ErrorPageCopy>
     </FriendlyShell>
   )
 }
@@ -185,17 +250,28 @@ export function DefaultErrorPage({ error, reset, fullPage = true }: ErrorPagePro
 export function NotFoundPage() {
   return (
     <FriendlyShell>
-      <h1 className="text-2xl font-semibold tracking-tight">Page not found</h1>
-      <p className="mt-2 text-sm text-muted-foreground">
-        The page you're looking for doesn't exist. It may have been moved or deleted, or the link
-        may be incorrect.
-      </p>
+      <ErrorPageCopy>
+        {(copy) => (
+          <>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              {copy({ id: 'common.errorPage.notFound.title', defaultMessage: 'Page not found' })}
+            </h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {copy({
+                id: 'common.errorPage.notFound.description',
+                defaultMessage:
+                  "The page you're looking for doesn't exist. It may have been moved or deleted, or the link may be incorrect.",
+              })}
+            </p>
 
-      <div className="mt-6">
-        <Button variant="outline" asChild>
-          <a href="/">Go home</a>
-        </Button>
-      </div>
+            <div className="mt-6">
+              <Button variant="outline" asChild>
+                <a href="/">{copy({ id: 'common.errorPage.goHome', defaultMessage: 'Go home' })}</a>
+              </Button>
+            </div>
+          </>
+        )}
+      </ErrorPageCopy>
     </FriendlyShell>
   )
 }

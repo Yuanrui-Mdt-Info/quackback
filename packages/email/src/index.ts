@@ -17,7 +17,8 @@ import type { Transporter } from 'nodemailer'
 import { Resend } from 'resend'
 import { createLogger } from '@quackback/logger'
 import { isSyntheticAnonEmail } from './anon'
-import { applyDisplayName, sendViaSes } from './ses'
+import { applyDisplayName, sendViaSes, SesTenantPausedError } from './ses'
+import { reportSesTenantPaused, resolveSesTenant } from './tenant-hooks'
 import { sendViaResend } from './resend'
 import { listUnsubscribeHeaders } from './list-unsubscribe'
 import { currentEmailIdempotencyKey } from './idempotency'
@@ -46,9 +47,11 @@ import type { SendingIdentity } from './sender'
 export type { SendingIdentity } from './sender'
 import { MagicLinkEmail } from './templates/magic-link'
 import { SignupNotAllowedEmail } from './templates/signup-not-allowed'
-import { InvitationEmail } from './templates/invitation'
+import { InvitationEmail, type InvitationEmailCopy } from './templates/invitation'
 import { PortalInviteEmail } from './templates/portal-invite'
 import { WelcomeEmail } from './templates/welcome'
+import { MessengerInstallEmail } from './templates/messenger-install'
+import { OnboardingEmail, type OnboardingEmailContent } from './templates/onboarding-email'
 import { StatusChangeEmail } from './templates/status-change'
 import { NewCommentEmail } from './templates/new-comment'
 import { ConversationMessageEmail } from './templates/conversation-message'
@@ -63,6 +66,10 @@ import { ChangelogPublishedEmail } from './templates/changelog-published'
 import { FeedbackLinkedEmail } from './templates/feedback-linked'
 import { PasswordResetEmail } from './templates/password-reset'
 import { RecoveryCodeUsedEmail } from './templates/recovery-code-used'
+import {
+  SendingDomainAttentionEmail,
+  type SendingDomainAttentionProblem,
+} from './templates/sending-domain-attention'
 import { NewSignInEmail } from './templates/new-sign-in'
 import { StatusIncidentPublishedEmail } from './templates/status-incident-published'
 import type { IncidentImpact } from './templates/status-incident-published'
@@ -70,6 +77,9 @@ import { StatusMaintenanceScheduledEmail } from './templates/status-maintenance-
 import { CsatRequestEmail } from './templates/csat-request'
 import { VerifyAddressEmail } from './templates/verify-address'
 export { setEmailPoweredByResolver } from './powered-by'
+export { setSesTenantHooks } from './tenant-hooks'
+export type { SesTenantHooks, SesTenantSendContext } from './tenant-hooks'
+export { SesTenantPausedError } from './ses'
 export { setDefaultFromResolver, resetDefaultFromResolver } from './default-from'
 import { createElement } from 'react'
 import { EmailPoweredByProvider, resolveEmailPoweredBy } from './powered-by'
@@ -410,8 +420,13 @@ async function dispatch(
     // threading. What is lost is our ability to CHOOSE the id; the Message-ID
     // route home survives because the caller records the assigned one instead
     // of the minted one.
+    //
+    // The tenant is asked for here and nowhere else: only this provider has
+    // them, and auth mail never reaches the app's resolver (see tenant-hooks).
+    const tenantName = await resolveSesTenant({ emailType, from })
     const result = await sendViaSes({
       from,
+      ...(tenantName ? { tenantName } : {}),
       to: options.to,
       subject: options.subject,
       ...(html !== undefined ? { html } : {}),
@@ -421,6 +436,11 @@ async function dispatch(
       ...(options.attachments && options.attachments.length > 0
         ? { attachments: options.attachments }
         : {}),
+    }).catch(async (error: unknown) => {
+      if (error instanceof SesTenantPausedError) {
+        await reportSesTenantPaused(error.tenantName, error.detail)
+      }
+      throw error
     })
     // The id as the provider reported it, which is what its delivery events and
     // the threading map both name the message by. A raw inbound header quotes
@@ -614,6 +634,8 @@ export async function sendRawEmail(options: RawEmailOptions): Promise<EmailResul
 // Invitation Email
 // ============================================================================
 
+export type { InvitationEmailCopy }
+
 interface SendInvitationParams {
   to: SecureRecipient
   invitedByName: string
@@ -621,20 +643,23 @@ interface SendInvitationParams {
   workspaceName: string
   inviteLink: string
   logoUrl?: string
+  /** The invitation in the team's language, subject included. English without it. */
+  copy?: InvitationEmailCopy & { subject: string }
 }
 
 export async function sendInvitationEmail(params: SendInvitationParams): Promise<EmailResult> {
-  const { to, invitedByName, inviteeName, workspaceName, inviteLink, logoUrl } = params
+  const { to, invitedByName, inviteeName, workspaceName, inviteLink, logoUrl, copy } = params
 
   return sendEmail({
     to,
-    subject: `You've been invited to join ${workspaceName} on Quackback`,
+    subject: copy?.subject ?? `${invitedByName} invited you to ${workspaceName}`,
     react: InvitationEmail({
       invitedByName,
       inviteeName,
       organizationName: workspaceName,
       inviteLink,
       logoUrl,
+      copy,
     }),
     emailType: 'InvitationEmail',
     preview: { inviteLink },
@@ -690,6 +715,66 @@ export async function sendWelcomeEmail(params: SendWelcomeParams): Promise<Email
 }
 
 // ============================================================================
+// Going live: install instructions and the onboarding welcome / nudge
+// ============================================================================
+
+export async function sendMessengerInstallEmail(params: {
+  to: string
+  senderName: string
+  workspaceName: string
+  snippet: string
+  logoUrl?: string
+}): Promise<EmailResult> {
+  const { to, senderName, workspaceName, snippet, logoUrl } = params
+  return sendEmail({
+    to,
+    subject: `Add ${workspaceName} Messenger to the website`,
+    react: MessengerInstallEmail({ senderName, workspaceName, snippet, logoUrl }),
+    emailType: 'MessengerInstallEmail',
+    preview: { workspaceName },
+  })
+}
+
+export type { OnboardingEmailContent }
+
+interface SendOnboardingEmailParams extends OnboardingEmailContent {
+  to: string
+  subject: string
+  workspaceName: string
+  unsubscribeUrl: string
+  logoUrl?: string
+}
+
+function sendOnboardingEmail(
+  params: SendOnboardingEmailParams,
+  emailType: 'OnboardingWelcomeEmail' | 'OnboardingNudgeEmail'
+): Promise<EmailResult> {
+  const { to, subject, ...content } = params
+  return sendEmail({
+    to,
+    subject,
+    react: OnboardingEmail(content),
+    extraHeaders: listUnsubscribeHeaders(params.unsubscribeUrl),
+    emailType,
+    preview: { cta: params.cta.url, lang: params.lang },
+  })
+}
+
+/** The one "workspace is ready" email, sent when a new workspace's owner first lands. */
+export async function sendOnboardingWelcomeEmail(
+  params: SendOnboardingEmailParams
+): Promise<EmailResult> {
+  return sendOnboardingEmail(params, 'OnboardingWelcomeEmail')
+}
+
+/** The day-two nudge, sent at most once while no customer has acted yet. */
+export async function sendOnboardingNudgeEmail(
+  params: SendOnboardingEmailParams
+): Promise<EmailResult> {
+  return sendOnboardingEmail(params, 'OnboardingNudgeEmail')
+}
+
+// ============================================================================
 // Sign-in Email (magic link + 6-digit code combined)
 // ============================================================================
 
@@ -698,16 +783,24 @@ interface SendMagicLinkParams {
   signInUrl: string
   code: string
   logoUrl?: string
+  /** The workspace being signed in to, named in the subject beside the code. */
+  workspaceName?: string
+}
+
+/** The code first, so the inbox list alone is enough to sign in. */
+export function magicLinkSubject(code: string, workspaceName?: string): string {
+  const name = workspaceName?.trim()
+  return name ? `${code} is your code for ${name}` : `${code} is your sign-in code`
 }
 
 export async function sendMagicLinkEmail(params: SendMagicLinkParams): Promise<EmailResult> {
-  const { to, signInUrl, code, logoUrl } = params
+  const { to, signInUrl, code, logoUrl, workspaceName } = params
 
   log.debug('sending sign-in email')
   return sendEmail({
     to,
-    subject: 'Your Quackback sign-in link',
-    react: MagicLinkEmail({ signInUrl, code, logoUrl }),
+    subject: magicLinkSubject(code, workspaceName),
+    react: MagicLinkEmail({ signInUrl, code, logoUrl, workspaceName }),
     emailType: 'MagicLinkEmail',
     preview: { signInUrl, code },
   })
@@ -855,6 +948,37 @@ export async function sendNewSignInEmail(params: SendNewSignInParams): Promise<E
     }),
     emailType: 'NewSignInEmail',
     preview: { occurredAt },
+  })
+}
+
+// ============================================================================
+// Sending domain needs attention
+// ============================================================================
+
+interface SendSendingDomainAttentionParams {
+  to: SecureRecipient
+  domain: string
+  record?: SendingDomainAttentionProblem | null
+  settingsUrl?: string | null
+  workspaceName?: string
+  logoUrl?: string
+}
+
+/**
+ * To a person who manages email channels, when a verified sending domain stops
+ * verifying and replies fall back to the default address.
+ */
+export async function sendSendingDomainAttentionEmail(
+  params: SendSendingDomainAttentionParams
+): Promise<EmailResult> {
+  const { to, domain, record, settingsUrl, workspaceName, logoUrl } = params
+  log.debug('sending sending-domain attention alert')
+  return sendEmail({
+    to,
+    subject: `Sending from ${domain} needs attention`,
+    react: SendingDomainAttentionEmail({ domain, record, settingsUrl, workspaceName, logoUrl }),
+    emailType: 'SendingDomainAttentionEmail',
+    preview: { domain },
   })
 }
 
@@ -1258,7 +1382,7 @@ function ticketEventCopy(p: SendTicketEventEmailParams): TicketEmailCopy {
           subject: `Your ticket ${p.ticketLabel} was closed`,
           heading: 'Your ticket was closed',
           intro: `${p.ticketLabel} "${p.title}" has been closed by the ${p.workspaceName} team.`,
-          note: 'If you have a follow-up, reply on the ticket thread — replying reopens it.',
+          note: 'If you have a follow-up, reply on the ticket thread. Replying reopens it.',
           ctaLabel: 'View your ticket',
           reason: requesterReason,
         }
@@ -1738,6 +1862,8 @@ export async function sendCsatRequestEmail(
 export { InvitationEmail } from './templates/invitation'
 export { PortalInviteEmail } from './templates/portal-invite'
 export { WelcomeEmail } from './templates/welcome'
+export { MessengerInstallEmail } from './templates/messenger-install'
+export { OnboardingEmail } from './templates/onboarding-email'
 export { MagicLinkEmail } from './templates/magic-link'
 export { SignupNotAllowedEmail } from './templates/signup-not-allowed'
 export { StatusChangeEmail } from './templates/status-change'
@@ -1747,6 +1873,14 @@ export { ChangelogPublishedEmail } from './templates/changelog-published'
 export { FeedbackLinkedEmail } from './templates/feedback-linked'
 export { PasswordResetEmail } from './templates/password-reset'
 export { RecoveryCodeUsedEmail } from './templates/recovery-code-used'
+export {
+  SendingDomainAttentionEmail,
+  sendingDomainProblem,
+} from './templates/sending-domain-attention'
+export type {
+  SendingDomainAttentionRecord,
+  SendingDomainAttentionProblem,
+} from './templates/sending-domain-attention'
 export { NewSignInEmail } from './templates/new-sign-in'
 export { StatusIncidentPublishedEmail } from './templates/status-incident-published'
 export type { IncidentImpact } from './templates/status-incident-published'

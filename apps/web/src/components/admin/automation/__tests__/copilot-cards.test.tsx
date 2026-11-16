@@ -87,6 +87,14 @@ function renderWithProviders(node: React.ReactElement) {
 }
 
 describe('CopilotKnowledgeCard', () => {
+  it('describes its conversation sources without any Home wording', async () => {
+    renderWithProviders(<CopilotKnowledgeCard />)
+    expect(await screen.findByText('Earlier conversations with the same customer.')).toBeTruthy()
+    expect(
+      screen.getByText('Private teammate notes on the conversation. Never used in drafts.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Home/)).toBeNull()
+  })
   it('lists all seven live sources (toggles are wired into the runtime)', async () => {
     renderWithProviders(<CopilotKnowledgeCard />)
     expect(await screen.findByText('Help center')).toBeInTheDocument()

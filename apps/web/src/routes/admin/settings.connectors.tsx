@@ -22,13 +22,15 @@ import {
   useStartConnectorOAuth,
 } from '@/lib/client/mutations/assistant-connectors'
 import { toast } from 'sonner'
-import { PERMISSIONS } from '@/lib/shared/permissions'
-import { assertRoutePermission } from '@/lib/shared/route-permission'
+import { assertRouteAnyPermission } from '@/lib/shared/route-permission'
+import { AI_ANY_PERMISSIONS } from '@/lib/shared/ai-permissions'
 import { warmQuery } from '@/lib/client/queries/warm-query'
+import { adminPageHead } from '@/lib/client/admin-head'
 
 export const Route = createFileRoute('/admin/settings/connectors')({
+  head: adminPageHead('Connectors settings'),
   beforeLoad: ({ context }) => {
-    assertRoutePermission(context.permissions, PERMISSIONS.ASSISTANT_MANAGE)
+    assertRouteAnyPermission(context.permissions, AI_ANY_PERMISSIONS)
   },
   loader: async ({ context }) => {
     const { queryClient } = context
@@ -65,7 +67,7 @@ function ConnectorsPage() {
       page="/admin/settings/connectors"
       description={intl.formatMessage({
         id: 'automation.connectors.description',
-        defaultMessage: 'Give Quinn tools from external MCP servers.',
+        defaultMessage: 'Give Quackback AI tools from external MCP servers.',
       })}
       actions={addButton}
     >

@@ -5,6 +5,7 @@ import type { PlanNotice } from '@/lib/server/domains/settings/tier-limits.types
 
 export interface PlanNoticeView {
   label: string
+  trialPlan?: string
   message?: string
   /** Whole days until expiry (ceil), clamped to >= 0. Null when the
    *  notice has no (valid) expiresAt. */
@@ -14,9 +15,17 @@ export interface PlanNoticeView {
   actionUrl?: string
   actionLabel?: string
   ended: boolean
+  /** An ended trial's deadline for choosing a plan, while it is still ahead. */
+  choiceDueAt: Date | null
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000
+
+function futureDate(iso: string | undefined, now: Date): Date | null {
+  if (!iso) return null
+  const at = Date.parse(iso)
+  return Number.isNaN(at) || at <= now.getTime() ? null : new Date(at)
+}
 
 export function presentPlanNotice(
   notice: PlanNotice | null | undefined,
@@ -36,11 +45,21 @@ export function presentPlanNotice(
   }
   return {
     label: notice.label,
+    ...(notice.trialPlan ? { trialPlan: notice.trialPlan } : {}),
     message: notice.message,
     daysLeft,
     urgent: daysLeft !== null && daysLeft <= 3,
     actionUrl: notice.actionUrl,
     actionLabel: notice.actionLabel,
     ended: Boolean(notice.ended),
+    choiceDueAt: futureDate(notice.choiceDueAt, now),
   }
+}
+
+/**
+ * A running trial with more than three days left. It stays out of the banner
+ * and shows quietly in the sidebar until its last days.
+ */
+export function isQuietTrial(view: PlanNoticeView | null): boolean {
+  return Boolean(view && !view.ended && view.daysLeft !== null && view.daysLeft > 3)
 }

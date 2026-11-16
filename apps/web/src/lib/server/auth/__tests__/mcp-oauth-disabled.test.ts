@@ -1,9 +1,4 @@
-/**
- * Every way into Better Auth carries the trusted client address: the instance
- * is configured to read only the private header, requests through
- * `auth.handler` get it set from the socket peer, and server-side `auth.api.*`
- * calls get the same rewrite of the headers they forward.
- */
+/** MCP OAuth opt-out must leave ordinary HTTP authentication available. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 if (!process.env.BASE_URL?.startsWith('http')) process.env.BASE_URL = 'http://localhost:3000'
@@ -80,6 +75,7 @@ describe('explicit MCP OAuth opt-out', () => {
     await getAuth()
     const ids = built.options?.plugins?.map((p) => p.id)
     expect(ids).not.toContain('oauth-provider')
+    expect(ids).not.toContain('device-authorization')
     expect(ids).toEqual(expect.arrayContaining(['bearer', 'one-time-token', 'magic-link']))
     expect(built.options?.emailAndPassword?.enabled).toBe(true)
     expect(ensureMcpOauthResource).not.toHaveBeenCalled()
@@ -100,7 +96,9 @@ describe('explicit MCP OAuth opt-out', () => {
     vi.stubEnv('QUACKBACK_MCP_OAUTH_ENABLED', 'true')
     resetConfig()
     await getAuth()
-    expect(built.options?.plugins?.map((p) => p.id)).toContain('oauth-provider')
+    expect(built.options?.plugins?.map((p) => p.id)).toEqual(
+      expect.arrayContaining(['oauth-provider', 'device-authorization'])
+    )
     expect(ensureMcpOauthResource).toHaveBeenCalled()
   })
 

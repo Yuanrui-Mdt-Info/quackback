@@ -23,6 +23,11 @@ import { quinnActor } from './assistant.actor'
 import { addTicketNote } from '@/lib/server/domains/tickets/ticket-message.service'
 import { logger } from '@/lib/server/logger'
 import type { AssistantRole } from '@/lib/shared/assistant/config'
+import {
+  pendingActionContentDigest,
+  requesterColumns,
+  type PendingActionRequester,
+} from './pending-action-decisions'
 
 const log = logger.child({ component: 'assistant-pending-actions' })
 
@@ -33,8 +38,9 @@ const DEFAULT_TTL_HOURS = 24
 
 /**
  * A pending action's polymorphic parent (unified inbox §3.3): exactly one of
- * conversation or ticket, mirroring the DB's own `num_nonnuls(...) = 1` CHECK
- * on `assistant_pending_actions`.
+ * conversation, ticket or workspace thread, where the card is decided. The
+ * DB's own `num_nonnulls(...) <= 1` CHECK on `assistant_pending_actions` also
+ * admits none, which no caller files.
  */
 export type ProposePendingActionParent =
   | { workspaceThreadKey: string; conversationId?: undefined; ticketId?: undefined }
@@ -48,6 +54,8 @@ export type ProposePendingActionInput = ProposePendingActionParent & {
   summary: string
   originRole?: AssistantRole
   ttlHours?: number
+  /** Who filed the request; it can never decide it. */
+  requester?: PendingActionRequester
   /**
    * A stable per-turn key, same shape as `assistant_tool_calls.idempotency_key`
    * (assistant.tools.ts's `resolveIdempotencyKey`:
@@ -78,22 +86,27 @@ export async function proposePendingAction(
 ): Promise<AssistantPendingAction> {
   const ttlHours = input.ttlHours ?? DEFAULT_TTL_HOURS
   const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000)
-  const [row] = await exec
-    .insert(assistantPendingActions)
-    .values({
-      workspaceThreadKey: input.workspaceThreadKey ?? null,
-      conversationId: input.conversationId ?? null,
-      ticketId: input.ticketId ?? null,
-      involvementId: input.involvementId ?? null,
-      toolName: input.toolName,
-      args: input.args,
-      summary: input.summary,
-      originRole: input.originRole ?? 'customer_support',
-      expiresAt,
-      idempotencyKey: input.idempotencyKey ?? null,
-    })
-    .onConflictDoNothing()
-    .returning()
+  const row = await exec.transaction(async (tx) => {
+    const [inserted] = await tx
+      .insert(assistantPendingActions)
+      .values({
+        workspaceThreadKey: input.workspaceThreadKey ?? null,
+        conversationId: input.conversationId ?? null,
+        ticketId: input.ticketId ?? null,
+        involvementId: input.involvementId ?? null,
+        toolName: input.toolName,
+        args: input.args,
+        summary: input.summary,
+        originRole: input.originRole ?? 'customer_support',
+        expiresAt,
+        idempotencyKey: input.idempotencyKey ?? null,
+        argsDigest: pendingActionContentDigest(input.args),
+        ...requesterColumns(input.requester),
+      })
+      .onConflictDoNothing()
+      .returning()
+    return inserted
+  })
   if (row) {
     await surfacePendingActionNote(row)
     return row
@@ -146,12 +159,12 @@ export async function getPendingActionByIdempotencyKey(
  * Announce a fresh proposal in the item's thread so the team sees it without
  * polling. Best-effort: a note failure (or Quinn not yet provisioned) must
  * never fail the proposal itself, since the pending action row is already the
- * source of truth an agent can act on from the approval queue.
+ * source of truth an agent can act on from the pending action card.
  *
  * Conversation-scoped rows get the rich card note (`appendAssistantPendingActionNote`,
- * with the structured `assistantPendingAction` metadata the approval-queue UI
+ * with the structured `assistantPendingAction` metadata the card UI
  * renders as a card). Ticket-scoped rows (unified inbox §3.3) get a plain
- * internal ticket note instead — there is no ticket-scoped approval-queue card
+ * internal ticket note instead — there is no ticket-scoped pending action card
  * UI yet (see functions/assistant-actions.ts's `AssistantPendingActionDTO`
  * comment), so this only needs to make the proposal visible in the thread, not
  * render a card. Posted as Quinn (`quinnActor`), which needs `ticket.note` —
@@ -159,6 +172,7 @@ export async function getPendingActionByIdempotencyKey(
  * other bounded ticket/conversation authority.
  */
 async function surfacePendingActionNote(row: AssistantPendingAction): Promise<void> {
+  if (row.workspaceThreadKey) return
   try {
     const assistant = await getAssistantPrincipal()
     if (!assistant) return
@@ -175,7 +189,7 @@ async function surfacePendingActionNote(row: AssistantPendingAction): Promise<vo
     if (row.ticketId) {
       await addTicketNote(quinnActor(assistant.id), {
         ticketId: row.ticketId,
-        content: `Requested approval: ${row.summary}`,
+        content: `Waiting for a teammate to confirm: ${row.summary}`,
       })
     }
   } catch (err) {
@@ -196,29 +210,48 @@ export async function getPendingActionById(
   return row ?? null
 }
 
+/** What a decision carries. */
+export interface PendingActionDecisionOptions {
+  /**
+   * The content digest the decision names. The decision only lands on a row
+   * whose stored digest is that one, so it can never approve content it was
+   * not shown.
+   */
+  contentHash: string
+}
+
 /**
  * Move a proposal to approved/rejected. Only a still-`proposed`,
  * not-yet-expired action is decidable; returns null otherwise (already
- * decided, or the sweep beat this call to expiring it).
+ * decided, the sweep beat this call to expiring it, or the content is not
+ * what the decision names).
  */
 export async function decidePendingAction(
   id: AssistantPendingActionId,
   decision: 'approved' | 'rejected',
   decidedById: PrincipalId,
-  exec: Executor = db
+  exec: Executor,
+  options: PendingActionDecisionOptions
 ): Promise<AssistantPendingAction | null> {
-  const [row] = await exec
-    .update(assistantPendingActions)
-    .set({ status: decision, decidedById, decidedAt: new Date() })
-    .where(
-      and(
-        eq(assistantPendingActions.id, id),
-        eq(assistantPendingActions.status, 'proposed'),
-        gt(assistantPendingActions.expiresAt, new Date())
+  return exec.transaction(async (tx) => {
+    const [row] = await tx
+      .update(assistantPendingActions)
+      .set({
+        status: decision,
+        decidedById,
+        decidedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(assistantPendingActions.id, id),
+          eq(assistantPendingActions.status, 'proposed'),
+          gt(assistantPendingActions.expiresAt, new Date()),
+          eq(assistantPendingActions.argsDigest, options.contentHash)
+        )
       )
-    )
-    .returning()
-  return row ?? null
+      .returning()
+    return row ?? null
+  })
 }
 
 /** Settle an approved action into a terminal execution outcome. */
@@ -228,12 +261,20 @@ async function settleApprovedAction(
   result: Record<string, unknown> | null,
   exec: Executor
 ): Promise<AssistantPendingAction | null> {
-  const [row] = await exec
-    .update(assistantPendingActions)
-    .set({ status, executedAt: new Date(), result })
-    .where(and(eq(assistantPendingActions.id, id), eq(assistantPendingActions.status, 'approved')))
-    .returning()
-  return row ?? null
+  return exec.transaction(async (tx) => {
+    const [row] = await tx
+      .update(assistantPendingActions)
+      .set({
+        status,
+        executedAt: new Date(),
+        result,
+      })
+      .where(
+        and(eq(assistantPendingActions.id, id), eq(assistantPendingActions.status, 'approved'))
+      )
+      .returning()
+    return row ?? null
+  })
 }
 
 /** Record a successful execution. Only an `approved` action can be executed. */

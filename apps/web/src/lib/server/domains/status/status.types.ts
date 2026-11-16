@@ -176,6 +176,8 @@ export interface StatusIncidentWithDetails {
   resolvedAt: Date | null
   backfilled: boolean
   notifiedAt: Date | null
+  /** The publisher's "Email subscribers" choice; false means never emailed. */
+  notifySubscribers: boolean
   createdBy: PrincipalId | null
   createdAt: Date
   updatedAt: Date
@@ -187,6 +189,11 @@ export interface ListStatusIncidentsParams {
   kind?: StatusIncidentKind
   /** 'active' = not resolved/completed; 'resolved' = resolved/completed. */
   state?: 'active' | 'resolved' | 'all'
+  /** Only rows in one of these lifecycle statuses, applied before `limit`. */
+  statuses?: Array<StatusIncidentStatus | StatusMaintenanceStatus>
+  /** 'newest' (default) = most recently created first, and pages by `cursor`;
+   *  'soonest' = earliest scheduled start first (none last), one page only. */
+  order?: 'newest' | 'soonest'
   /** Case-insensitive title match. */
   search?: string
   cursor?: string
@@ -271,6 +278,8 @@ export interface StatusSubscriptionCsvImportResult {
   imported: number
   /** Emails that didn't match an existing user account. */
   skipped: number
+  /** Matched people who had unsubscribed; left unsubscribed. */
+  optedOut: number
   total: number
 }
 
@@ -352,7 +361,13 @@ export interface StatusPageSnapshot {
   ungroupedComponents: PublicStatusComponent[]
   activeIncidents: PublicStatusIncident[]
   upcomingMaintenance: PublicStatusIncident[]
+  /** Resolved incidents that started inside `recentWindow`, grouped by UTC
+   *  day, newest first. Only days with an incident appear, so the list is
+   *  empty when the window had none. */
   recentIncidents: StatusDayGroup[]
+  /** The recent-incidents window. Incident history resumes from its `start`
+   *  (`IncidentHistoryParams.before`) so it never repeats these incidents. */
+  recentWindow: { start: Date; days: number }
 }
 
 export interface UptimeDay {
@@ -371,6 +386,9 @@ export interface UptimeSeries {
 export interface IncidentHistoryParams {
   cursor?: string
   limit?: number
+  /** Leave out incidents that started at or after this instant: the page's
+   *  recent window (`StatusPageSnapshot.recentWindow.start`) already lists them. */
+  before?: Date
 }
 
 export interface IncidentHistoryResult {

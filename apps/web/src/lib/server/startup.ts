@@ -116,6 +116,14 @@ export function logStartupBanner(): void {
 
   logUnusedRedisUrl(log)
 
+  // Self-hosted first boot only: one line pointing at the repo, while setup is
+  // unfinished, so it shows during the first `docker compose up` and never again.
+  if (!config.isPooledTenancy) {
+    import('@/lib/server/github-star-prompt')
+      .then(({ logFirstBootStarLine }) => logFirstBootStarLine(log))
+      .catch((err) => log.debug({ err }, 'first boot star line skipped'))
+  }
+
   // One-shot override: run a named fleet job and exit. The live fleet does
   // not use this — hourly and daily sweeps run on the always-on worker — but
   // a container that should do one pass and stop still needs a way to say so.
@@ -198,6 +206,15 @@ export function logStartupBanner(): void {
         runFleetPass('sweep', () => runStartupBackfills())
       )
       .catch((err) => log.error({ err }, 'failed to run startup backfills'))
+  }
+
+  // First-run setup token: on an install that still has no admin, either note
+  // that SETUP_TOKEN is live or print a generated one once. Self-hosted only:
+  // a pooled workspace is provisioned for a named owner and never takes one.
+  if (!config.isPooledTenancy) {
+    import('@/lib/server/domains/onboarding/headless-setup')
+      .then(({ ensureBootSetupToken }) => ensureBootSetupToken())
+      .catch((err) => log.error({ err }, 'failed to prepare the first-run setup token'))
   }
 
   // Quackback config file watcher — reconciles managed fields from

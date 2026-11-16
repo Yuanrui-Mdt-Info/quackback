@@ -19,6 +19,15 @@ describe('feature flag settings layout', () => {
     expect([...productFlags].sort()).toEqual(Object.keys(DEFAULT_FEATURE_FLAGS).sort())
   })
 
+  it('drops a stored Copilot on Home value from the retired Labs switch', () => {
+    const flags = resolveFeatureFlags(JSON.stringify({ supportInbox: true, copilotHome: true }))
+    expect(flags).not.toHaveProperty('copilotHome')
+    expect(flags.supportInbox).toBe(true)
+    expect(enableFlagsForUseCase(DEFAULT_FEATURE_FLAGS, 'customer_support')).not.toHaveProperty(
+      'copilotHome'
+    )
+  })
+
   it('shows the five workspace products in the expected order', () => {
     expect(PRODUCT_DEFINITIONS.map((product) => product.label)).toEqual([
       'Feedback & Roadmaps',

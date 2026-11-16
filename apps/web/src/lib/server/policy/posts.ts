@@ -12,6 +12,10 @@ import {
   type ModerationRuleValue,
   type ModerationState,
 } from '@/lib/server/db'
+// Imported through the client-safe re-export, not '@/lib/server/db': this is a
+// pure helper, and pulling it from the db barrel would make every suite that
+// mocks that barrel have to stub it.
+import { resolveReplyPolicy } from '@/lib/shared/db-types'
 import type { PrincipalId } from '@quackback/ids'
 import { allowDecision, denyDecision, isTeamActor, type Actor, type Decision } from './types'
 import { can } from './authorize'
@@ -20,6 +24,7 @@ import { canViewBoard, boardViewFilter } from './boards'
 import { tierAllows } from './access'
 import { resolveWorkspaceModeration, type ModerationAxis } from '@/lib/shared/moderation-policy'
 import { normalizeBoardAccess } from '@/lib/shared/schemas/boards'
+import { notTestPrincipal } from '@/lib/server/test-data'
 
 /** The workspace moderation policy — the fallback that per-board
  *  `moderation` rules resolve against when set to `'inherit'`. */
@@ -58,6 +63,8 @@ export function resolveModerationRule(
 interface PostShape {
   moderationState: ModerationState
   principalId?: PrincipalId | null
+  /** The author is a test customer (callers that load the row select `isTestPrincipalSql`). */
+  authorIsTest?: boolean
 }
 
 interface BoardShape {
@@ -71,6 +78,15 @@ function accessOf(board: BoardShape): BoardAccess {
 const isTeam = isTeamActor
 
 export function canViewPost(actor: Actor, post: PostShape, board: BoardShape): Decision {
+  // A test customer sees only its own ideas, which are test by identity, and
+  // nothing once its owner has left the team.
+  if (actor.testFeedback) {
+    if (!actor.testFeedback.active || !post.principalId || post.principalId !== actor.principalId) {
+      return denyDecision('Post is not visible')
+    }
+  } else if (post.authorIsTest && !isTeam(actor) && post.principalId !== actor.principalId) {
+    return denyDecision('Post is not visible')
+  }
   const boardDecision = canViewBoard(actor, board)
   if (!boardDecision.allowed) return boardDecision
 
@@ -90,26 +106,33 @@ export function canViewPost(actor: Actor, post: PostShape, board: BoardShape): D
   return denyDecision('Post is not yet visible')
 }
 
-/**
- * SQL predicate for post list queries. Caller must join `boards` so
- * that boards.access is resolvable. The predicate composes WITH
- * `isNull(posts.deletedAt)` from existing list queries — never replaces it.
- */
+/** Test visibility depends on the author's identity, independent of the post's board. */
+export function postTestViewFilter(actor: Actor): SQL {
+  const ownPost = actor.principalId ? eq(posts.principalId, actor.principalId) : sql`false`
+  if (actor.testFeedback) return actor.testFeedback.active ? ownPost : sql`false`
+  return isTeam(actor) ? sql`true` : or(notTestPrincipal(posts.principalId), ownPost)!
+}
+
+/** Caller joins boards before applying the complete view predicate. */
 export function postViewFilter(actor: Actor): SQL {
+  const testVisibility = postTestViewFilter(actor)
   if (can(actor, PERMISSIONS.POST_VIEW_PRIVATE)) {
-    return sql`${posts.moderationState} <> 'deleted'`
+    return and(sql`${posts.moderationState} <> 'deleted'`, testVisibility)!
   }
   const principalIdParam: string | null = actor.principalId ?? null
   const ownPending =
     principalIdParam !== null
       ? and(eq(posts.moderationState, 'pending'), eq(posts.principalId, principalIdParam as never))
       : sql`false`
-  return and(boardViewFilter(actor), or(eq(posts.moderationState, 'published'), ownPending))!
+  return and(
+    boardViewFilter(actor),
+    or(eq(posts.moderationState, 'published'), ownPending),
+    testVisibility
+  )!
 }
 
 export type CommentCreateDecision =
-  | { allowed: true; requiresApproval: boolean }
-  | { allowed: false; reason: string }
+  { allowed: true; requiresApproval: boolean } | { allowed: false; reason: string }
 
 /** Action-specific copy for the (unreachable) anonymous deny branch. */
 const ANON_DENY_MESSAGE: Record<'comment' | 'vote' | 'submit', string> = {
@@ -144,7 +167,12 @@ function tierDenyMessage(action: 'comment' | 'vote' | 'submit', tier: AccessTier
  * 1. The actor must be able to view the post (board view tier + moderation state).
  * 2. The actor must satisfy the board's comment tier — independent of view
  *    (a board can be public-to-view but team-only-to-comment).
- * 3. If comments are locked, only team members may bypass.
+ * 3. On an `author-only` board, only the post's own author and team members
+ *    may reply — everyone else reads the thread without being able to answer.
+ * 4. If comments are locked, only team members may bypass.
+ * 5. If the post was merged into another, only team members may comment. Its
+ *    thread shows on the post it was merged into, which is where the portal
+ *    sends everyone else.
  *
  * On the allowed branch, `requiresApproval` is true when the actor is not
  * a team member AND the board's `moderation.comments` rule (resolved
@@ -152,7 +180,7 @@ function tierDenyMessage(action: 'comment' | 'vote' | 'submit', tier: AccessTier
  */
 export function canCreateComment(
   actor: Actor,
-  post: PostShape & { isCommentsLocked: boolean },
+  post: PostShape & { isCommentsLocked: boolean; isMerged: boolean },
   board: BoardShape,
   workspaceApproval: RequireApproval | undefined
 ): CommentCreateDecision {
@@ -163,8 +191,26 @@ export function canCreateComment(
   if (!tierAllows(actor, access.comment, access.segments.comment)) {
     return { allowed: false, reason: tierDenyMessage('comment', access.comment) }
   }
+  // Author-only board: the thread belongs to its author, so only they and the
+  // team may reply. Authorship is principalId VALUE equality guarded on a
+  // non-null actor principal — the same guard canViewPost's own-pending hatch
+  // uses, and for the same reason: without it an anonymous viewer (null) would
+  // match every anonymously-authored post (null) and inherit the author's
+  // reply right. An actor with no principal therefore always lands on the deny.
+  if (resolveReplyPolicy(access) === 'author-only' && !isTeam(actor)) {
+    const isAuthor = !!actor.principalId && actor.principalId === post.principalId
+    if (!isAuthor) {
+      return {
+        allowed: false,
+        reason: 'Only the post author and team members can reply on this board',
+      }
+    }
+  }
   if (post.isCommentsLocked && !isTeam(actor)) {
     return { allowed: false, reason: 'Comments are locked on this post' }
+  }
+  if (post.isMerged && !isTeam(actor)) {
+    return { allowed: false, reason: 'This post was merged into another post' }
   }
   return {
     allowed: true,
@@ -200,8 +246,7 @@ export function canVotePost(actor: Actor, post: PostShape, board: BoardShape): V
 }
 
 export type CreateDecision =
-  | { allowed: true; requiresApproval: boolean }
-  | { allowed: false; reason: string }
+  { allowed: true; requiresApproval: boolean } | { allowed: false; reason: string }
 
 export function canCreatePost(
   actor: Actor,
@@ -216,12 +261,15 @@ export function canCreatePost(
   // on a board they cannot see.
   const view = canViewBoard(actor, board)
   if (!view.allowed) return { allowed: false, reason: view.reason }
+  if (actor.testFeedback && !actor.testFeedback.active) {
+    return { allowed: false, reason: 'insufficient_permission:post.create' }
+  }
 
   // Submit is then its own decision on top of view — a board can be public to
   // view but team-only to submit (admin-curated roadmap pattern), so the tier
   // check stays independent rather than collapsing into canViewBoard.
   const access = accessOf(board)
-  if (!tierAllows(actor, access.submit, access.segments.submit)) {
+  if (!actor.testFeedback?.canSubmit && !tierAllows(actor, access.submit, access.segments.submit)) {
     return { allowed: false, reason: tierDenyMessage('submit', access.submit) }
   }
 
@@ -251,6 +299,16 @@ export interface BoardCapabilities {
 }
 
 /**
+ * Whether the workspace anonymous master switch applies to this actor. Team
+ * actors are never gated by it (tierAllows already bypasses for them), so the
+ * !isTeam guard is part of the question — a hypothetical non-user team actor
+ * (e.g. a service principal carrying a team role) must stay ungated.
+ */
+function isAnonCeilinged(actor: Actor): boolean {
+  return !isTeam(actor) && actor.principalType !== 'user'
+}
+
+/**
  * Per-board submit/vote/comment capability for a viewer, composed with the
  * workspace anonymous master switch. This is the single source of truth the
  * portal + widget UIs use to decide whether to advertise the submit/vote/comment
@@ -272,29 +330,62 @@ export function boardCapabilitiesForActor(
   const canSubmit = canCreatePost(actor, board, undefined).allowed
   // canVotePost / canCreateComment compose canViewPost; pass a published,
   // unauthored post so each decision reflects its own tier (callers already
-  // filtered to viewable). isCommentsLocked is a per-post UI concern, not a
-  // board capability, so it stays false here.
+  // filtered to viewable). isCommentsLocked and isMerged are per-post UI
+  // concerns, not board capabilities, so they stay false here.
   const canVote = canVotePost(
     actor,
     { moderationState: 'published', principalId: null },
     board
   ).allowed
+  // `replyPolicy` is dropped for the same reason isCommentsLocked stays false:
+  // it is a per-post concern, not a board capability. On an author-only board a
+  // non-team user CAN still reply — on their own post — so the board-level
+  // answer stays tier-based and the per-post truth comes from canCommentOnPost.
+  const { replyPolicy: _replyPolicy, ...commentAccess } = board.access
   const canComment = canCreateComment(
     actor,
-    { moderationState: 'published', principalId: null, isCommentsLocked: false },
-    board,
+    { moderationState: 'published', principalId: null, isCommentsLocked: false, isMerged: false },
+    { access: commentAccess },
     undefined
   ).allowed
-  // Compose the workspace anonymous ceiling for non-user actors only. Team
-  // actors are never gated by the anon ceiling (tierAllows already bypasses
-  // for them), so guard on !isTeam too — a hypothetical non-user team actor
-  // (e.g. a service principal carrying a team role) must stay ungated.
-  if (!isTeam(actor) && actor.principalType !== 'user') {
+  // Compose the workspace anonymous ceiling for non-user actors only.
+  if (isAnonCeilinged(actor)) {
     return {
-      canSubmit: canSubmit && allowAnonymous,
+      canSubmit: canSubmit && (allowAnonymous || actor.testFeedback?.canSubmit === true),
       canVote: canVote && allowAnonymous,
       canComment: canComment && allowAnonymous,
     }
   }
   return { canSubmit, canVote, canComment }
+}
+
+/**
+ * Per-POST comment capability for a viewer — what the portal/widget composer
+ * is actually gated on. Same composition as `boardCapabilitiesForActor`'s
+ * `canComment` (board comment tier + the workspace anonymous ceiling), plus
+ * the one input a board-level answer structurally cannot have: the post's own
+ * author, which an `author-only` board's reply policy turns on.
+ *
+ * `isCommentsLocked` and `isMerged` stay false here deliberately. Each is
+ * surfaced by its own UI affordance (the "comments are locked" notice, the
+ * merge banner), not by collapsing the viewer's permission state — the write
+ * path re-checks both via `canCreateComment` with the real flags.
+ *
+ * Callers pass a post they have ALREADY proved viewable for this actor
+ * (assertPostViewable / getPublicPostDetail); the inner view check is then a
+ * no-op and the decision reflects the comment gates specifically.
+ */
+export function canCommentOnPost(
+  actor: Actor,
+  post: PostShape,
+  access: BoardAccess,
+  allowAnonymous: boolean
+): boolean {
+  const allowed = canCreateComment(
+    actor,
+    { ...post, isCommentsLocked: false, isMerged: false },
+    { access: normalizeBoardAccess(access) },
+    undefined
+  ).allowed
+  return isAnonCeilinged(actor) ? allowed && allowAnonymous : allowed
 }
