@@ -18,7 +18,7 @@ vi.mock('@/lib/server/cache', () => ({
   CACHE_KEYS: { PRINCIPAL_BY_USER: (id: string) => `principal:user:${id}` },
 }))
 
-import { identifyPortalUser } from '../user.identify'
+import { identifyPortalUser, updatePortalUser } from '../user.identify'
 
 const fixture = await createDbTestFixture({
   probe: async (db) => {
@@ -81,6 +81,37 @@ describe.skipIf(!fixture.available)('identifyPortalUser emailVerifiedAsserted', 
 
     expect(result.emailVerified).toBe(true)
     expect(result.emailVerifiedAsserted).toBe(false)
+  })
+
+  it('updates an existing user with an external ID and no metadata removals', async () => {
+    const email = `existing-external-id-${runSuffix()}@example.com`
+    const initial = await identifyPortalUser({ email })
+    await testDb
+      .update(user)
+      .set({ metadata: JSON.stringify({ existing: 'keep' }) })
+      .where(eq(user.email, email))
+
+    const input = { email, externalId: 'medcursor:existing', emailVerified: true }
+    const result = await identifyPortalUser(input)
+    const repeated = await identifyPortalUser(input)
+
+    expect(result).toMatchObject({
+      created: false,
+      userId: initial.userId,
+      principalId: initial.principalId,
+      externalId: input.externalId,
+      emailVerified: true,
+    })
+    expect(repeated).toMatchObject({
+      userId: initial.userId,
+      externalId: input.externalId,
+      emailVerifiedAsserted: false,
+    })
+
+    const updated = await updatePortalUser(initial.principalId, { externalId: null })
+    expect(updated.externalId).toBeNull()
+    const [row] = await testDb.select().from(user).where(eq(user.email, email))
+    expect(JSON.parse(row.metadata!)).toEqual({ existing: 'keep' })
   })
 
   it('is false when emailVerified is explicitly false (including true -> false revoke)', async () => {
