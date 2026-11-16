@@ -78,7 +78,7 @@ export async function identifyPortalUser(
       }
     }
     if (Object.keys(metadataUpdates).length > 0 || metadataRemovals.length > 0) {
-      userUpdates.metadata = sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ${metadataRemovals}::text[]) || ${JSON.stringify(metadataUpdates)}::jsonb)::text`
+      userUpdates.metadata = sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ARRAY[${sql.join(metadataRemovals, sql`, `)}]::text[]) || ${JSON.stringify(metadataUpdates)}::jsonb)::text`
     }
 
     if (Object.keys(userUpdates).length > 0) {
@@ -254,7 +254,7 @@ export async function updatePortalUser(
     }
   }
   if (Object.keys(metadataUpdates).length > 0 || metadataRemovals.length > 0) {
-    userUpdates.metadata = sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ${metadataRemovals}::text[]) || ${JSON.stringify(metadataUpdates)}::jsonb)::text`
+    userUpdates.metadata = sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ARRAY[${sql.join(metadataRemovals, sql`, `)}]::text[]) || ${JSON.stringify(metadataUpdates)}::jsonb)::text`
   }
 
   if (Object.keys(userUpdates).length > 0) {
